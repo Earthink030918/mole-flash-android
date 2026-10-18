@@ -183,6 +183,57 @@
   var RENDERER = 'wgpu-webgl';
   try { RENDERER = __RENDERER__; } catch (e) { /* 用默认值 */ }
   window.__moleRenderer = RENDERER;
+
+  /* ---- 0.2.1) GPU 自适应：弱 GPU 直接换掉渲染后端 ----
+   * 现场：步步高 S6（骁龙 730 / Adreno 618）一进游戏 Ruffle 就整体崩掉。
+   * 成因与 mc 里 Adreno Vulkan 驱动同源 —— wgpu 在创建渲染管线时过不了
+   * 着色器校验，panic 发生在 wasm 内部，Java 侧拿不到任何回调，
+   * 崩溃降档也就无从触发（第一次启动就死）。
+   *
+   * 对策分两层：
+   *   1. 开机探测真实 GPU 型号，Adreno 6xx / Mali-G5x 这种已知会翻车的
+   *      直接改用 'canvas'（纯 CPU 光栅化）。宁可帧率低一点，也要能跑。
+   *   2. Ruffle 一旦 panic，就把 'canvas' 写进 localStorage（见 mole_boot.js），
+   *      下次加载自动生效，避免「panic → Java 重载 → 再 panic」的死循环。
+   * 注意：Java 已经降过档（注入值不是默认的 wgpu-webgl）时以 Java 为准，
+   * 否则会把用户手动选的更优后端又踩回去。
+   */
+  (function () {
+    var gpu = '';
+    try {
+      var cv = document.createElement('canvas');
+      var gl = cv.getContext('webgl2') || cv.getContext('webgl');
+      if (gl) {
+        var dbg = gl.getExtension('WEBGL_debug_renderer_info');
+        gpu = String((dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL)
+                          : gl.getParameter(gl.RENDERER)) || '');
+      }
+    } catch (e) { /* 探不到就按未知处理 */ }
+    window.__moleGpu = gpu;
+
+    var weak = /Adreno\s*\(TM\)\s*(60[6-9]|61[0-9]|620)\b/i.test(gpu) || /Mali-G5\d/i.test(gpu);
+    var remembered = '';
+    try { remembered = localStorage.getItem('mole_force_renderer') || ''; } catch (e) {}
+    var isDefault = (RENDERER === 'wgpu-webgl' || RENDERER === 'webgpu');
+
+    if (isDefault && remembered) {
+      /* panic 过的机器：直接退到纯 CPU 光栅化，先保证能跑 */
+      RENDERER = remembered;
+      window.__moleRenderer = RENDERER;
+    } else if (isDefault && weak) {
+      /* 弱 GPU 优先退到传统 WebGL 后端（'webgl'，非 wgpu）：
+         仍然走 GPU，但绕开 wgpu 那条会 panic 的管线创建路径。
+         比直接退 'canvas'（纯 CPU）快得多，是更合适的中间档。 */
+      RENDERER = 'webgl';
+      window.__moleRenderer = RENDERER;
+    }
+    if (weak) BUDGET = Math.min(BUDGET, 750000);
+    try {
+      console.warn('[MoleShell] GPU=' + (gpu || '?') + ' | 后端=' + RENDERER
+        + ' | 预算=' + BUDGET + 'px' + (weak ? '（弱 GPU 档）' : ''));
+    } catch (e) {}
+  })();
+
   var raw = window.devicePixelRatio || 1;
 
   function compute() {
@@ -460,6 +511,40 @@
    * 界面上不出现任何字样，日志里也只有打码后的标识。
    * ------------------------------------------------------------------ */
   window.__moleNewTarget = function () { /* 静默：不做任何界面提示 */ };
+
+  /* ------------------------------------------------------------------
+   * 4) 输入事件诊断（调试构建专用）
+   * ---------------------------------------------------------------
+   * 症状：「工具类按钮按下 → 侧边菜单弹出来一下就消失」。
+   * 最可能是同一次点击被派发了两遍（Ruffle 内部 pointerdown/up 各有多个
+   * 监听点），第一次开面板、第二次被当成「点空白关闭」。
+   * 这里把每个 pointer 事件连同坐标 / 间隔 / 播放器矩形打进 logcat，
+   * 一次点击打出几行、间隔多少毫秒，直接就能判定是不是重复派发。
+   * 正式构建把 __moleInputLog 置 false 即可关闭。
+   * ------------------------------------------------------------------ */
+  window.__moleInputLog = true;
+  (function () {
+    if (!window.__moleInputLog) return;
+    var last = 0, idx = 0;
+    ['pointerdown', 'pointerup', 'pointercancel'].forEach(function (t) {
+      document.addEventListener(t, function (e) {
+        var now = performance.now();
+        var p = document.querySelector('ruffle-player,ruffle-embed,ruffle-object');
+        var r = p ? p.getBoundingClientRect() : null;
+        try {
+          console.warn('[tap#' + (++idx) + '] ' + t
+            + ' @' + Math.round(e.clientX) + ',' + Math.round(e.clientY)
+            + ' dt=' + (last ? (now - last).toFixed(0) : '-') + 'ms'
+            + ' target=' + (e.target && e.target.tagName ? e.target.tagName.toLowerCase() : '?')
+            + ' rect=' + (r ? (Math.round(r.left) + ',' + Math.round(r.top) + ' '
+              + Math.round(r.width) + 'x' + Math.round(r.height)) : '?')
+            + ' pid=' + (e.pointerId === undefined ? '-' : e.pointerId)
+            + ' ptype=' + (e.pointerType || '-'));
+        } catch (x) {}
+        last = now;
+      }, true);
+    });
+  })();
 })();
 </script>
 <script src="/__mole_ruffle__.js"></script>

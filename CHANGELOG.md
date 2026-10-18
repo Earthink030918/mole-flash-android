@@ -2,6 +2,27 @@
 
 格式参照 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+真机反馈的一轮修复（APK 重打包，非源码重编译 —— 见 `docs/decompile-report.md` 的失真说明）。
+
+### Added
+
+- 应用图标换成新图标（`res/mipmap-*` 五档全换），预览见 `docs/icons/app-icon-512.png`
+- `shell.html` GPU 自适应：开机探测 `WEBGL_debug_renderer_info`，命中
+  Adreno 606–620 / Mali-G5x 时自动把 `preferredRenderer` 退到传统 `webgl` 后端
+  （绕开 wgpu 的管线创建），同时把渲染预算压到 75 万像素
+- `mole_boot.js`：Ruffle `panic` 时把 `canvas` 后端写入 `localStorage`，
+  下次加载自动生效，断掉「panic → Java 重载 → 再 panic」的循环
+- `shell.html`：可选输入诊断 `window.__moleInputLog`，把每次 pointer 事件的
+  坐标/间隔/播放器矩形打进 logcat
+
+### Known issues（尚未验证）
+
+- 登录界面闪退、连续切换地图闪退 —— 仍怀疑 GPU 内存耗尽，但没有拿到对应时刻的日志
+- 工具按钮弹出的侧边菜单「弹出即消失」—— 实测单次点击只派发一对
+  `pointerdown`/`pointerup`（同一 pointerId），未确认重复派发，待复现日志
+
 ## [1.0.0] - 2026-10-18
 
 首个可安装的 Release。源码与文档在 0.1.0 已公开，本次补上分发包。

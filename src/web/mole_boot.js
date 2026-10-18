@@ -113,6 +113,10 @@
                            （panicked at wgpu-30.0.1/src/backend/wgpu_core.rs:1414）。
                            此时唯一出路是清空重载，把信号交给 Java。 */
                         if (t === 'panic') {
+                            /* 把「本机 wgpu 后端不可用」记下来：shell.html 读这个键，
+                               下次加载直接换 canvas，避免 panic → 重载 → 再 panic 的死循环。
+                               这是唯一能覆盖「第一次启动就崩、Java 来不及降档」场景的落点。 */
+                            try { localStorage.setItem('mole_force_renderer', 'canvas'); } catch (x) {}
                             try { MoleBridge.onPanic(); } catch (x) {}
                         }
                         // 影片真实分辨率到手 → 校正容器尺寸并重算缩放与渲染预算
