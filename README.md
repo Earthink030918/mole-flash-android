@@ -13,6 +13,25 @@ WebSocket 隧道补上 raw TCP 能力的安卓客户端。
 
 > 不是官方产品，与上海淘米网络无任何关系。仓库不含任何游戏资源文件。
 
+## 下载
+
+[![Release](https://img.shields.io/github/v/release/Earthink030918/mole-flash-android?sort=semver&label=release)](https://github.com/Earthink030918/mole-flash-android/releases/latest)
+
+安装包在 [Releases](https://github.com/Earthink030918/mole-flash-android/releases/latest)，当前版本 **v1.0.0**：
+`mole-flash-android-1.0.0.apk`，10.1 MB，Android 5.0+，不需要 Root。
+
+```bash
+sha256sum -c SHA256SUMS.txt
+```
+
+| 版本 | 包名 | 大小 | 签名 | SHA-256（前 12 位） |
+| --- | --- | --- | --- | --- |
+| v1.0.0 | `com.taomee.mole` | 10,134,939 B | v1 + v2，自签名 | `d167eeeb2d4f` |
+
+> **账号被踢出怎么办** —— 如果提示「账号在其他设备登录」或被踢回登录页，**按一次返回键**即可，
+> 不用强杀重开。返回键在壳里走的是 `WebView.goBack()`，正好退回上一层的登录界面，
+> 重新登录就能继续。
+
 ## 实机截图
 
 | 进入游戏 | 登录 |

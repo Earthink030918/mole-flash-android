@@ -2,6 +2,18 @@
 
 格式参照 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## [1.0.0] - 2026-10-18
+
+首个可安装的 Release。源码与文档在 0.1.0 已公开，本次补上分发包。
+
+### Added
+
+- GitHub Release [`v1.0.0`](https://github.com/Earthink030918/mole-flash-android/releases/tag/v1.0.0)，附件：
+  - `mole-flash-android-1.0.0.apk` —— 10,134,939 字节，`com.taomee.mole` 1.0（versionCode 1），
+    minSdk 21 / targetSdk 35，APK Signature Scheme v1 + v2 自签名（`CN=Mole Shell, O=Mole, C=CN`）
+  - `SHA256SUMS.txt`
+- README 增加「下载」小节与校验方法
+
 ## [0.1.0] - 2026-10-18
 
 首次公开。内容为对一个已构建 APK（`com.taomee.mole` v1.0，versionCode 1）的反编译整理。

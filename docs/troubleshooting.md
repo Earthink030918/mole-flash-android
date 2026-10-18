@@ -54,6 +54,14 @@ adb shell run-as com.taomee.mole rm -f /data/data/com.taomee.mole/shared_prefs/m
 adb shell am force-stop com.taomee.mole
 ```
 
+### 账号被踢出 / 提示在其他设备登录 / 突然掉回登录页
+
+先**按一次返回键**。`MainActivity.onBackPressed()` 在 `WebView` 可回退时执行 `goBack()`，
+会把页面退回上一层的登录界面，重新登录即可继续，不需要强杀进程。
+
+如果按返回键直接退出应用（说明当前是历史栈第一页，`canGoBack()` 为 `false`），那就只有重开。
+反复被踢通常是同一账号在别处登录，或服务端判定会话失效，与壳本身无关。
+
 ### 一闪白光 / 偶发闪黑一帧
 
 GPU 上下文丢失后重建，合成器按透明画布默认底色合成了一帧。`shell.html` 已给 `#wrap canvas`
