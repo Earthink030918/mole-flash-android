@@ -1,0 +1,27 @@
+# Gradle / Android Studio
+.gradle/
+build/
+app/build/
+local.properties
+*.iml
+.idea/
+captures/
+.externalNativeBuild/
+.cxx/
+
+# Ruffle 二进制（体积大，从官方 release 获取）
+app/src/main/assets/ruffle/ruffle.js
+app/src/main/assets/ruffle/*.wasm.gz
+
+# 反编译临时产物
+decompile/
+out/
+*.dex
+*.apk
+*.aab
+*.jks
+*.keystore
+
+# 系统
+.DS_Store
+Thumbs.db
