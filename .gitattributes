@@ -1,0 +1,16 @@
+# 统一走 LF，避免 Windows 下 git 把 Java/JS 全转成 CRLF 造成无意义 diff
+* text=auto eol=lf
+
+*.java    text eol=lf
+*.js      text eol=lf
+*.html    text eol=lf
+*.md      text eol=lf
+*.py      text eol=lf
+*.xml     text eol=lf
+*.txt     text eol=lf
+
+# 二进制
+*.wasm.gz binary
+*.apk     binary
+*.png     binary
+*.ttf     binary
