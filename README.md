@@ -15,18 +15,19 @@ WebSocket 隧道补上 raw TCP 能力的安卓客户端。
 
 ## 实机截图
 
-| 登录 | 选择服务器 |
+| 进入游戏 | 登录 |
 | :---: | :---: |
-| ![登录](docs/screenshots/01-login.jpg) | ![选择服务器](docs/screenshots/02-server-select.jpg) |
+| ![开始](docs/screenshots/01-start.jpg) | ![登录](docs/screenshots/02-login.jpg) |
 
-| 进入游戏 | 家园 |
+| 选择服务器 | 家园 |
 | :---: | :---: |
-| ![开始](docs/screenshots/03-start.jpg) | ![家园](docs/screenshots/04-home.jpg) |
+| ![选择服务器](docs/screenshots/03-server-select.jpg) | ![家园](docs/screenshots/04-home.jpg) |
 
 | 游戏内弹窗 |
 | :---: |
 | ![超级拉姆](docs/screenshots/05-super-lamu.jpg) |
 
+按实际启动顺序排列：开始 → 登录 → 选择服务器 → 家园 → 游戏内弹窗。
 截图取自 iQOO Neo9（Android 16），横屏沉浸，上下留黑边来自等比缩放（`contain`），非缺陷。
 游戏画面版权归上海淘米网络所有，此处仅作兼容性展示，不构成对游戏内容的分发。
 
