@@ -4,7 +4,7 @@
 [![Platform](https://img.shields.io/badge/platform-Android%2021%2B-brightgreen.svg)](#环境要求)
 [![Engine](https://img.shields.io/badge/engine-Ruffle%20%2F%20WASM-orange.svg)](https://ruffle.rs)
 [![Status](https://img.shields.io/badge/status-playable-informational.svg)](#已知限制)
-
+安卓微端交流群：1125775110
 一个把**官方网页版 Flash 客户端**塞进 Android WebView、用 [Ruffle](https://ruffle.rs) 运行、再用本地
 WebSocket 隧道补上 raw TCP 能力的安卓客户端。
 
@@ -164,3 +164,4 @@ Ruffle 为 MIT / Apache-2.0 双许可，见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY
 **免责声明**：本项目仅供个人在自己的设备上运行已停止官方支持的 Flash 内容之用，与上海淘米网络
 及其关联公司无任何关系，未获其授权或认可。"摩尔庄园"及相关商标、游戏本体与美术资源的权利
 均归其各自权利人所有，**不在本仓库内，也不随本项目分发**。使用本项目产生的账号风险由使用者自行承担。
+
