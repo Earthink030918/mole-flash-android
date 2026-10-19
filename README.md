@@ -59,7 +59,7 @@ sha256sum -c SHA256SUMS.txt
 构建步骤见 [docs/build.md](docs/build.md)。
 请注意：**需要键盘辅助的小游戏暂时不支持**，目前正在想办法解决。
 
-**如果你是来看实现的** —— 从 [docs/architecture.md](docs/architecture.md) 开始。四个核心问题各有一章：
+**如果你是来看实现的** —— 从 [docs/architecture.md](docs/architecture.md) 开始。每个卡过的坑各占一行：
 
 | 问题 | 解法 | 位置 |
 | --- | --- | --- |
@@ -67,6 +67,8 @@ sha256sum -c SHA256SUMS.txt
 | 官方客户端是 24fps，Ruffle 默认 60 → 小游戏"开倍速" | 在 `ruffle.js` 之前装帧率节流器 | `shell.html` §0 |
 | 手机 GPU 显存扛不住 1.5K 分辨率 | 三套降载：启动档 / 运行时 DPR / 显存看护 | `MainActivity` |
 | AS3 一旦 `scaleMode = NO_SCALE` 就裁切 | 元素尺寸 = 影片原生尺寸，只用 CSS transform 缩放 | `shell.html` §0 |
+| 按钮「点一下就消失」、点击不成立 | 关掉 Ruffle 自带右键菜单（它截走了 `pointerup`） | `shell.html` §2 `contextMenu` |
+| 服务端半包 → `#2030` → 进度条卡 100% | 在 `ruffle.js` 之前替换 `WebSocket`，对本地桥做 8ms 合帧 | `shell.html` §0.45 |
 
 ```
 ┌──────────────────────────── Android App ────────────────────────────┐

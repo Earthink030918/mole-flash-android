@@ -142,14 +142,23 @@
   window.__moleFit = function () {
     var mw = window.__moleMovieW || MW, mh = window.__moleMovieH || MH;
     var w = document.getElementById('wrap');
+    /* 只在**真的变了**的时候写样式。
+       旧版无条件写 width/height，而 Ruffle 用 ResizeObserver 盯容器：
+       值没变也写一次 → 观察器仍然回调 → 重建后备缓冲（2400x1400，约 100~150ms）。
+       初始化阶段 metadata 逐个子 SWF 到位，这个循环会被触发好几次，
+       表现就是界面上线那几秒一顿一顿的。 */
     if (w) {
-      w.style.width = mw + 'px';
-      w.style.height = mh + 'px';
+      var wantW = mw + 'px', wantH = mh + 'px';
+      if (w.style.width !== wantW) w.style.width = wantW;
+      if (w.style.height !== wantH) w.style.height = wantH;
     }
     var vw = Math.max(1, window.innerWidth), vh = Math.max(1, window.innerHeight);
     var f = Math.min(vw / mw, vh / mh);          // contain：保证整个舞台都可见
-    try { document.documentElement.style.setProperty('--f', f); } catch (e) {}
-    window.__moleFitScale = f;
+    var prevF = window.__moleFitScale;
+    if (prevF === undefined || Math.abs(prevF - f) > 0.0005) {
+      try { document.documentElement.style.setProperty('--f', f); } catch (e) {}
+      window.__moleFitScale = f;
+    }
     return f;
   };
   window.addEventListener('resize', function () {
@@ -172,31 +181,61 @@
      连 4KB 都分配不出来，驱动拿到空指针就直接崩进程。
      渲染分辨率是与 GPU 内存/带宽成正比的、我们能控制的主要杠杆，
      所以做成可分档，崩一次自动降一档，直到稳定。 */
-  var BUDGET = 900000;
   // 占位符未注入时 __PIXEL_BUDGET__ 是未声明标识符 → 直接求值会 ReferenceError，
-  // 用 try 兜住：注入成功则赋值，失败则保持上面的默认值，页面脚本不会整段挂掉。
-  try { BUDGET = __PIXEL_BUDGET__; } catch (e) { /* 用默认值 */ }
-  var MAXCAP = 3;         // 再高对观感已无意义
-  var FLOOR  = 0.5;       // 下限，避免超大窗口下过度降采样发虚
+  // 用 try 兜住：注入成功则赋值，失败则保持默认值，页面脚本不会整段挂掉。
+  var JAVA_BUDGET = 900000;
+  try { JAVA_BUDGET = __PIXEL_BUDGET__; } catch (e) { /* 用默认值 */ }
+  var BUDGET = JAVA_BUDGET;
 
-  /* 渲染后端，同样由 Java 侧注入（见 Ruffle 配置段的说明） */
+  /* 清晰度参数（v1.3 重做）
+   * ---------------------------------------------------------------
+   * FLOOR / MAXCAP 都是「影片像素 → 渲染像素」的倍数，不是 CSS 倍数。
+   *   旧版：BUDGET 当绝对上限用（Java 注入 460000~900000），
+   *         算出来 DPR 只有 0.84~1.29；而 960x560 的舞台经 CSS 放大
+   *         0.742~1.14 倍、屏幕又是 2.25x，真正需要 1.67~2.56 倍。
+   *         于是 807x470 的后备缓冲被拉到 1602x934 显示 —— 一个渲染像素
+   *         摊两个屏幕像素，字和图标全线发虚，这就是「分辨率过低」。
+   *   现在：先按 raw×fit 算屏幕真正要多少，再据此定预算（见 0.2.3）。
+   *         FLOOR 是硬下限，任何降载都不许击穿它。
+   */
+  var FLOOR  = 1.35;      // 硬下限：低于此值 960x560 的中文 UI 必发虚
+  /* 上限 2.5：这块屏 2560 宽、DPR 2.25，舞台放大 1.185 倍，
+     屏幕真正需要 2.25×1.185 ≈ 2.67 倍。取 2.5 略低于「完全 1:1」，
+     但已经明显高于旧的 0.84，字与 UI 边框都是实心的，不再发虚。
+     为什么不再往上顶到 3.0：wgpu-webgl 的渲染目标与纹理缓存都吃显存，
+     而挂机闪退的根因正是显存/系统内存耗尽（mmap errno 12）。
+     3.0 时后备缓冲 2880x1680（4.8M px），2.5 时 2400x1400（3.4M px），
+     像素量少 30%，肉眼几乎看不出差别，却直接换来更长的安全挂机时间。 */
+  var MAXCAP = 2.5;
+  /* 超采样系数：屏幕需求（raw×fit）之上再乘一点，让字号笔画边缘更干净。 */
+  var SS = 1.15;
+
+  /* 渲染后端 —— 实机三档对照（小米平板5 / Adreno 640 / 2026-10-19）：
+   *
+   *   wgpu-webgl : 唯一**能进场景**的后端。离屏渲染（BitmapData.draw）支持完整，
+   *                摩尔庄园「正在进入 XX」加载链必经此调用。
+   *                代价：流式子 SWF 的纹理在 GPU 上累积，长时间挂机后
+   *                Adreno 显存分配失败（mmap errno 12）→ SIGTRAP 整进程死。
+   *   webgl      : 不支持 BitmapData.draw。日志实证（19:09:58）：
+   *                  avm2.rs:702 Error running AVM2 construction for movie clip:
+   *                  RustError("Render backend does not support BitmapData.draw")
+   *                影片剪辑构造期就抛错 → 加载链断开 → **进度条卡 100% 进不去**。
+   *                （此前测到它「挂机 10 分钟显存恒定」是假象：它一直停在选服界面，
+   *                  根本没进过场景，所以没有纹理累积。）
+   *   canvas     : 同样缺 BitmapData.draw，且纯 CPU 光栅化，帧率与画质都最差。
+   *
+   * 结论：**必须用 wgpu-webgl**。挂机崩溃只能靠「控制显存水位」而不是「换后端」
+   * 来解 —— 见下面的分辨率上限与 IdleGuard。
+   * 用户显式指定：localStorage['mole_force_renderer']，优先级最高。
+   */
   var RENDERER = 'wgpu-webgl';
   try { RENDERER = __RENDERER__; } catch (e) { /* 用默认值 */ }
   window.__moleRenderer = RENDERER;
 
-  /* ---- 0.2.1) GPU 自适应：弱 GPU 直接换掉渲染后端 ----
-   * 现场：步步高 S6（骁龙 730 / Adreno 618）一进游戏 Ruffle 就整体崩掉。
-   * 成因与 mc 里 Adreno Vulkan 驱动同源 —— wgpu 在创建渲染管线时过不了
-   * 着色器校验，panic 发生在 wasm 内部，Java 侧拿不到任何回调，
-   * 崩溃降档也就无从触发（第一次启动就死）。
-   *
-   * 对策分两层：
-   *   1. 开机探测真实 GPU 型号，Adreno 6xx / Mali-G5x 这种已知会翻车的
-   *      直接改用 'canvas'（纯 CPU 光栅化）。宁可帧率低一点，也要能跑。
-   *   2. Ruffle 一旦 panic，就把 'canvas' 写进 localStorage（见 mole_boot.js），
-   *      下次加载自动生效，避免「panic → Java 重载 → 再 panic」的死循环。
-   * 注意：Java 已经降过档（注入值不是默认的 wgpu-webgl）时以 Java 为准，
-   * 否则会把用户手动选的更优后端又踩回去。
+  /* ---- 0.2.1) GPU 探测与显式覆盖 ----
+   * Java 已注入非默认后端（崩溃降档）时以记忆值/Java 为准；
+   * 高级用户可用 localStorage['mole_force_renderer'] 显式指定
+   * canvas | webgl | wgpu-webgl | webgpu，优先级最高。
    */
   (function () {
     var gpu = '';
@@ -214,35 +253,211 @@
     var weak = /Adreno\s*\(TM\)\s*(60[6-9]|61[0-9]|620)\b/i.test(gpu) || /Mali-G5\d/i.test(gpu);
     var remembered = '';
     try { remembered = localStorage.getItem('mole_force_renderer') || ''; } catch (e) {}
-    var isDefault = (RENDERER === 'wgpu-webgl' || RENDERER === 'webgpu');
 
-    if (isDefault && remembered) {
-      /* panic 过的机器：直接退到纯 CPU 光栅化，先保证能跑 */
-      RENDERER = remembered;
-      window.__moleRenderer = RENDERER;
-    } else if (isDefault && weak) {
-      /* 弱 GPU 优先退到传统 WebGL 后端（'webgl'，非 wgpu）：
-         仍然走 GPU，但绕开 wgpu 那条会 panic 的管线创建路径。
-         比直接退 'canvas'（纯 CPU）快得多，是更合适的中间档。 */
-      RENDERER = 'webgl';
-      window.__moleRenderer = RENDERER;
+    if (/^(canvas|webgl|wgpu-webgl|webgpu)$/.test(remembered)) {
+      RENDERER = remembered;      /* 高级用户显式指定：优先级最高 */
+    } else {
+      /* 固定 wgpu-webgl：三档实测里只有它支持 BitmapData.draw，
+         能走过「正在进入 XX」那条加载链；webgl / canvas 都会在影片剪辑
+         构造期抛 RustError 并把进度条卡在 100%（见上面 0.2 的对照表）。 */
+      RENDERER = 'wgpu-webgl';
     }
-    if (weak) BUDGET = Math.min(BUDGET, 750000);
+    window.__moleRenderer = RENDERER;
+    /* 弱 GPU 不再靠「砍分辨率」保命（那正是发虚的来源），
+       只把超采样上限压下来：清晰度仍按 1:1 给足，放弃 2x 超采样。 */
+    if (weak) MAXCAP = Math.max(FLOOR, 1.6);
+
+    /* ---- 0.2.2) 原生崩溃自愈 ----
+     * Adreno 显存耗尽是以 SIGTRAP 打死进程的（logcat 实证：
+     *   W/Adreno-GSL: sharedmem_gpumem_alloc: mmap failed errno 12 Out of memory
+     *   F/libc: Fatal signal 5 (SIGTRAP) in Chrome_InProcGp
+     * ），这条路上 **没有任何 JS 回调**，mole_boot.js 里「panic 时改后端」完全够不着。
+     * 只能走下一轮启动：上次启动后 120 秒内又进来，判定为异常结束，降一档。
+     * 两档封顶，避免一次误判就把画质永久按死；要复位执行
+     *   localStorage.removeItem('mole_degrade')
+     */
+    var prevBoot = 0, degrade = 0;
+
+    /* ---- 版本迁移：升级时清掉上一版留下的降档/轮转记录 ----
+       两个理由：
+       1) 历史测试（反复强行 kill 进程）会把 mole_degrade 顶到 2~3，
+          旧版据此砍分辨率 —— 新版本已经不用它控制清晰度，留着只会误导排查。
+       2) 旧版可能残留 mole_force_renderer 指向 'canvas' 或 'webgl' ——
+          这两个都缺 BitmapData.draw，进不了场景（卡 100%）。
+          升级后必须清掉，回落到唯一能进场景的 wgpu-webgl。
+    */
+    var SHELL_VER = '1.4.0';
+    try {
+      if (localStorage.getItem('mole_ver') !== SHELL_VER) {
+        localStorage.setItem('mole_ver', SHELL_VER);
+        localStorage.setItem('mole_degrade', '0');
+        localStorage.setItem('mole_auto_seq', '0');
+        localStorage.removeItem('mole_boot_ts');   /* 不清掉会被当成「120 秒内又崩了」 */
+        localStorage.removeItem('mole_stuckfix_n');
+        localStorage.removeItem('mole_stuckfix_ts');
+        var stale = localStorage.getItem('mole_force_renderer');
+        if (stale === 'canvas' || stale === 'webgl' || stale === 'webgpu') {
+          localStorage.removeItem('mole_force_renderer');
+        }
+      }
+    } catch (e) {}
+
+    try {
+      prevBoot = Number(localStorage.getItem('mole_boot_ts') || 0);
+      degrade = Number(localStorage.getItem('mole_degrade') || 0);
+    } catch (e) {}
+    var nowMs = Date.now();
+    if (prevBoot && (nowMs - prevBoot) < 120000 && degrade < 2) degrade++;
+    else if (prevBoot && (nowMs - prevBoot) > 900000 && degrade > 0) degrade--;  /* 上轮平稳跑满 15 分钟：回落一档 */
+    try {
+      localStorage.setItem('mole_boot_ts', String(nowMs));
+      localStorage.setItem('mole_degrade', String(degrade));
+    } catch (e) {}
+    if (degrade >= 2 && !remembered) {
+      /* 连着两次 120 秒内异常退出 —— 只记录，不再自动换后端。
+         换到 wgpu-webgl 会让启动更卡（见上面的实测）而且更容易崩，
+         换到 canvas 又进不了场景（不支持 BitmapData.draw）。
+         也就是说「换后端」在这个游戏上压根不是一条可用的退路，
+         真正管用的是 webgl + 不降分辨率 + 帧产额节流，这三条已经都在。 */
+      try {
+        console.warn('[MoleShell] 检测到连续快速重启（degrade=' + degrade
+          + '），保持 webgl 后端不变；如仍异常请查看 logcat 里的 Adreno-GSL 记录');
+      } catch (e) {}
+    }
     try {
       console.warn('[MoleShell] GPU=' + (gpu || '?') + ' | 后端=' + RENDERER
-        + ' | 预算=' + BUDGET + 'px' + (weak ? '（弱 GPU 档）' : ''));
+        + ' | Java预算=' + JAVA_BUDGET + 'px' + (weak ? '（弱 GPU 档）' : '')
+        + ' | 崩溃降档=' + degrade + ' | contextMenu=off');
     } catch (e) {}
   })();
 
+  /* ---- 0.3) 卡死自愈看门狗（StuckGuard）----
+   * 用户规则：进度条卡 100% 超过 10 秒即判定故障，自动查找原因并修复。
+   * 「卡 100%」的确诊签名（两次实机复现一致，见顶部现场 B）：
+   *   1) avm2.rs:702 "Render backend does not support BitmapData.draw"
+   *      —— canvas 后端不支持，进入场景必经路径，一抛即死锁；
+   *   2) "Error #2030: End of file was encountered"
+   *      —— 其后的 SocketImpl 解析连锁崩溃，加载握手彻底卡死。
+   * 做法：钩住全部 console 方法捕获签名 → 首次命中起计时，
+   *      10 秒后仍无进展 → 锁定 wgpu-webgl 并自动重载一次。
+   * 限频/限域：距上次自动重载 <90 秒、连续 3 次修复不成、或已超出启动后 4 分钟，
+   *      都不再重载 —— 后者是为了避免把正在游戏里的玩家因一次偶发 #2030 踢下线。
+   */
+  (function () {
+    var PAT = /does not support BitmapData\.draw|Error #2030|End of file was encountered/;
+    var hitAt = 0, fired = false;
+    /* 只在「启动后的进入阶段」允许自动重载 —— 这是防误伤的关键。
+       #2030（End of file）在游戏内也会偶发：服务端某个包被拆成两段到达，
+       客户端 readUnsignedInt 读到半截就抛错，但下一帧照样正常跑。
+       如果这种偶发也触发重载，等于把正在玩的玩家直接踢下线，
+       比「卡一次」糟糕得多。而「卡 100% 进不去」只可能发生在启动阶段，
+       所以给自动修复划一条 4 分钟的时间窗：窗口内救场，窗口外只记账不重载。 */
+    var BOOT_TS = Date.now();
+    var REPAIR_WINDOW_MS = 4 * 60 * 1000;
+    try {
+      var lastFix = Number(localStorage.getItem('mole_stuckfix_ts') || 0);
+      var fixCount = Number(localStorage.getItem('mole_stuckfix_n') || 0);
+      if (Date.now() - lastFix > 600000) fixCount = 0;   /* 10 分钟前的旧记录清零 */
+    } catch (e) { var lastFix = 0, fixCount = 0; }
+
+    /* 必须钩住**全部** console 方法，不能只钩 console.error。
+       Ruffle 的 web 日志层把级别编码进 `%cERROR%c ... %c 文案` 这种样式字符串，
+       然后统一走 console.log / console.debug 输出 —— 只钩 error 会一条都收不到。
+       实测（19:09:58 那次卡 100%）就是因为只钩了 console.error，
+       签名明明出现在 logcat 里，看门狗却全程没反应。
+       只看第一个参数（签名就在这个字符串里），避免为每条日志拼接全部参数。 */
+    function probe(args) {
+      if (fired || hitAt) return;
+      var a = args[0];
+      if (typeof a !== 'string') return;
+      if (PAT.test(a)) {
+        hitAt = Date.now();
+        try { console.warn('[MoleShell] 捕获卡死签名，10 秒后仍无进展则自动修复'); } catch (e) {}
+      }
+    }
+    ['log', 'info', 'warn', 'error', 'debug', 'trace'].forEach(function (k) {
+      var orig = (console[k] || function () {}).bind(console);
+      console[k] = function () {
+        try { probe(arguments); } catch (e) {}
+        return orig.apply(null, arguments);
+      };
+    });
+
+    setInterval(function () {
+      if (fired || !hitAt) return;
+      var now = Date.now();
+      if (now - hitAt <= 10000) return;                 /* 用户规则：满 10 秒才动手 */
+      fired = true;
+      if (now - BOOT_TS > REPAIR_WINDOW_MS) {
+        console.warn('[MoleShell] 卡死签名出现在启动 4 分钟之后（游戏内偶发），'
+          + '不重载以免踢下线，仅记录');
+        return;
+      }
+      if (fixCount >= 3 || now - lastFix < 90000) {
+        console.warn('[MoleShell] 检测到卡死签名但限频中（n=' + fixCount
+          + '，距上次 ' + Math.round((now - lastFix) / 1000) + 's），停止自动修复');
+        return;
+      }
+      /* 修复动作：锁定唯一支持 BitmapData.draw 的 wgpu-webgl，然后重载一次。
+         「卡 100%」的确诊原因就是当前后端缺离屏渲染能力，进场景的加载链
+         在影片剪辑构造期就断了（avm2.rs:702 RustError）。 */
+      try {
+        localStorage.setItem('mole_force_renderer', 'wgpu-webgl');
+        localStorage.setItem('mole_stuckfix_ts', String(now));
+        localStorage.setItem('mole_stuckfix_n', String(fixCount + 1));
+      } catch (e) {}
+      console.warn('[MoleShell] 卡死确认（>10s）：锁定 wgpu-webgl 后端，1 秒后自动重载修复');
+      setTimeout(function () { location.reload(); }, 1000);
+    }, 2000);
+  })();
+
+  /* ---- 0.2.3) 分辨率基线：按「屏幕实际需要多少像素」反推预算 ----
+   * 旧版把 Java 注入的预算当绝对上限（460000~900000 px），
+   * 960x560 的舞台算下来 DPR 只有 0.84~1.29；可这块屏是 2.25 倍密度，
+   * 舞台又被 CSS 放大 0.74~1.14 倍 —— 真正需要的倍率是 1.67~2.56。
+   * 结果：807x470 的后备缓冲被拉去铺满 1602x934 的设备像素，
+   * 一个渲染像素摊两个屏幕像素，字、图标、UI 边框全线发虚。
+   *
+   * 现在反过来算：need = raw × fit（屏幕密度 × 舞台放大倍数），
+   * 预算 = 影片面积 × need²，只在 Java 值更高时才采纳 Java 值。
+   * 这里刻意**不读 offsetWidth / getBoundingClientRect** ——
+   * Ruffle 的 wasm 会频繁读 devicePixelRatio，每次读都强制一次同步重排，
+   * 初始化阶段成百上千次重排叠起来就是「UI 初始化卡顿」。全部改用纯数字。
+   */
   var raw = window.devicePixelRatio || 1;
 
-  function compute() {
-    var w = document.getElementById('wrap');
-    var lw = (w && w.offsetWidth) || window.__moleMovieW || 960;
-    var lh = (w && w.offsetHeight) || window.__moleMovieH || 560;
-    var byBudget = Math.sqrt(BUDGET / (lw * lh));
-    return Math.max(FLOOR, Math.min(MAXCAP, raw, byBudget));
+  function needDpr() {
+    var f = window.__moleFitScale || 1;
+    return Math.min(MAXCAP, Math.max(FLOOR, raw * f * SS));
   }
+  function compute() {
+    var area = (window.__moleMovieW || 960) * (window.__moleMovieH || 560);
+    var byBudget = Math.sqrt(BUDGET / area);
+    return Math.max(FLOOR, Math.min(needDpr(), byBudget, MAXCAP));
+  }
+  window.__moleNeedDpr = needDpr;
+
+  window.__moleRefreshBudget = function () {
+    var area = (window.__moleMovieW || 960) * (window.__moleMovieH || 560);
+    var need = needDpr();
+    var target = Math.round(area * need * need);
+    var floorPx = Math.round(area * FLOOR * FLOOR);
+    window.__moleQualityFloor = floorPx;
+    BUDGET = Math.max(JAVA_BUDGET, target, floorPx);
+    window.__moleRes = { need: need, target: target, floor: floorPx, java: JAVA_BUDGET };
+    return BUDGET;
+  };
+  window.__moleRefreshBudget();
+
+  try {
+    var dprNow = compute();
+    console.warn('[MoleShell] 分辨率：DPR=' + dprNow.toFixed(2)
+      + '（raw=' + raw + ' × fit=' + (window.__moleFitScale || 1).toFixed(3)
+      + ' × SS=' + SS + '）'
+      + ' | 后备缓冲≈' + Math.round((window.__moleMovieW || 960) * dprNow) + 'x'
+      + Math.round((window.__moleMovieH || 560) * dprNow)
+      + ' | 预算=' + BUDGET + 'px（Java 注入 ' + JAVA_BUDGET + 'px，仅作参考）');
+  } catch (e) {}
 
   window.__moleDprRaw = raw;
   window.__moleDprCap = compute();
@@ -252,6 +467,20 @@
       get: function () { return compute(); }
     });
   } catch (e) { /* 定义失败则分辨率不受约束，功能不受影响 */ }
+
+  /* 舞台尺寸/屏幕方向变化后，预算要跟着重算（纯算术，不做任何 DOM 抖动）。
+     Ruffle 自己会在容器变化时重建后备缓冲；我们只保证它读到的倍率是对的。 */
+  (function () {
+    var lastW = 0, lastH = 0, lastF = 0;
+    setInterval(function () {
+      var w = window.__moleMovieW || 960, h = window.__moleMovieH || 560;
+      var f = window.__moleFitScale || 1;
+      if (w === lastW && h === lastH && Math.abs(f - lastF) < 0.001) return;
+      lastW = w; lastH = h; lastF = f;
+      window.__moleRefreshBudget();
+      window.__moleDprCap = compute();
+    }, 1000);
+  })();
 
   /* ------------------------------------------------------------------
    * 0.3) 运行时降载接口 —— 由 Java 侧的 GPU 显存看护调用
@@ -270,10 +499,20 @@
    *   · 足以让 Ruffle 的 ResizeObserver 触发重建，
    *     而重建时会读到新的、更小的 devicePixelRatio。
    * ------------------------------------------------------------------ */
-  window.__moleSetBudget = function (px) {
+  window.__moleSetBudget = function (px, why) {
     try {
       px = Number(px);
       if (!isFinite(px) || px <= 0) return false;
+
+      /* 清晰度护栏：Java 显存看护、挂机守护都可能往下压，
+         但任何一方都不许把分辨率压到 FLOOR 以下（那就是「看着糊」的根源）。
+         已经在安全区内的降载请求直接吃掉，连一次 resize 抖动都不做。 */
+      var minPx = window.__moleQualityFloor || 0;
+      if (px < minPx) {
+        if (BUDGET >= minPx) return true;
+        px = minPx;
+      }
+
       window.__moleBudget = px;
       if (px === BUDGET) return true;
       BUDGET = px;
@@ -290,7 +529,10 @@
           try { window.__moleFit(); } catch (e) {}
         });
       }
-      try { window.dispatchEvent(new Event('resize')); } catch (e) {}
+      /* 这里不再额外 dispatch 一次 window.resize：
+         容器抖动已经能让 Ruffle 的 ResizeObserver 重建后备缓冲，
+         再派发一次 resize 会连带触发 __moleFit → 又一次布局与重建，
+         两遍叠在一起就是切档瞬间那一下明显的卡顿（还会闪一下 1px 拉伸）。 */
 
       /* 600ms 后回读 canvas 尺寸，把「到底有没有真的重建」直接写进日志 ——
          这个机制依赖 Ruffle 的 ResizeObserver 行为，属于不可只靠推理确认的一环，
@@ -375,6 +617,18 @@
     }
 
     function fwd(level, args) {
+      /* 零拷贝快速丢弃（v1.3 新增）
+         Ruffle 初始化阶段会刷掉大量 log/info/debug，旧版对**每个参数**先做
+         String() / JSON.stringify 拼成整串，再去按级别过滤丢弃 ——
+         UI 初始化最忙的那几百毫秒里，光拼这些永远用不上的字符串就吃掉了
+         可观的主线程时间，表现为「界面出来时一顿一顿」。
+         现在先按级别判断，非保留级别直接 return，一个字符串都不拼。 */
+      if (!window.__moleVerbose && level !== 'WARN' && level !== 'ERROR'
+          && level !== 'JSERR' && level !== 'REJECT') {
+        var a0 = args[0];
+        if (typeof a0 !== 'string' || a0.indexOf('[MoleShell]') < 0) return;
+      }
+
       /* 服务器地址最准的来源，必须优先处理（零误报，且与转发级别无关）：
          Ruffle 只在真的要去连某个 host:port 而 socketProxy 里没配时才打印这句。
          转交 Java 侧落盘并静默热重启，界面不做任何提示。 */
@@ -431,6 +685,342 @@
   })();
 
   /* ------------------------------------------------------------------
+   * 0.45) WebSocket 合帧 —— 治「进度条卡 100%」的关键一环
+   * ---------------------------------------------------------------
+   * 确诊现场（logcat，19:09:58 / 19:23:20 两次复现）：
+   *   ERROR core/src/avm2.rs:702 Error dispatching event "8755":
+   *         Error: Error #2030: End of file was encountered.
+   * 之后加载状态机就停住了，进度条永远停在 100%。
+   *
+   * 成因：摩尔庄园的协议是「先读一个命令号，再读长度，再读负载」。
+   * 服务端一个逻辑包如果被 TCP 拆成两段到达，本地桥（SocketBridge）
+   * 每次 read() 就发一个 WebSocket 二进制帧 —— 于是 SWF 收到第一帧时
+   * 只拿到半个包，readUnsignedInt / readUTFBytes 读到末尾 → #2030。
+   * 实机统计：4 次进服里命中 3 次，是进服失败的头号原因。
+   *
+   * 对策：在 ruffle.js 之前替换 window.WebSocket，
+   * 对连到本地桥（127.0.0.1 / localhost）的连接，把 8ms 内到达的多个
+   * 二进制帧**合并成一个**再派发给 Ruffle。
+   *   · 流式协议里「合并」永远安全（字节顺序不变），「切开」才危险；
+   *     所以这一步只会减少 #2030，不会引入新的解析问题。
+   *   · 8ms 是引导延迟（首帧立即起表，不重新计时），不累积；
+   *     对回合制/寻路类玩法完全无感。
+   *   · 非本地地址、非二进制帧、Blob 帧一律原样直通，不改变行为。
+   * ------------------------------------------------------------------ */
+  (function () {
+    var Orig = window.WebSocket;
+    if (!Orig || !Orig.prototype) return;
+    var COALESCE_MS = 8;
+
+    function isLocal(u) {
+      return /^wss?:\/\/(127\.0\.0\.1|localhost)([:/]|$)/i.test(String(u));
+    }
+
+    /* 全部是 ArrayBuffer 才合并；返回 null 表示放弃合并、逐帧原样投递 */
+    function concatAll(list) {
+      var total = 0, i;
+      for (i = 0; i < list.length; i++) {
+        if (!(list[i] instanceof ArrayBuffer)) return null;
+        total += list[i].byteLength;
+      }
+      var out = new Uint8Array(total), off = 0;
+      for (i = 0; i < list.length; i++) {
+        out.set(new Uint8Array(list[i]), off);
+        off += list[i].byteLength;
+      }
+      return out.buffer;
+    }
+
+    function makeEvent(data) {
+      try { return new MessageEvent('message', { data: data }); }
+      catch (e) {
+        try {
+          var ev = document.createEvent('MessageEvent');
+          ev.initMessageEvent('message', false, false, data, '', '', window, null);
+          return ev;
+        } catch (x) { return null; }
+      }
+    }
+
+    function deliver(ws, data) {
+      var ev = makeEvent(data);
+      if (!ev) return;
+      var hs = ws.__moleHandlers.slice();
+      for (var i = 0; i < hs.length; i++) {
+        try { hs[i].call(ws, ev); } catch (x) {}
+      }
+      if (typeof ws.__moleOnMsg === 'function') {
+        try { ws.__moleOnMsg.call(ws, ev); } catch (x) {}
+      }
+    }
+
+    function enqueue(ws, data) {
+      if (!ws.__moleCoalesce) { deliver(ws, data); return; }
+      ws.__moleQueue.push(data);
+      if (ws.__moleTimer) return;
+      ws.__moleTimer = setTimeout(function () {
+        ws.__moleTimer = 0;
+        var items = ws.__moleQueue;
+        ws.__moleQueue = [];
+        if (!items.length) return;
+        if (items.length > 1) {
+          var merged = concatAll(items);
+          if (merged) { deliver(ws, merged); return; }
+        }
+        for (var i = 0; i < items.length; i++) deliver(ws, items[i]);
+      }, COALESCE_MS);
+    }
+
+    function MoleWS(url, protocols) {
+      var ws = arguments.length > 1 ? new Orig(url, protocols) : new Orig(url);
+      ws.__moleHandlers = [];
+      ws.__moleOnMsg = null;
+      ws.__moleQueue = [];
+      ws.__moleTimer = 0;
+      ws.__moleCoalesce = isLocal(url);
+      Orig.prototype.addEventListener.call(ws, 'message', function (ev) {
+        enqueue(ws, ev.data);
+      });
+      return ws;
+    }
+    MoleWS.prototype = Orig.prototype;
+
+    var add = Orig.prototype.addEventListener;
+    var rem = Orig.prototype.removeEventListener;
+    Orig.prototype.addEventListener = function (type, fn, opts) {
+      if (type === 'message' && this.__moleCoalesce && typeof fn === 'function') {
+        this.__moleHandlers.push(fn);
+        return;
+      }
+      return add.call(this, type, fn, opts);
+    };
+    Orig.prototype.removeEventListener = function (type, fn, opts) {
+      if (type === 'message' && this.__moleCoalesce && this.__moleHandlers) {
+        var i = this.__moleHandlers.indexOf(fn);
+        if (i >= 0) this.__moleHandlers.splice(i, 1);
+        return;
+      }
+      return rem.call(this, type, fn, opts);
+    };
+    /* onmessage 走自己的槽位，避免与上面的原生监听重复派发 */
+    try {
+      Object.defineProperty(Orig.prototype, 'onmessage', {
+        configurable: true,
+        get: function () { return this.__moleOnMsg || null; },
+        set: function (fn) { this.__moleOnMsg = fn; }
+      });
+    } catch (e) {}
+
+    window.WebSocket = MoleWS;
+  })();
+
+  /* ------------------------------------------------------------------
+   * 0.4) 挂机守护（IdleGuard）—— 长时挂机的显存 / 帧产额控制
+   * ---------------------------------------------------------------
+   * 用户反馈：「挂机时间过长容易闪退」。真机取证（小米平板 5 / Adreno 640）：
+   *   pid 23358, name Chrome_InProcGp, signal 5 (SIGTRAP), code 1 (TRAP_BRKPT)
+   *   Process uptime: 25329s（≈7 小时）
+   *   W/Adreno-GSL: sharedmem_gpumem_alloc: mmap failed errno 12 Out of memory
+   *   E/Adreno-GSL: kgsl_sharedmem_alloc ioctl failed! Allocation size: (4 KB)
+   * —— 连 4KB 都分配不出来，驱动拿到空指针 → Chromium CHECK 失败 → 进程被 trap 打死。
+   *
+   * Java 侧本来有显存看护（MainActivity$1，每 8s 读 summary.graphics，
+   * 400MB 降档 / 410MB 清空重载）。但实测这台机器上它报的是 **95MB**，
+   * 同一时刻 dumpsys meminfo 是 Graphics=254MB、EGL mtrack=63MB ——
+   * 口径差一个量级，400MB 阈值永远够不到，看护实际上是空转的。
+   * 所以这里不再依赖它，改用两个自控信号：**在线时长** 与 **空闲时长**。
+   *
+   * 三条措施：
+   *   1) 阶梯降载：每 20 分钟把渲染预算降一档（0.88 衰减），最低 380k px。
+   *      显存与带宽占用正比于像素数，长期运行时把基础水位往下压是最直接的延寿。
+   *   2) 挂机节流：连续 3 分钟无触摸 → rAF 节流到 6fps。
+   *      无人操作时游戏仍在跑待机动画、NPC 走动、特效循环，每帧都可能上传新位图；
+   *      把帧产额砍到 1/4，显存增长速度同步下降。一碰屏幕立刻恢复满帧。
+   *   3) 显存告警：每 20s 读一次 gl.getError()，拿到 OUT_OF_MEMORY(0x505)
+   *      就把预算压到最低档，抢在驱动崩之前把空间腾出来。
+   *
+   * 为什么节流 rAF 不会把人踢下线：Ruffle 的 Timer / setInterval 由真实时间驱动，
+   * 与 rAF 解耦，服务端心跳照常。所以挂机时只是「画面动得慢」，逻辑与连接都不丢。
+   * ------------------------------------------------------------------ */
+  (function () {
+    var T0 = Date.now();
+    var CAP_IDLE = 12;                // 挂机帧率上限（0 = 不限）：24 → 12，正好一半
+    var IDLE_MS = 5 * 60 * 1000;      // 判定挂机所需的静默时长
+    /* 分辨率下限 = 清晰度护栏（960x560 × 1.35²）。任何降载都不许击穿它。 */
+    var FLOOR_BUDGET = window.__moleQualityFloor || BUDGET;
+
+    var lastInput = Date.now();
+    var lastFrameAt = 0;
+    var frames = 0, frameWinAt = Date.now();
+    window.__moleFrameCap = 0;
+
+    /* ---- rAF 节流：只在挂机时生效，恢复瞬时完成 ---- */
+    var nativeRaf = window.requestAnimationFrame.bind(window);
+    var nativeCancel = window.cancelAnimationFrame
+      ? window.cancelAnimationFrame.bind(window) : function () {};
+    var pending = {};
+    var seq = 1;
+
+    window.requestAnimationFrame = function (cb) {
+      frames++;                                   // 实测帧率统计用
+      var cap = window.__moleFrameCap;
+      if (!cap) return nativeRaf(cb);
+      var gap = 1000 / cap;
+      var now = performance.now();
+      var wait = gap - (now - lastFrameAt);
+      if (wait <= 0) { lastFrameAt = now; return nativeRaf(cb); }
+      var id = seq++;
+      pending[id] = setTimeout(function () {
+        delete pending[id];
+        lastFrameAt = performance.now();
+        nativeRaf(cb);
+      }, wait);
+      return id;
+    };
+    window.cancelAnimationFrame = function (id) {
+      if (pending[id]) { clearTimeout(pending[id]); delete pending[id]; return; }
+      return nativeCancel(id);
+    };
+
+    /* ---- 有输入就立刻恢复满帧，不等下一轮巡检 ---- */
+    function markInput() {
+      lastInput = Date.now();
+      if (window.__moleFrameCap) {
+        window.__moleFrameCap = 0;
+        try { console.warn('[MoleShell] 检测到操作 → 恢复满帧'); } catch (e) {}
+      }
+    }
+    ['pointerdown', 'touchstart', 'mousedown', 'keydown', 'wheel']
+      .forEach(function (t) {
+        try {
+          window.addEventListener(t, markInput, { capture: true, passive: true });
+        } catch (e) {
+          window.addEventListener(t, markInput, true);
+        }
+      });
+
+    /* ---- WebGL 显存告警 ---- */
+    /* Ruffle 在上下文重建 / 分辨率变化时会换掉 <canvas>，旧 context 会变成
+       脱离文档的僵尸对象（对它的 getError 永远返回 0），所以每次都要校验连通性。 */
+    var glRef = null, glCanvas = null;
+    function findGL() {
+      if (glRef && glCanvas && glCanvas.isConnected) return glRef;
+      glRef = null; glCanvas = null;
+      try {
+        var p = document.querySelector('ruffle-player,ruffle-embed,ruffle-object');
+        var sh = p && p.shadowRoot;
+        var c = sh && sh.querySelector('canvas');
+        if (!c) return null;
+        var g = c.getContext('webgl2') || c.getContext('webgl');
+        if (g) { glRef = g; glCanvas = c; }
+      } catch (e) { /* 探不到就算了，不影响主流程 */ }
+      return glRef;
+    }
+
+    function tick() {
+      var now = Date.now();
+      var uptime = now - T0;
+      var idle = now - lastInput;
+
+      /* 1) 挂机只降帧，**不降分辨率**
+         旧版挂机 3 分钟就把预算砍到 380000px（DPR 0.84），用户回到屏幕前
+         看到的是永久发虚的画面 —— 拿画质换保险，而且换不到：真正打死进程的是
+         wgpu 后端的纹理累积，与画布分辨率无关（经典 webgl 实测 EGL 恒定 64MB）。
+         现在挂机只做帧产额节流，清晰度全程保持不变。 */
+
+      /* 2) 挂机节流 */
+      if (idle >= IDLE_MS && !window.__moleFrameCap) {
+        window.__moleFrameCap = CAP_IDLE;
+        try {
+          console.warn('[MoleShell] 挂机守护：静默 ' + Math.round(idle / 60000)
+            + 'min → 帧率降到 ' + CAP_IDLE + 'fps（分辨率不变，'
+            + BUDGET + 'px）（在线 ' + Math.round(uptime / 60000) + 'min）');
+        } catch (e) {}
+      }
+
+      /* 3) 显存告警 */
+      var g = findGL();
+      if (g) {
+        try {
+          if (g.getError() === 0x505) {          // GL_OUT_OF_MEMORY
+            try { console.warn('[MoleShell] WebGL OUT_OF_MEMORY → 压到最低档'); } catch (e) {}
+            window.__moleFrameCap = CAP_IDLE;
+            try { window.__moleSetBudget(FLOOR_BUDGET); } catch (e) {}
+          }
+        } catch (e) {}
+      }
+
+      /* 4) 实测帧率：每轮巡检打一次，用来对比后端与降载策略的实际代价 */
+      try {
+        var span = (now - frameWinAt) / 1000;
+        var fps = span > 0 ? (frames / span) : 0;
+        console.warn('[MoleShell] 实测 ' + fps.toFixed(1) + 'fps | 后端=' + window.__moleRenderer
+          + ' | 预算=' + BUDGET + 'px | 在线 ' + Math.round(uptime / 60000)
+          + 'min | 空闲 ' + Math.round(idle / 1000) + 's');
+      } catch (e) {}
+      frames = 0; frameWinAt = now;
+
+      setTimeout(tick, 20000);
+    }
+
+    try {
+      console.warn('[MoleShell] 挂机守护已启动：静默 ' + (IDLE_MS / 60000)
+        + 'min 降帧到 ' + CAP_IDLE + 'fps（只降帧、不降分辨率），清晰度下限 '
+        + FLOOR_BUDGET + 'px');
+    } catch (e) {}
+    setTimeout(tick, 20000);
+  })();
+
+  /* ------------------------------------------------------------------
+   * 1.5) 初始化卡顿取证（Long Task）
+   * ---------------------------------------------------------------
+   * 「UI 初始化卡顿」是体感描述，必须有量化锚点才能确认修好了没有。
+   * PerformanceObserver 的 longtask 只在主线程被单次占用 >50ms 时回调，
+   * 平时零成本；这里只记录 ≥100ms 的，并带上相对页面加载的时间点，
+   * 一眼就能对上「界面刚出来那一下」。
+   * ------------------------------------------------------------------ */
+  (function () {
+    if (!window.PerformanceObserver) return;
+    var n = 0;
+    try {
+      var po = new PerformanceObserver(function (list) {
+        var es = list.getEntries();
+        for (var i = 0; i < es.length && n < 40; i++) {
+          if (es[i].duration < 100) continue;
+          n++;
+          try {
+            console.warn('[MoleShell] 主线程长任务 ' + Math.round(es[i].duration)
+              + 'ms @' + Math.round(es[i].startTime) + 'ms');
+          } catch (e) {}
+        }
+      });
+      po.observe({ entryTypes: ['longtask'] });
+    } catch (e) {}
+  })();
+
+  /* 后备缓冲尺寸变化打点：每一次变化都对应 Ruffle 重建一次渲染表面，
+     和上面的长任务时间点对齐，就能确认「初始化卡顿」到底是不是重建导致的。 */
+  (function () {
+    var last = '';
+    setInterval(function () {
+      try {
+        var p = document.querySelector('ruffle-player,ruffle-embed,ruffle-object');
+        var sh = p && p.shadowRoot;
+        var c = sh && sh.querySelector('canvas');
+        if (!c || !c.width) return;
+        var sig = c.width + 'x' + c.height;
+        if (sig === last) return;
+        if (last) {
+          console.warn('[MoleShell] 后备缓冲 ' + last + ' → ' + sig
+            + ' @' + Math.round(performance.now()) + 'ms'
+            + '（DPR=' + compute().toFixed(2) + '，每次变化都会重建渲染表面）');
+        }
+        last = sig;
+      } catch (e) {}
+    }, 500);
+  })();
+
+  /* ------------------------------------------------------------------
    * 2) Ruffle 配置（ruffle.js 加载时立即读取 window.RufflePlayer.config）
    *    参数照抄官网 embed：960x560 / allowScriptAccess=always / wmode=opaque
    * ------------------------------------------------------------------ */
@@ -450,6 +1040,17 @@
          显式声明后两条路径都指向 24，避免它自作主张。 */
       frameRate: 24,
       unmuteOverlay: 'hidden',
+      /* 关闭 Ruffle 自带的右键/长按菜单（'on' | 'rightClickOnly' | 'off'）。
+         这一条是「工具按钮点了弹不出来 / 弹一下就消失」的直接解药：
+         触摸时 Ruffle 会在 pointerdown 起一个长按计时器，到点就弹自己的
+         contextMenuOverlay（音量控制/存档管理器/关于 Ruffle），并注册
+         document 上的 {once:true} pointerup 去收起它，同时 stopPropagation。
+         结果：手指按久一点（平板很常见）→ 覆盖层抢走 pointerup →
+         游戏只收到 mouseDown 收不到 mouseUp → 点击永远不成立，
+         而覆盖层在松手瞬间自己消失，看起来就是「闪一下」。
+         关掉之后 Ruffle 不再生成覆盖层（showContextMenu 直接 return），
+         所有 pointer 事件原样交给 SWF。 */
+      contextMenu: 'off',
       letterbox: 'on',
       scale: 'showAll',             // 元素尺寸 = 影片尺寸时该值实际不生效，仅作保险
       quality: 'low',               // 手机优先帧率；清晰度由上面的 DPR 预算保证
@@ -520,9 +1121,11 @@
    * 监听点），第一次开面板、第二次被当成「点空白关闭」。
    * 这里把每个 pointer 事件连同坐标 / 间隔 / 播放器矩形打进 logcat，
    * 一次点击打出几行、间隔多少毫秒，直接就能判定是不是重复派发。
-   * 正式构建把 __moleInputLog 置 false 即可关闭。
+   * 正式构建默认关闭；需要复查时在控制台执行
+   *   localStorage.setItem('mole_debug','1')  然后重启应用即可打开。
    * ------------------------------------------------------------------ */
-  window.__moleInputLog = true;
+  window.__moleInputLog = false;
+  try { window.__moleInputLog = localStorage.getItem('mole_debug') === '1'; } catch (e) {}
   (function () {
     if (!window.__moleInputLog) return;
     var last = 0, idx = 0;
