@@ -2,6 +2,19 @@
 
 格式参照 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## [1.0.1] - 2026-10-19
+
+本次更新更新了 APP 图标，图标来自群友授权赞助，感谢。
+
+### Changed
+
+- 应用图标更换为群友授权的摩尔庄园主题图标（`res/mipmap-*` 五档密度，48/72/96/144/192 px）
+- `versionName` `1.0` → `1.0.1`，`versionCode` `1` → `2`
+
+### Unchanged
+
+- 除图标与版本号外，安装包内容与 `1.0.0` 完全一致（`assets/`、`classes.dex`、`resources.arsc` 未改动）
+
 ## [0.1.0] - 2026-10-18
 
 首次公开。内容为对一个已构建 APK（`com.taomee.mole` v1.0，versionCode 1）的反编译整理。
