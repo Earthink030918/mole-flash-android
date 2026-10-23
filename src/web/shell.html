@@ -25,11 +25,15 @@
      ================================================================== */
   html,body{margin:0;padding:0;border:0;width:100%;height:100%;background:#000;overflow:hidden;
     -webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:transparent;
+    -webkit-touch-callout:none;        /* 长按不弹「存储图片 / 打开链接」气泡，否则会吞掉一次点击 */
+    overscroll-behavior:none;          /* 阻断下拉刷新 / 边缘回弹，否则上滑会被 WebView 抢走 */
     touch-action:none;}
   #wrap{position:fixed;left:50%;top:50%;
     width:960px;height:560px;                 /* 运行时按影片实际分辨率校正 */
     transform:translate(-50%,-50%) scale(var(--f,1));
-    transform-origin:50% 50%;background:#000;}
+    transform-origin:50% 50%;background:#000;
+    /* 触摸事件在这一层就吃掉，别让它冒泡到 WebView 的滚动/缩放手势识别器 */
+    touch-action:none;-webkit-user-select:none;user-select:none;}
   #wrap > *{display:block;width:100%!important;height:100%!important;margin:0!important;padding:0!important;}
   ruffle-player,ruffle-embed,ruffle-object{display:block;width:100%!important;height:100%!important;background:#000;}
   /* 播放器内部可能出现的 canvas / 中间层统一铺黑底。
@@ -219,12 +223,14 @@
    *   · 足以让 Ruffle 的 ResizeObserver 触发重建，
    *     而重建时会读到新的、更小的 devicePixelRatio。
    * ------------------------------------------------------------------ */
-  window.__moleSetBudget = function (px) {
+  window.__moleSetBudget = function (px, force) {
     try {
       px = Number(px);
       if (!isFinite(px) || px <= 0) return false;
       window.__moleBudget = px;
-      if (px === BUDGET) return true;
+      /* force = 预算不变也要走一次重建（只换渲染目标、不改分辨率）。
+         1.0.3 的「无损纹理回收」靠它，见下面的 __molePurgeTex。 */
+      if (px === BUDGET && !force) return true;
       BUDGET = px;
       window.__moleDprCap = compute();
 
@@ -255,6 +261,47 @@
         } catch (e) {}
       }, 600);
       return true;
+    } catch (e) {
+      return false;
+    }
+  };
+
+  /* ------------------------------------------------------------------
+   * 0.4) 无损纹理回收 —— 长跑卡死的对症手段（1.0.3）
+   * ---------------------------------------------------------------
+   * 现象（群友反馈）：连跑一两个小时之后画面直接冻住，进程还在、日志还在刷，
+   *   但画面不再更新、点哪儿都没反应。1.0.2 之前靠「显存越闸就整页重载」
+   *   把这个坑盖住了，代价是游戏被重启 —— 用户不接受，于是坑就露出来了。
+   *
+   * 根因：Ruffle 的 wgpu 后端把「已上传的位图纹理」缓存在 wasm 侧的纹理池里，
+   *   AVM2 的 GC 只回收 ActionScript 对象，**不会**通知 wgpu 释放已提交的纹理；
+   *   GPU 侧（Adreno / Mali 的 kgsl 池）因此单调上涨。涨到分配不出来的时候，
+   *   驱动不会崩，而是让上下文反复丢失/重建，渲染线程空转 —— 画面就是死的，
+   *   而 CPU 侧一切正常，所以 ANR 也抓不到。
+   *
+   * 做法：预算、帧率、画质**一律不动**，只让 Ruffle 重新走一遍
+   *   「容器尺寸变化 → 重建渲染目标」的既有路径。重建时旧 canvas 的
+   *   WebGL 上下文被丢弃，驱动侧那块纹理内存随之归还；而 AVM2 里的游戏状态、
+   *   已建立的 Socket 连接、登录态全部保留 —— 玩家看不到掉线，也看不到黑屏。
+   *   抖动量仍然是 1px（1/960），且只存在一帧。
+   *
+   * 频率：由 Java 侧按显存闸位触发；这里再兜一层冷却，防止闸位在临界值
+   *   反复抖动时把重建做成风暴（重建本身要重传一遍在位图，是有成本的）。
+   * ------------------------------------------------------------------ */
+  var lastPurgeAt = 0;
+  window.__molePurgeTex = function (minGapMs) {
+    try {
+      var gap = Number(minGapMs);
+      if (!isFinite(gap) || gap <= 0) gap = 240000;      // 默认 4 分钟一次
+      var now = Date.now();
+      if (lastPurgeAt && now - lastPurgeAt < gap) return false;
+      lastPurgeAt = now;
+      var ok = window.__moleSetBudget(BUDGET, true);
+      try {
+        console.warn('[MoleShell] 无损纹理回收 -> ' + (ok ? '已触发渲染目标重建' : '失败')
+            + '（预算不变 ' + BUDGET + 'px，画质/帧率未动）');
+      } catch (e) {}
+      return ok;
     } catch (e) {
       return false;
     }
@@ -460,6 +507,86 @@
    * 界面上不出现任何字样，日志里也只有打码后的标识。
    * ------------------------------------------------------------------ */
   window.__moleNewTarget = function () { /* 静默：不做任何界面提示 */ };
+
+  /* ------------------------------------------------------------------
+   * 4) 输入加固（触控 / 鼠标错乱的壳层侧修复）
+   * ---------------------------------------------------------------
+   * 现象（群友反馈）：「部分触控逻辑和鼠标逻辑完全混乱」——
+   * 点 A 出 B、拖拽跳位、双指操作过之后整块画布的命中区全部偏移且不可恢复。
+   *
+   * 根因不在 Ruffle 的输入映射，而是**浏览器的视口手势**在它之前截胡：
+   *   1. `user-scalable=no` 自 Chrome 32 起对「捏合缩放」已不再强制生效，
+   *      WebView 照样会做 visual viewport zoom。缩放后
+   *      `getBoundingClientRect()` 给的是布局坐标，触点是落在被放大的
+   *      视觉层上的 —— Ruffle 换算出的舞台坐标整体错位，
+   *      表现就是「点哪儿都不对」，而且**不会自己恢复**（除非重载）。
+   *      主修在 Java 侧（setSupportZoom/setBuiltInZoomControls 全关），
+   *      这里做兜底复位。
+   *   2. 长按会弹 callout / 文本选择，Android 上表现为一次点击被吞，
+   *      外加偶发的 contextmenu。
+   *   3. 上滑与边缘拖拽会触发 overscroll / 系统返回手势，
+   *      把 touchmove 抢走 → 拖拽类操作（拉杆、拖地图）变成「拖一下停一下」。
+   *
+   * 修法：把这三类手势拦在 Ruffle 之前，**单指事件原样放过**，
+   * 不吞任何一次点击（所以没有做「双击 300ms 去抖」—— 那会丢快速连点）。
+   * 全程不涉及帧率、画质、画幅。
+   * ------------------------------------------------------------------ */
+  (function () {
+    /* 4.1 多指：第二根手指落下就锁死，直到全部抬起。
+           游戏是单指操作，多指唯一的作用就是触发 WebView 的捏合缩放。 */
+    var multiLock = false;
+    document.addEventListener('touchstart', function (e) {
+      if (e.touches && e.touches.length > 1) { multiLock = true; e.preventDefault(); }
+    }, { passive: false, capture: true });
+    document.addEventListener('touchmove', function (e) {
+      if (multiLock || (e.touches && e.touches.length > 1)) { e.preventDefault(); }
+    }, { passive: false, capture: true });
+    document.addEventListener('touchend', function (e) {
+      if (!e.touches || e.touches.length === 0) { multiLock = false; }
+    }, { passive: true, capture: true });
+    document.addEventListener('gesturestart', function (e) { e.preventDefault(); }, { passive: false });
+
+    /* 4.2 长按选择 / 拖拽 / 右键菜单：不给默认行为 */
+    ['contextmenu', 'selectstart', 'dragstart'].forEach(function (t) {
+      document.addEventListener(t, function (e) { e.preventDefault(); }, { capture: true });
+    });
+
+    /* 4.3 万一仍被缩放（系统辅助功能、三指手势），把视口比例拉回 1:1。
+           visualViewport 不可写，只能重声明 viewport 让内核重置；
+           只在真的被缩放时才动，正常游玩零开销。 */
+    function resetZoom() {
+      try {
+        var vv = window.visualViewport;
+        if (!vv) return;
+        if (Math.abs(vv.scale - 1) > 0.01) {
+          var m = document.querySelector('meta[name=viewport]');
+          if (m) {
+            m.setAttribute('content',
+              'width=device-width,initial-scale=1.0,maximum-scale=1.0,minimum-scale=1.0,user-scalable=no,viewport-fit=cover');
+          }
+          console.warn('[MoleShell] 页面被缩放 scale=' + vv.scale.toFixed(3) + ' → 已重置');
+        }
+      } catch (e) {}
+    }
+
+    /* 4.4 软键盘 / 手势条 / 分屏引起视口变化时重做等比适配。
+           不重做的话 #wrap 的 scale 会停在旧值，画面与实际显示错位 → 命中偏差。 */
+    var fitTimer = 0;
+    function refit() {
+      clearTimeout(fitTimer);
+      fitTimer = setTimeout(function () {
+        try { window.__moleFit(); } catch (e) {}
+        resetZoom();
+      }, 120);
+    }
+    window.addEventListener('orientationchange', refit);
+    if (window.visualViewport) {
+      window.visualViewport.addEventListener('resize', refit);
+      window.visualViewport.addEventListener('scroll', resetZoom);
+    }
+
+    console.log('[MoleShell] 输入加固已装载（多指/长按/视口复位）');
+  })();
 })();
 </script>
 <script src="/__mole_ruffle__.js"></script>

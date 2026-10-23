@@ -1,0 +1,595 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,minimum-scale=1.0,user-scalable=no,viewport-fit=cover">
+<meta name="format-detection" content="telephone=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>摩尔庄园</title>
+<style>
+  /* ==================================================================
+     屏幕适配（第二版，修复「画面放大、UI 被裁切」）
+     ------------------------------------------------------------------
+     上一版把播放器元素撑满视口、指望 Ruffle 的 scale=showAll 去适配。
+     实测不行：AS3 游戏几乎都会在运行时自己改 stage.scaleMode（常见
+     NO_SCALE / EXACT_FIT），一旦它改成 NO_SCALE，舞台就按 960x560
+     的原始坐标 1:1 贴到元素上，视口比舞台小 → 右侧和底部被裁掉，
+     表现就是「画面被放大、部分 UI 被遮挡」。
+
+     正确姿势（本版）：让播放器元素**严格等于影片原生尺寸**（默认
+     960x560，运行时按 metadata 校正），再用 CSS transform 等比缩放
+     整个容器去适配屏幕（contain：完整可见、居中、多余部分留黑边）。
+     这样 scaleMode 是什么都不重要 —— 元素尺寸 = 舞台尺寸 = 设计稿
+     尺寸，和官方电脑微端窗口里的呈现完全一致；手机 / 平板 / 安卓
+     x86 桌面只是整体缩放比例与黑边宽窄不同，永远不裁切、不变形。
+     ================================================================== */
+  html,body{margin:0;padding:0;border:0;width:100%;height:100%;background:#000;overflow:hidden;
+    -webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:transparent;
+    -webkit-touch-callout:none;        /* 长按不弹「存储图片 / 打开链接」气泡，否则会吞掉一次点击 */
+    overscroll-behavior:none;          /* 阻断下拉刷新 / 边缘回弹，否则上滑会被 WebView 抢走 */
+    touch-action:none;}
+  #wrap{position:fixed;left:50%;top:50%;
+    width:960px;height:560px;                 /* 运行时按影片实际分辨率校正 */
+    transform:translate(-50%,-50%) scale(var(--f,1));
+    transform-origin:50% 50%;background:#000;
+    /* 触摸事件在这一层就吃掉，别让它冒泡到 WebView 的滚动/缩放手势识别器 */
+    touch-action:none;-webkit-user-select:none;user-select:none;}
+  #wrap > *{display:block;width:100%!important;height:100%!important;margin:0!important;padding:0!important;}
+  ruffle-player,ruffle-embed,ruffle-object{display:block;width:100%!important;height:100%!important;background:#000;}
+  /* 播放器内部可能出现的 canvas / 中间层统一铺黑底。
+     用途只有一个：GPU 上下文重建（显存吃紧时驱动会先丢上下文再崩）的那一瞬，
+     透明画布会被合成器按默认底色呈现 —— 也就是用户看到的「一闪而过的白光」。
+     给它一个黑底，同一瞬间看起来就只是黑了一帧，不会刺眼。 */
+  #wrap canvas,#wrap video{background:#000;}
+  #hud{position:fixed;left:0;right:0;bottom:0;max-height:46vh;overflow:auto;
+    font:11px/1.45 ui-monospace,Menlo,Consolas,monospace;color:#7f7;
+    background:rgba(0,0,0,.78);padding:6px 8px;z-index:2147483646;
+    white-space:pre-wrap;word-break:break-all;display:none;}
+  #hud.on{display:block;}
+</style>
+</head>
+<body>
+<div id="wrap"></div>
+<div id="hud"></div>
+<script>
+/* ==================================================================
+ * 0) 帧率节流器 —— 必须在 ruffle.js **之前**装载
+ * ==================================================================
+ * 问题（用户实测反馈：「小游戏跟开了倍速一样」）
+ * ------------------------------------------------
+ * 解析淘米 SWF 文件头得到的真实帧率：
+ *     Client.swf                     FR=24.0
+ *     WordMapMainPanel.swf           FR=24.0
+ *     Map_10015.swf                  FR=24.0
+ *     lamubone.swf                   FR=24.0
+ * 而 Ruffle 自己也认到了：metadata.frameRate = 24。
+ *
+ * 但实测本页 requestAnimationFrame 的中位间隔是 17ms（≈58.8 Hz），
+ * 也就是屏幕给的是 60Hz 的推进节奏。两者一除：
+ *     58.8 / 24 ≈ 2.45
+ * 正好对上「开了倍速」的体感 —— 说明 Ruffle 的时间累加没起到限速作用，
+ * 逻辑帧实际上是跟着屏幕刷新率在跑。
+ *
+ * 注意这些 SWF 都是 numFrames=1 的「资源库」型文件（只放位图/元件，
+ * 时间轴不推进），游戏逻辑全靠 ENTER_FRAME 驱动 —— 一旦 ENTER_FRAME
+ * 变成每屏刷一次而不是每 SWF 帧一次，所有小游戏、走路的 NPC、
+ * 计时器就一起快 2.5 倍，和用户描述的现象完全一致。
+ *
+ * 做法：把 rAF 改成「按累积时间放行」——
+ * 原生 rAF 仍然 60Hz 触发，但只有当累积时间够一个 SWF 帧长（1000/24 ms）
+ * 才真正把回调放出去。这样：
+ *   · 若 Ruffle 内部用 performance.now() 算 dt（正确实现）→ 逻辑帧率不变，
+ *     只是渲染调用变少，纯赚；
+ *   · 若 Ruffle 是按 rAF 次数推进（当前实际情形）→ 逻辑帧率被拉回 24。
+ * 两种情况都收敛到 SWF 的真实帧率，不会更糟。
+ *
+ * 传给回调的时间戳仍是原生高精度戳，不做任何加工，避免 Ruffle
+ * 的 dt 计算被我们的节流污染。
+ * ================================================================== */
+(function () {
+  var TARGET_FPS = 24;              // = SWF 真实帧率，可被 __moleSetFps 改
+  var FRAME_MS = 1000 / TARGET_FPS;
+  var nativeRaf = window.requestAnimationFrame.bind(window);
+  var queue = new Map();
+  var seq = 0;
+  var acc = 0;
+  var lastTs = 0;
+
+  window.requestAnimationFrame = function (cb) {
+    var id = ++seq;
+    queue.set(id, cb);
+    return id;
+  };
+  window.cancelAnimationFrame = function (id) {
+    queue.delete(id);
+  };
+
+  function pump(ts) {
+    nativeRaf(pump);
+    if (!lastTs) { lastTs = ts; return; }
+    acc += ts - lastTs;
+    lastTs = ts;
+    if (acc < FRAME_MS) return;
+    acc -= FRAME_MS;
+    /* 页面被挂起很久后（切后台回来）累积量会很大，一次性补齐会造成
+       「补帧风暴」，直接把画面冲过去。这里直接丢弃超额部分。 */
+    if (acc > FRAME_MS * 4) acc = 0;
+    var cbs = [];
+    queue.forEach(function (v) { cbs.push(v); });
+    queue.clear();
+    for (var i = 0; i < cbs.length; i++) {
+      try { cbs[i](ts); } catch (e) {}
+    }
+  }
+  nativeRaf(pump);
+
+  window.__moleSetFps = function (n) {
+    n = Number(n);
+    if (!isFinite(n) || n < 1 || n > 120) return false;
+    TARGET_FPS = n;
+    FRAME_MS = 1000 / n;
+    return true;
+  };
+  window.__moleFps = TARGET_FPS;
+})();
+
+/* ==================================================================
+ * 0) 适配引擎：影片尺寸 → CSS 等比缩放 + 渲染分辨率预算
+ *    必须最先执行（在 ruffle.js 之前）
+ * ================================================================== */
+(function () {
+  /* ---- 0.1) 影片设计尺寸与等比缩放 ---- */
+  var MW = 960, MH = 560;          // 默认按官网 embed 的 960x560；metadata 到手后校正
+  window.__moleMovieW = MW;
+  window.__moleMovieH = MH;
+
+  window.__moleFit = function () {
+    var mw = window.__moleMovieW || MW, mh = window.__moleMovieH || MH;
+    var w = document.getElementById('wrap');
+    if (w) {
+      w.style.width = mw + 'px';
+      w.style.height = mh + 'px';
+    }
+    var vw = Math.max(1, window.innerWidth), vh = Math.max(1, window.innerHeight);
+    var f = Math.min(vw / mw, vh / mh);          // contain：保证整个舞台都可见
+    try { document.documentElement.style.setProperty('--f', f); } catch (e) {}
+    window.__moleFitScale = f;
+    return f;
+  };
+  window.addEventListener('resize', function () {
+    try { window.__moleFit(); } catch (e) {}
+  });
+  window.__moleFit();
+
+  /* ---- 0.2) 渲染分辨率预算（钳制 devicePixelRatio）----
+   * Ruffle 在 wasm 内读 window.devicePixelRatio 决定 canvas 后备缓冲尺寸。
+   * 不钳制：1.5K 手机 DPR 3.5 → 350 万像素；4K 桌面 → 830 万像素，GPU 直接跪。
+   * 注意：本版播放器元素的布局尺寸是影片原生尺寸（960x560），**不是**视口尺寸，
+   * 所以预算要按布局尺寸算，再用 CSS transform 缩到实际显示大小 ——
+   * 显示端缩放是免费的（合成器做），渲染端超预算才是真的贵。 */
+  /* 预算值由 Java 侧注入 —— 按设备与崩溃历史自动分档（正常 90 万 / 崩溃后逐级下调）。
+     为什么必须留出下调空间：真机高压场景（餐厅、牧场）崩溃的根因是
+     Adreno 驱动的 **GPU 内存池耗尽**，不是我们代码的 bug：
+       W/Adreno-GSL: sharedmem_gpumem_alloc: mmap failed errno 12 Out of memory
+       E/Adreno-GSL: kgsl_sharedmem_alloc() failed! Allocation size: (4 KB)
+       F/libc: SIGSEGV in Chrome_InProcGp ← glTexSubImage2D
+     连 4KB 都分配不出来，驱动拿到空指针就直接崩进程。
+     渲染分辨率是与 GPU 内存/带宽成正比的、我们能控制的主要杠杆，
+     所以做成可分档，崩一次自动降一档，直到稳定。 */
+  var BUDGET = 900000;
+  // 占位符未注入时 __PIXEL_BUDGET__ 是未声明标识符 → 直接求值会 ReferenceError，
+  // 用 try 兜住：注入成功则赋值，失败则保持上面的默认值，页面脚本不会整段挂掉。
+  try { BUDGET = __PIXEL_BUDGET__; } catch (e) { /* 用默认值 */ }
+  var MAXCAP = 3;         // 再高对观感已无意义
+  var FLOOR  = 0.5;       // 下限，避免超大窗口下过度降采样发虚
+
+  /* 渲染后端，同样由 Java 侧注入（见 Ruffle 配置段的说明） */
+  var RENDERER = 'wgpu-webgl';
+  try { RENDERER = __RENDERER__; } catch (e) { /* 用默认值 */ }
+  window.__moleRenderer = RENDERER;
+  var raw = window.devicePixelRatio || 1;
+
+  function compute() {
+    var w = document.getElementById('wrap');
+    var lw = (w && w.offsetWidth) || window.__moleMovieW || 960;
+    var lh = (w && w.offsetHeight) || window.__moleMovieH || 560;
+    var byBudget = Math.sqrt(BUDGET / (lw * lh));
+    return Math.max(FLOOR, Math.min(MAXCAP, raw, byBudget));
+  }
+
+  window.__moleDprRaw = raw;
+  window.__moleDprCap = compute();
+  try {
+    Object.defineProperty(window, 'devicePixelRatio', {
+      configurable: true,
+      get: function () { return compute(); }
+    });
+  } catch (e) { /* 定义失败则分辨率不受约束，功能不受影响 */ }
+
+  /* ------------------------------------------------------------------
+   * 0.3) 运行时降载接口 —— 由 Java 侧的 GPU 显存看护调用
+   * ---------------------------------------------------------------
+   * Java 每 3 秒读一次本进程的 GL mtrack（dumpsys 里的 Graphics），
+   * 一旦越过水位就调这里把渲染分辨率**就地**压低 —— 不重载页面、不掉线。
+   *
+   * 为什么需要它：原来的分档只在「下次启动」生效，必须先崩一次才降载，
+   * 而真机证明人多地图里位图纹理是几十秒内堆满的，从 Adreno 开始
+   * `mmap failed errno 12` 到 SIGTRAP 只剩几百毫秒 —— 事后降档根本来不及。
+   *
+   * 实现要点：Ruffle 只在「容器尺寸变化」时才重新读取 devicePixelRatio
+   * 来决定 canvas 后备缓冲大小，光改 getter 的返回值它不会理会。
+   * 这里对 #wrap 做一次「+1px → 下一帧回原位」的跨帧抖动：
+   *   · 视觉上完全看不出（1/960 的差别，且只存在一帧）
+   *   · 足以让 Ruffle 的 ResizeObserver 触发重建，
+   *     而重建时会读到新的、更小的 devicePixelRatio。
+   * ------------------------------------------------------------------ */
+  window.__moleSetBudget = function (px, force) {
+    try {
+      px = Number(px);
+      if (!isFinite(px) || px <= 0) return false;
+      window.__moleBudget = px;
+      /* force = 预算不变也要走一次重建（只换渲染目标、不改分辨率）。
+         1.0.3 的「无损纹理回收」靠它，见下面的 __molePurgeTex。 */
+      if (px === BUDGET && !force) return true;
+      BUDGET = px;
+      window.__moleDprCap = compute();
+
+      var w = document.getElementById('wrap');
+      if (w) {
+        var mw = window.__moleMovieW || 960, mh = window.__moleMovieH || 560;
+        w.style.width = (mw + 1) + 'px';
+        w.style.height = (mh + 1) + 'px';
+        requestAnimationFrame(function () {
+          w.style.width = mw + 'px';
+          w.style.height = mh + 'px';
+          try { window.__moleFit(); } catch (e) {}
+        });
+      }
+      try { window.dispatchEvent(new Event('resize')); } catch (e) {}
+
+      /* 600ms 后回读 canvas 尺寸，把「到底有没有真的重建」直接写进日志 ——
+         这个机制依赖 Ruffle 的 ResizeObserver 行为，属于不可只靠推理确认的一环，
+         必须有一次实测数据兜底。console.warn 会被上面的接管转发到 Java 日志。 */
+      setTimeout(function () {
+        try {
+          var p = document.querySelector('ruffle-player,ruffle-embed,ruffle-object');
+          var sh = p && p.shadowRoot;
+          var c = sh ? sh.querySelector('canvas') : null;
+          console.warn('[MoleShell] 降载 budget=' + px
+              + ' DPR=' + compute().toFixed(2)
+              + ' canvas=' + (c ? (c.width + 'x' + c.height) : '?'));
+        } catch (e) {}
+      }, 600);
+      return true;
+    } catch (e) {
+      return false;
+    }
+  };
+
+  /* ------------------------------------------------------------------
+   * 0.4) 无损纹理回收 —— 长跑卡死的对症手段（1.0.3）
+   * ---------------------------------------------------------------
+   * 现象（群友反馈）：连跑一两个小时之后画面直接冻住，进程还在、日志还在刷，
+   *   但画面不再更新、点哪儿都没反应。1.0.2 之前靠「显存越闸就整页重载」
+   *   把这个坑盖住了，代价是游戏被重启 —— 用户不接受，于是坑就露出来了。
+   *
+   * 根因：Ruffle 的 wgpu 后端把「已上传的位图纹理」缓存在 wasm 侧的纹理池里，
+   *   AVM2 的 GC 只回收 ActionScript 对象，**不会**通知 wgpu 释放已提交的纹理；
+   *   GPU 侧（Adreno / Mali 的 kgsl 池）因此单调上涨。涨到分配不出来的时候，
+   *   驱动不会崩，而是让上下文反复丢失/重建，渲染线程空转 —— 画面就是死的，
+   *   而 CPU 侧一切正常，所以 ANR 也抓不到。
+   *
+   * 做法：预算、帧率、画质**一律不动**，只让 Ruffle 重新走一遍
+   *   「容器尺寸变化 → 重建渲染目标」的既有路径。重建时旧 canvas 的
+   *   WebGL 上下文被丢弃，驱动侧那块纹理内存随之归还；而 AVM2 里的游戏状态、
+   *   已建立的 Socket 连接、登录态全部保留 —— 玩家看不到掉线，也看不到黑屏。
+   *   抖动量仍然是 1px（1/960），且只存在一帧。
+   *
+   * 频率：由 Java 侧按显存闸位触发；这里再兜一层冷却，防止闸位在临界值
+   *   反复抖动时把重建做成风暴（重建本身要重传一遍在位图，是有成本的）。
+   * ------------------------------------------------------------------ */
+  var lastPurgeAt = 0;
+  window.__molePurgeTex = function (minGapMs) {
+    try {
+      var gap = Number(minGapMs);
+      if (!isFinite(gap) || gap <= 0) gap = 240000;      // 默认 4 分钟一次
+      var now = Date.now();
+      if (lastPurgeAt && now - lastPurgeAt < gap) return false;
+      lastPurgeAt = now;
+      var ok = window.__moleSetBudget(BUDGET, true);
+      try {
+        console.warn('[MoleShell] 无损纹理回收 -> ' + (ok ? '已触发渲染目标重建' : '失败')
+            + '（预算不变 ' + BUDGET + 'px，画质/帧率未动）');
+      } catch (e) {}
+      return ok;
+    } catch (e) {
+      return false;
+    }
+  };
+
+  /* ------------------------------------------------------------------
+   * 1) console 接管 —— 必须在 ruffle.js 之前装好。
+   *    Ruffle 的加载失败/AVM2 错误都只走 console，不转发就永远是黑屏无信息。
+   *
+   * ==================================================================
+   * 性能改造（这一版真正找到的卡顿元凶）
+   * ==================================================================
+   * 旧版每次 console 调用都干两件很贵的事：
+   *
+   *   a) 同步调 MoleBridge.log(...) —— 一次跨 JNI 的 Java 调用。
+   *      它跑在渲染线程上，**直接阻塞 Ruffle 的渲染循环**。
+   *   b) getElementById('hud') 之后 textContent += ...，再**读取** scrollTop。
+   *      即便 HUD 是 display:none，写 textContent 仍会标脏样式；
+   *      而读 scrollTop 会强制一次同步重排（layout thrashing）。
+   *
+   * 两者叠起来，效果就是「日志越多的场景越卡」—— 而人多地图恰恰是刷得最凶的。
+   * 而日志一多，主线程被占住、帧时间被拉长，GPU 侧的纹理上传又更赶，
+   * 反过来加速显存吃紧。所以这不只是「卡」，它同时是崩溃的助推器。
+   *
+   * 现在：
+   *   · HUD 关闭（正式版常态）时，**一次 DOM 都不碰**；
+   *   · 所有级别先进队列，每 600ms 或攒够 60 行才做**一次** JNI 转发；
+   *   · 默认只转发 warn/error 及以上 —— Ruffle 的 log/info/debug 数量最大、
+   *     诊断价值最低，全量转发纯属自残（原来靠 logLevel:'warn' 已经砍了一部分，
+   *     但页面自身的调用仍照转不误）。
+   * ------------------------------------------------------------------ */
+  (function () {
+    var queue = [];
+    var flushTimer = null;
+    var HUD_ON = false;
+    var hudEl = null;
+    var hudSeq = 0;
+
+    /* IP 打码：Ruffle 自己会打印 `Missing WebSocket proxy for host 1.2.3.4, port N`，
+       直接把真实服务器地址写进日志。用户明确要求不暴露服务器 IP，故在转发前统一打码。
+       只保留首段用于区分，其余遮蔽。 */
+    function maskIp(s) {
+      return String(s).replace(/\b(\d{1,3})\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/g, '$1.***.***.***');
+    }
+
+    function flush() {
+      flushTimer = null;
+      if (!queue.length) return;
+      if (queue.length > 60) queue.splice(0, queue.length - 60);
+      var joined = queue.join('\n');
+      queue.length = 0;
+      try { if (window.MoleBridge && MoleBridge.log) MoleBridge.log(joined); } catch (e) {}
+    }
+
+    function enqueue(line) {
+      queue.push(line);
+      if (!flushTimer) flushTimer = setTimeout(flush, 600);
+    }
+
+    function hudLine(line) {
+      if (!HUD_ON) return;                     // 正式版：完全不碰 DOM
+      if (!hudEl) hudEl = document.getElementById('hud');
+      if (!hudEl) return;
+      if (hudSeq++ > 300) { hudEl.textContent = ''; hudSeq = 0; }
+      hudEl.textContent += line + '\n';
+      hudEl.scrollTop = hudEl.scrollHeight;
+    }
+
+    function fwd(level, args) {
+      /* 服务器地址最准的来源，必须优先处理（零误报，且与转发级别无关）：
+         Ruffle 只在真的要去连某个 host:port 而 socketProxy 里没配时才打印这句。
+         转交 Java 侧落盘并静默热重启，界面不做任何提示。 */
+      var rawAll = '';
+      try {
+        for (var i = 0; i < args.length; i++) rawAll += String(args[i]) + ' ';
+      } catch (e) {}
+      if (rawAll.indexOf('Missing WebSocket proxy') >= 0) {
+        var mm = /for host\s+([^,\s]+)\s*,\s*port\s+(\d+)/i.exec(rawAll);
+        if (mm) {
+          try { MoleBridge.onMissingProxy(mm[1], parseInt(mm[2], 10)); } catch (e) {}
+        }
+      }
+
+      /* 默认只留 warn / error 及以上。需要全量时把 __moleVerbose 置 true 即可。 */
+      if (!window.__moleVerbose) {
+        var keep = (level === 'WARN' || level === 'ERROR'
+                 || level === 'JSERR' || level === 'REJECT');
+        /* MoleShell 自己的启动/状态日志必须留 —— 总量可控（几十行），
+           而排查时全靠它。Ruffle 的 log/info/debug 才是要砍掉的大头。 */
+        if (!keep && rawAll.indexOf('[MoleShell]') < 0) return;
+      }
+
+      var parts = [];
+      for (var j = 0; j < args.length; j++) {
+        var a = args[j];
+        try { parts.push(typeof a === 'string' ? a : (a && a.stack ? a.stack : JSON.stringify(a))); }
+        catch (e) { parts.push(String(a)); }
+      }
+      var line = maskIp(level + '| ' + parts.join(' '));
+      enqueue(line);
+      hudLine(line);
+    }
+
+    window.__moleLog = fwd;
+    window.__moleHud = function (on) {
+      HUD_ON = !!on;
+      if (!hudEl) hudEl = document.getElementById('hud');
+      if (hudEl) hudEl.className = HUD_ON ? 'on' : '';
+    };
+    var names = ['log', 'info', 'warn', 'error', 'debug'];
+    for (var i = 0; i < names.length; i++) {
+      (function (k) {
+        var orig = console[k] ? console[k].bind(console) : function () {};
+        console[k] = function () { fwd(k.toUpperCase(), arguments); try { orig.apply(null, arguments); } catch (e) {} };
+      })(names[i]);
+    }
+    window.addEventListener('error', function (e) {
+      fwd('JSERR', [e.message + ' @' + (e.filename || '') + ':' + (e.lineno || 0)]);
+    });
+    window.addEventListener('unhandledrejection', function (e) {
+      fwd('REJECT', [String(e && e.reason ? e.reason : e)]);
+    });
+  })();
+
+  /* ------------------------------------------------------------------
+   * 2) Ruffle 配置（ruffle.js 加载时立即读取 window.RufflePlayer.config）
+   *    参数照抄官网 embed：960x560 / allowScriptAccess=always / wmode=opaque
+   * ------------------------------------------------------------------ */
+  (function () {
+    var R = window.RufflePlayer = window.RufflePlayer || {};
+
+    // socketProxy / fontSources 由 Java 侧在下发本页时替换占位符注入
+    var proxy = __SOCKET_PROXY__;
+    var fontSources = __FONT_SOURCES__;
+
+    R.config = {
+      publicPath: '/',              // core.ruffle.*.js / *.wasm 落在同源根路径 → 被 App 换成本地 assets
+      autoplay: 'on',
+      /* 显式覆盖影片帧率 = SWF 的真实帧率。
+         不写的话 Ruffle 走「读取 root movie 帧率」那条路，实测在
+         高刷新率屏幕上会把逻辑推成屏幕刷新率（60Hz / 24fps ≈ 2.5 倍速）。
+         显式声明后两条路径都指向 24，避免它自作主张。 */
+      frameRate: 24,
+      unmuteOverlay: 'hidden',
+      letterbox: 'on',
+      scale: 'showAll',             // 元素尺寸 = 影片尺寸时该值实际不生效，仅作保险
+      quality: 'low',               // 手机优先帧率；清晰度由上面的 DPR 预算保证
+      /* 渲染后端。键名是 preferredRenderer（不是 renderer），取值见 Ruffle 源码枚举：
+           'webgpu' | 'wgpu-webgl'（默认，PC 实测走的就是它） | 'webgl' | 'canvas'
+         正常情况下用默认档；'canvas' 完全不碰 WebGL，是 GPU 内存耗尽时的终极降级档。
+         由 Java 侧按崩溃历史注入 —— 高压场景崩过一次就自动降一档。 */
+      preferredRenderer: window.__moleRenderer || 'wgpu-webgl',
+      /* 不透明合成。官网 embed 本身就是 wmode=opaque（首页 so.addVariable('wmode','opaque')），
+         比默认的 'window' 少一条 alpha 合成通路，GPU 缓冲更省。 */
+      wmode: 'opaque',
+      /* 切后台时彻底停掉渲染循环 —— 与 Activity.onPause 里的 BLUR_JS 呼应，
+         保证「回退桌面不与手机原有渲染管线打架」。 */
+      backgroundExecutionMode: 'none',
+      allowScriptAccess: true,
+      allowNetworking: 'all',
+      logLevel: 'warn',             // debug 会逐帧刷 naga 着色器日志，实测是显著的性能杀手
+      warnOnUnsupportedContent: true,
+      upgradeToHttps: false,
+      openUrlMode: 'allow',
+      socketProxy: proxy,
+      /**
+       * 字体：直接跟随手机。
+       * ---------------------------------------------------------------
+       * Ruffle 的 deviceFontRenderer 有两档：
+       *   'embedded'（默认）——用 Ruffle 自带的字体集去凑。web 版拿不到系统字体，
+       *                       未知字体名一律回退到自带的 Noto Sans（无 CJK 字形），
+       *                       实测日志里 SimSun/宋体/SimHei/Tahoma/Arial… 全部 `Unknown device font`，
+       *                       表现就是中文整段消失、拉丁文和设计稿不一致。
+       *   'canvas'         ——把设备字体的绘制交给浏览器的 canvas 文本渲染，
+       *                       于是字体解析走 WebView 自己的字体栈，
+       *                       未知字体名由系统 fallback 到设备自带中文字体。
+       *                       这就是「直接跟随手机字体」，零字体文件、零体积增长、
+       *                       字形与系统观感一致。
+       * 另外实测过：往 fontSources 里塞系统字体文件并不能解决 ——
+       *   Ruffle 只按字体**内部 family 名**注册，URL 文件名不参与匹配
+       *   （把 NotoSansCJK 挂在 /fonts/SimSun.ttf 下，SimSun 依旧 Unknown）。
+       */
+      deviceFontRenderer: 'canvas',
+      fontSources: fontSources,
+      splashScreen: true,           // 保留启动画面，出问题至少能看见东西
+      favorFlash: false
+    };
+    try { MoleBridge.log('[cfg] socketProxy 条目=' + proxy.length
+        + ' | 字体渲染=canvas(跟随手机)'
+        + ' | 后端=' + (window.__moleRenderer || '?')
+        + ' | 预算=' + BUDGET + 'px'
+        + ' | DPR raw=' + window.__moleDprRaw + ' 钳制后=' + window.__moleDprCap.toFixed(2)
+        + ' | 缩放=' + (window.__moleFitScale || 1).toFixed(3)
+        + ' | 视口=' + window.innerWidth + 'x' + window.innerHeight); } catch (e) {}
+  })();
+
+  /* ------------------------------------------------------------------
+   * 3) 新服务器地址：静默处理，不做任何提示
+   * ---------------------------------------------------------------
+   * 曾经这里会弹 Toast 告知「发现新服务器 xxx」—— 已按用户要求移除。
+   * 原因：地址会出现在手机屏幕上，旁观者即可抄走服务器 IP，对用户不利。
+   * 现在新地址只在应用内部落盘（SharedPreferences），
+   * 界面上不出现任何字样，日志里也只有打码后的标识。
+   * ------------------------------------------------------------------ */
+  window.__moleNewTarget = function () { /* 静默：不做任何界面提示 */ };
+
+  /* ------------------------------------------------------------------
+   * 4) 输入加固（触控 / 鼠标错乱的壳层侧修复）
+   * ---------------------------------------------------------------
+   * 现象（群友反馈）：「部分触控逻辑和鼠标逻辑完全混乱」——
+   * 点 A 出 B、拖拽跳位、双指操作过之后整块画布的命中区全部偏移且不可恢复。
+   *
+   * 根因不在 Ruffle 的输入映射，而是**浏览器的视口手势**在它之前截胡：
+   *   1. `user-scalable=no` 自 Chrome 32 起对「捏合缩放」已不再强制生效，
+   *      WebView 照样会做 visual viewport zoom。缩放后
+   *      `getBoundingClientRect()` 给的是布局坐标，触点是落在被放大的
+   *      视觉层上的 —— Ruffle 换算出的舞台坐标整体错位，
+   *      表现就是「点哪儿都不对」，而且**不会自己恢复**（除非重载）。
+   *      主修在 Java 侧（setSupportZoom/setBuiltInZoomControls 全关），
+   *      这里做兜底复位。
+   *   2. 长按会弹 callout / 文本选择，Android 上表现为一次点击被吞，
+   *      外加偶发的 contextmenu。
+   *   3. 上滑与边缘拖拽会触发 overscroll / 系统返回手势，
+   *      把 touchmove 抢走 → 拖拽类操作（拉杆、拖地图）变成「拖一下停一下」。
+   *
+   * 修法：把这三类手势拦在 Ruffle 之前，**单指事件原样放过**，
+   * 不吞任何一次点击（所以没有做「双击 300ms 去抖」—— 那会丢快速连点）。
+   * 全程不涉及帧率、画质、画幅。
+   * ------------------------------------------------------------------ */
+  (function () {
+    /* 4.1 多指：第二根手指落下就锁死，直到全部抬起。
+           游戏是单指操作，多指唯一的作用就是触发 WebView 的捏合缩放。 */
+    var multiLock = false;
+    document.addEventListener('touchstart', function (e) {
+      if (e.touches && e.touches.length > 1) { multiLock = true; e.preventDefault(); }
+    }, { passive: false, capture: true });
+    document.addEventListener('touchmove', function (e) {
+      if (multiLock || (e.touches && e.touches.length > 1)) { e.preventDefault(); }
+    }, { passive: false, capture: true });
+    document.addEventListener('touchend', function (e) {
+      if (!e.touches || e.touches.length === 0) { multiLock = false; }
+    }, { passive: true, capture: true });
+    document.addEventListener('gesturestart', function (e) { e.preventDefault(); }, { passive: false });
+
+    /* 4.2 长按选择 / 拖拽 / 右键菜单：不给默认行为 */
+    ['contextmenu', 'selectstart', 'dragstart'].forEach(function (t) {
+      document.addEventListener(t, function (e) { e.preventDefault(); }, { capture: true });
+    });
+
+    /* 4.3 万一仍被缩放（系统辅助功能、三指手势），把视口比例拉回 1:1。
+           visualViewport 不可写，只能重声明 viewport 让内核重置；
+           只在真的被缩放时才动，正常游玩零开销。 */
+    function resetZoom() {
+      try {
+        var vv = window.visualViewport;
+        if (!vv) return;
+        if (Math.abs(vv.scale - 1) > 0.01) {
+          var m = document.querySelector('meta[name=viewport]');
+          if (m) {
+            m.setAttribute('content',
+              'width=device-width,initial-scale=1.0,maximum-scale=1.0,minimum-scale=1.0,user-scalable=no,viewport-fit=cover');
+          }
+          console.warn('[MoleShell] 页面被缩放 scale=' + vv.scale.toFixed(3) + ' → 已重置');
+        }
+      } catch (e) {}
+    }
+
+    /* 4.4 软键盘 / 手势条 / 分屏引起视口变化时重做等比适配。
+           不重做的话 #wrap 的 scale 会停在旧值，画面与实际显示错位 → 命中偏差。 */
+    var fitTimer = 0;
+    function refit() {
+      clearTimeout(fitTimer);
+      fitTimer = setTimeout(function () {
+        try { window.__moleFit(); } catch (e) {}
+        resetZoom();
+      }, 120);
+    }
+    window.addEventListener('orientationchange', refit);
+    if (window.visualViewport) {
+      window.visualViewport.addEventListener('resize', refit);
+      window.visualViewport.addEventListener('scroll', resetZoom);
+    }
+
+    console.log('[MoleShell] 输入加固已装载（多指/长按/视口复位）');
+  })();
+})();
+</script>
+<script src="/__mole_ruffle__.js"></script>
+<script src="/__mole_boot__.js"></script>
+</body>
+</html>
