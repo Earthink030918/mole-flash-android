@@ -1,0 +1,1207 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,minimum-scale=1.0,user-scalable=no,viewport-fit=cover">
+<meta name="format-detection" content="telephone=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>摩尔庄园</title>
+<style>
+  /* ==================================================================
+     屏幕适配（第二版，修复「画面放大、UI 被裁切」）
+     ------------------------------------------------------------------
+     上一版把播放器元素撑满视口、指望 Ruffle 的 scale=showAll 去适配。
+     实测不行：AS3 游戏几乎都会在运行时自己改 stage.scaleMode（常见
+     NO_SCALE / EXACT_FIT），一旦它改成 NO_SCALE，舞台就按 960x560
+     的原始坐标 1:1 贴到元素上，视口比舞台小 → 右侧和底部被裁掉，
+     表现就是「画面被放大、部分 UI 被遮挡」。
+
+     正确姿势（本版）：让播放器元素**严格等于影片原生尺寸**（默认
+     960x560，运行时按 metadata 校正），再用 CSS transform 等比缩放
+     整个容器去适配屏幕（contain：完整可见、居中、多余部分留黑边）。
+     这样 scaleMode 是什么都不重要 —— 元素尺寸 = 舞台尺寸 = 设计稿
+     尺寸，和官方电脑微端窗口里的呈现完全一致；手机 / 平板 / 安卓
+     x86 桌面只是整体缩放比例与黑边宽窄不同，永远不裁切、不变形。
+     ================================================================== */
+  html,body{margin:0;padding:0;border:0;width:100%;height:100%;background:#000;overflow:hidden;
+    -webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:transparent;
+    -webkit-touch-callout:none;        /* 长按不弹「存储图片 / 打开链接」气泡，否则会吞掉一次点击 */
+    overscroll-behavior:none;          /* 阻断下拉刷新 / 边缘回弹，否则上滑会被 WebView 抢走 */
+    touch-action:none;}
+  #wrap{position:fixed;left:50%;top:50%;
+    width:960px;height:560px;                 /* 运行时按影片实际分辨率校正 */
+    transform:translate(-50%,-50%) scale(var(--f,1));
+    transform-origin:50% 50%;background:#000;
+    /* 触摸事件在这一层就吃掉，别让它冒泡到 WebView 的滚动/缩放手势识别器 */
+    touch-action:none;-webkit-user-select:none;user-select:none;}
+  #wrap > *{display:block;width:100%!important;height:100%!important;margin:0!important;padding:0!important;}
+  ruffle-player,ruffle-embed,ruffle-object{display:block;width:100%!important;height:100%!important;background:#000;}
+  /* 播放器内部可能出现的 canvas / 中间层统一铺黑底。
+     用途只有一个：GPU 上下文重建（显存吃紧时驱动会先丢上下文再崩）的那一瞬，
+     透明画布会被合成器按默认底色呈现 —— 也就是用户看到的「一闪而过的白光」。
+     给它一个黑底，同一瞬间看起来就只是黑了一帧，不会刺眼。 */
+  #wrap canvas,#wrap video{background:#000;}
+  #hud{position:fixed;left:0;right:0;bottom:0;max-height:46vh;overflow:auto;
+    font:11px/1.45 ui-monospace,Menlo,Consolas,monospace;color:#7f7;
+    background:rgba(0,0,0,.78);padding:6px 8px;z-index:2147483646;
+    white-space:pre-wrap;word-break:break-all;display:none;}
+  #hud.on{display:block;}
+
+  /* ---- 虚拟触控板图层（OmniPad，见第 5 段） ----
+     默认 pointer-events:none，空白处一律穿透；
+     只有 OmniPad 自己的 .omnipad-target-zone / .omnipad-button-base 是 auto。 */
+  #pad{position:fixed;left:0;top:0;width:100%;height:100%;z-index:9;
+    pointer-events:none;touch-action:none;}
+  /* 触控板压暗一点、通透一点，别抢游戏画面的注意力 */
+  #pad .omnipad-trackpad{opacity:.92;
+    --omnipad-trackpad-bg:rgba(0,0,0,.45);
+    --omnipad-btn-border-color:rgba(255,255,255,.42);
+    --omnipad-btn-label-color:rgba(255,255,255,.9);
+    --omnipad-btn-font-size:13px;
+    --omnipad-btn-font-family:system-ui,-apple-system,"PingFang SC",sans-serif;}
+  /* ---- 触控板视觉隐藏（1.0.7 起只在「必须压画面」时才用）----
+     1.0.7 把板子挪进了屏幕右侧黑边，那里本来就是黑的，看得见才找得到
+     位置，所以默认显示；只有满幅无黑边、被迫压右下角（__molePad.corner(true)）
+     或用户手动关闭时才加 .pad-invisible 让它彻底看不见。
+     用 opacity:0 而**不是** display:none / visibility:hidden：
+     后两者会连带退出命中测试，拖动手势当场失效；而 opacity:0
+     的元素照样接收 pointer 事件，所以「看不见」但「手感一点没变」。
+     只作用于 .omnipad-trackpad 本身，靶区（TargetZone）与虚拟光标不受影响，
+     点哪走哪、悬停菜单照旧。想恢复外观：__molePad.trackpad('on')。 */
+  #pad.pad-invisible .omnipad-trackpad{opacity:0!important;}
+</style>
+<!-- OmniPad 样式（@omnipad/vanilla 0.7.3 dist/index.css，原样内联，不依赖外网） -->
+<style id="omnipad-css">:root{--omnipad-btn-bg: rgba(255, 255, 255, .2);--omnipad-btn-border-color: rgba(255, 255, 255, .4);--omnipad-btn-border-style: solid;--omnipad-btn-border-width: 2px;--omnipad-btn-radius: 8px;--omnipad-btn-font-family: "Upheaval", "monacoregular", sans-serif;--omnipad-btn-font-size: 18px;--omnipad-btn-font-weight: bold;--omnipad-btn-label-color: #ffffff;--omnipad-btn-pressed-bg: rgba(255, 186, 67, .6);--omnipad-btn-pressed-border-color: #ffba43;--omnipad-btn-pressed-opacity: 1;--omnipad-btn-transition-duration: .1s;--omnipad-btn-transition-timing: ease-out;--omnipad-dpad-arm-bg: rgba(255, 255, 255, .15);--omnipad-dpad-arm-border: 2px solid rgba(255, 255, 255, .4);--omnipad-dpad-arm-border-radius: 8px;--omnipad-dpad-active-bg: rgba(255, 186, 67, .6);--omnipad-dpad-active-border: #ffba43;--omnipad-dpad-active-scale: .96;--omnipad-dpad-active-transform: scale(var(--omnipad-dpad-active-scale));--omnipad-dpad-bg: rgba(255, 255, 255, .05);--omnipad-dpad-border-radius: 50%;--omnipad-default-cursor-height: 20px;--omnipad-default-cursor-width: 20px;--omnipad-default-cursor-transition: opacity .2s;--omnipad-default-cursor-dot-background: #ff000080;--omnipad-default-cursor-dot-border-color: #ffffff;--omnipad-default-cursor-dot-border-radius: 50%;--omnipad-default-cursor-dot-border-style: solid;--omnipad-default-cursor-dot-border-width: 2px;--omnipad-default-cursor-dot-down-background: #ff0000;--omnipad-default-cursor-dot-down-scale: .8;--omnipad-default-axis-stick-bg: rgba(255, 255, 255, .4);--omnipad-default-axis-stick-border-color: rgba(255, 255, 255, .8);--omnipad-default-axis-stick-border-radius: 50%;--omnipad-default-axis-stick-border-style: solid;--omnipad-default-axis-stick-border-width: 2px;--omnipad-default-axis-stick-box-shadow: 0 4px 10px rgba(0, 0, 0, .3);--omnipad-default-axis-stick-height-scaler: .2;--omnipad-default-axis-stick-width-scaler: .2;--omnipad-default-axis-stick-active-bg: rgba(255, 186, 67, .6);--omnipad-default-axis-stick-active-border-color: #ffba43;--omnipad-focus-color: rgba(255, 186, 67, .8);--omnipad-focus-bg-color: rgba(100, 200, 255, .05);--omnipad-joystick-base-border-color: rgba(255, 255, 255, .4);--omnipad-joystick-base-border-radius: 50%;--omnipad-joystick-base-border-style: solid;--omnipad-joystick-base-border-width: 2px;--omnipad-joystick-base-bg: rgba(255, 255, 255, .2);--omnipad-default-joystick-stick-height-scaler: .5;--omnipad-default-joystick-stick-width-scaler: .5;--omnipad-joystick-btn-bg: rgba(255, 255, 255, .2);--omnipad-joystick-btn-border-color: rgba(255, 255, 255, .4);--omnipad-joystick-btn-border-style: solid;--omnipad-joystick-btn-border-width: 2px;--omnipad-joystick-btn-radius: 50%;--omnipad-trackpad-bg: rgba(255, 255, 255, .05);--omnipad-trackpad-border-style: dashed;--omnipad-trackpad-cursor: crosshair}.omnipad-prevent{touch-action:none;user-select:none;outline:none;-webkit-user-select:none;-webkit-tap-highlight-color:transparent}.omnipad-root-layer{position:relative;pointer-events:none}.omnipad-virtual-layer-base{position:absolute;inset:0;pointer-events:none;z-index:1000}.omnipad-input-zone{position:relative;pointer-events:none;container-type:size}.omnipad-input-zone-trigger{position:absolute;inset:0;pointer-events:auto;background:transparent;touch-action:none}.dynamic-widget-mount{position:absolute;left:0;top:0;pointer-events:none;will-change:transform;transform:translate3d(var(--dynamic-widget-mount-x, 0px),var(--dynamic-widget-mount-y, 0px),0);--dynamic-widget-mount-x: 0px;--dynamic-widget-mount-y: 0px}.omnipad-target-zone{position:relative;pointer-events:auto;overflow:hidden;container-type:size}.omnipad-target-focus-layer,.omnipad-target-content-layer{position:absolute;inset:0;pointer-events:none}.omnipad-virtual-cursor{position:absolute;top:0;left:0;width:var(--omnipad-default-cursor-width);height:var(--omnipad-default-cursor-height);pointer-events:none;will-change:transform;transition:var(--omnipad-default-cursor-transition);z-index:10;transform:translate3d(calc(-50% + var(--omnipad-virtual-cursor-x, 0px)),calc(-50% + var(--omnipad-virtual-cursor-y, 0px)),0);--omnipad-virtual-cursor-x: 0px;--omnipad-virtual-cursor-y: 0px}.omnipad-default-cursor-dot{width:100%;height:100%;box-sizing:border-box;background:var(--omnipad-default-cursor-dot-background);border-color:var(--omnipad-default-cursor-dot-border-color);border-radius:var(--omnipad-default-cursor-dot-border-radius);border-style:var(--omnipad-default-cursor-dot-border-style);border-width:var(--omnipad-default-cursor-dot-border-width)}.omnipad-default-cursor-dot.is-down{transform:scale(var(--omnipad-default-cursor-dot-down-scale));background:var(--omnipad-default-cursor-dot-down-background)}.omnipad-default-focus-border-feedback{position:absolute;inset:0;pointer-events:none;z-index:5;border:2px solid var(--omnipad-focus-color);background-color:var(--omnipad-focus-bg-color);box-shadow:inset 0 0 10px var(--omnipad-focus-color);box-sizing:border-box}.omnipad-button-base{position:relative;overflow:hidden;box-sizing:border-box;pointer-events:auto;will-change:transform,opacity}.omnipad-button-visual-layer,.omnipad-default-button-base,.omnipad-button-content-layer{position:absolute;inset:0;pointer-events:none}.omnipad-default-button-base{background:var(--omnipad-btn-bg);border:var(--omnipad-btn-border-width) var(--omnipad-btn-border-style) var(--omnipad-btn-border-color);border-radius:var(--omnipad-btn-radius);transition:all var(--omnipad-btn-transition-duration) var(--omnipad-btn-transition-timing)}.omnipad-default-button-base.is-active{background:var(--omnipad-btn-pressed-bg);border-color:var(--omnipad-btn-pressed-border-color);opacity:var(--omnipad-btn-pressed-opacity)}.omnipad-button-content-layer{display:flex;align-items:center;justify-content:center}.omnipad-default-button-label{font-family:var(--omnipad-btn-font-family);font-size:var(--omnipad-btn-font-size);color:var(--omnipad-btn-label-color);font-weight:var(--omnipad-btn-font-weight)}.omnipad-axis-base{position:relative;box-sizing:border-box;pointer-events:auto;container-type:size}.omnipad-axis-bg,.omnipad-axis-content-layer{position:absolute;inset:0;pointer-events:none}.omnipad-axis-bg{box-sizing:border-box;border-color:var(--omnipad-axis-base-border-color);border-radius:var(--omnipad-axis-base-border-radius);border-style:var(--omnipad-axis-base-border-style);border-width:var(--omnipad-axis-base-border-width);background:var(--omnipad-axis-base-bg)}.omnipad-axis-stick-container{width:calc(var(--omnipad-axis-stick-width, 0px) * var(--omnipad-default-axis-stick-width-scaler, .2));height:calc(var(--omnipad-axis-stick-height, 0px) * var(--omnipad-default-axis-stick-height-scaler, .2));position:absolute;left:0;top:0;pointer-events:none;transform:translate3d(calc(-50% + var(--omnipad-axis-stick-container-x, 0px)),calc(-50% + var(--omnipad-axis-stick-container-y, 0px)),0);--omnipad-axis-stick-container-x: 0px;--omnipad-axis-stick-container-y: 0px}.omnipad-default-axis-stick{width:100%;height:100%;box-sizing:border-box;background:var(--omnipad-default-axis-stick-bg);border-width:var(--omnipad-default-axis-stick-border-width);border-style:var(--omnipad-default-axis-stick-border-style);border-color:var(--omnipad-default-axis-stick-border-color);border-radius:var(--omnipad-default-axis-stick-border-radius);box-shadow:var(--omnipad-default-axis-stick-box-shadow)}.omnipad-default-axis-stick.is-active{background:var(--omnipad-default-axis-stick-active-bg);border-color:var(--omnipad-default-axis-stick-active-border-color)}.omnipad-dpad-cross-bg{position:relative;width:100%;height:100%;border-radius:var(--omnipad-dpad-border-radius);background:var(--omnipad-dpad-bg);pointer-events:none}.dpad-arm{position:absolute;background:var(--omnipad-dpad-arm-bg);border:var(--omnipad-dpad-arm-border);box-sizing:border-box;transition:background .1s,transform .1s,border-color .1s}.dpad-arm.top{inset:0 33% 66%;border-bottom:none;border-radius:var(--omnipad-dpad-arm-border-radius) var(--omnipad-dpad-arm-border-radius) 0 0}.dpad-arm.bottom{inset:66% 33% 0;border-top:none;border-radius:0 0 var(--omnipad-dpad-arm-border-radius) var(--omnipad-dpad-arm-border-radius)}.dpad-arm.left{inset:33% 66% 33% 0;border-right:none;border-radius:var(--omnipad-dpad-arm-border-radius) 0 0 var(--omnipad-dpad-arm-border-radius)}.dpad-arm.right{inset:33% 0 33% 66%;border-left:none;border-radius:0 var(--omnipad-dpad-arm-border-radius) var(--omnipad-dpad-arm-border-radius) 0}.dpad-center{position:absolute;inset:33%;background:var(--omnipad-dpad-arm-bg);z-index:1}.dpad-arm.on{background:var(--omnipad-dpad-active-bg);border-color:var(--omnipad-dpad-active-border);transform:var(--omnipad-dpad-active-transform);z-index:2}.omnipad-joystick{pointer-events:auto;--omnipad-axis-base-border-color: var(--omnipad-joystick-base-border-color);--omnipad-axis-base-border-radius: var(--omnipad-joystick-base-border-radius);--omnipad-axis-base-border-style: var(--omnipad-joystick-base-border-style);--omnipad-axis-base-border-width: var(--omnipad-joystick-base-border-width);--omnipad-axis-base-bg: var(--omnipad-joystick-base-bg);--omnipad-default-axis-stick-height-scaler: var(--omnipad-default-joystick-stick-height-scaler);--omnipad-default-axis-stick-width-scaler: var(--omnipad-default-joystick-stick-width-scaler);--omnipad-btn-bg: var(--omnipad-joystick-btn-bg);--omnipad-btn-border-color: var(--omnipad-joystick-btn-border-color);--omnipad-btn-border-style: var(--omnipad-joystick-btn-border-style);--omnipad-btn-border-width: var(--omnipad-joystick-btn-border-width);--omnipad-btn-radius: var(--omnipad-joystick-btn-radius)}.omnipad-trackpad{--omnipad-btn-border-style: var(--omnipad-trackpad-border-style);--omnipad-btn-bg: var(--omnipad-trackpad-bg);cursor:var(--omnipad-trackpad-cursor)}.omnipad-trackpad:before{content:"";position:absolute;inset:10px;background-image:radial-gradient(rgba(255,255,255,.1) 1px,transparent 1px);background-size:20px 20px;pointer-events:none}
+</style>
+</head>
+<body>
+<div id="wrap"></div>
+<div id="hud"></div>
+<script>
+/* ==================================================================
+ * 0) 帧率节流器 —— 必须在 ruffle.js **之前**装载
+ * ==================================================================
+ * 问题（用户实测反馈：「小游戏跟开了倍速一样」）
+ * ------------------------------------------------
+ * 解析淘米 SWF 文件头得到的真实帧率：
+ *     Client.swf                     FR=24.0
+ *     WordMapMainPanel.swf           FR=24.0
+ *     Map_10015.swf                  FR=24.0
+ *     lamubone.swf                   FR=24.0
+ * 而 Ruffle 自己也认到了：metadata.frameRate = 24。
+ *
+ * 但实测本页 requestAnimationFrame 的中位间隔是 17ms（≈58.8 Hz），
+ * 也就是屏幕给的是 60Hz 的推进节奏。两者一除：
+ *     58.8 / 24 ≈ 2.45
+ * 正好对上「开了倍速」的体感 —— 说明 Ruffle 的时间累加没起到限速作用，
+ * 逻辑帧实际上是跟着屏幕刷新率在跑。
+ *
+ * 注意这些 SWF 都是 numFrames=1 的「资源库」型文件（只放位图/元件，
+ * 时间轴不推进），游戏逻辑全靠 ENTER_FRAME 驱动 —— 一旦 ENTER_FRAME
+ * 变成每屏刷一次而不是每 SWF 帧一次，所有小游戏、走路的 NPC、
+ * 计时器就一起快 2.5 倍，和用户描述的现象完全一致。
+ *
+ * 做法：把 rAF 改成「按累积时间放行」——
+ * 原生 rAF 仍然 60Hz 触发，但只有当累积时间够一个 SWF 帧长（1000/24 ms）
+ * 才真正把回调放出去。这样：
+ *   · 若 Ruffle 内部用 performance.now() 算 dt（正确实现）→ 逻辑帧率不变，
+ *     只是渲染调用变少，纯赚；
+ *   · 若 Ruffle 是按 rAF 次数推进（当前实际情形）→ 逻辑帧率被拉回 24。
+ * 两种情况都收敛到 SWF 的真实帧率，不会更糟。
+ *
+ * 传给回调的时间戳仍是原生高精度戳，不做任何加工，避免 Ruffle
+ * 的 dt 计算被我们的节流污染。
+ * ================================================================== */
+(function () {
+  var TARGET_FPS = 24;              // = SWF 真实帧率，可被 __moleSetFps 改
+  var FRAME_MS = 1000 / TARGET_FPS;
+  var nativeRaf = window.requestAnimationFrame.bind(window);
+  var queue = new Map();
+  var seq = 0;
+  var acc = 0;
+  var lastTs = 0;
+
+  window.requestAnimationFrame = function (cb) {
+    var id = ++seq;
+    queue.set(id, cb);
+    return id;
+  };
+  window.cancelAnimationFrame = function (id) {
+    queue.delete(id);
+  };
+
+  /* ------------------------------------------------------------------
+   * 时间轴钳制（1.0.5）——「切后台回来被服务器踢」的对症修复
+   * ---------------------------------------------------------------
+   * 现象（群友反馈）：把游戏切到后台，再回来时服务器收到**大量时间顺序
+   *   对不上的异常数据包**，随即被踢下线。
+   *
+   * 根因（已核对 Ruffle 源码）：
+   *   web/src/lib.rs:1220   dt = 本次 rAF 时间戳 − 上次 rAF 时间戳
+   *   core/src/player.rs:550  frame_accumulator += dt，然后
+   *                           while (frame < max_frames_per_tick=5) run_frame()
+   *   切后台时 Java 侧执行了 WebView.onPause() + pauseTimers()，rAF 彻底
+   *   停摆；回来时第一个时间戳已经是几分钟之后 → dt = 挂起时长。于是：
+   *     · 一次 tick 连跑 5 帧（"补帧风暴"）
+   *     · update_timers(dt) 把所有 setInterval 一次性补跑
+   *     · 影片全局时钟（getTimer）凭空前进几分钟
+   *   游戏在这几帧里把积压逻辑全做了一遍，每个包都带着跳变后的时间戳
+   *   发出去 —— 服务器看到的就是「时间倒挂 / 顺序错乱」的一串包。
+   *
+   * 做法：**只改喂给 Ruffle 的时间戳，不碰任何真实计时**。
+   *   · 平时虚拟时钟与真实时间 1:1 前进，一毫秒不差；
+   *   · 单次推进超过 MAX_STEP_MS（250ms ≈ 6 帧）就截断 —— 真实掉帧
+   *     很难到这个量级，到了也说明这一帧已经废了，截断只会更稳；
+   *   · 超过 RESUME_GAP_MS（800ms）判定为后台恢复：只推进 1 帧，
+   *     让游戏从挂起处平滑接上，不补帧、不补定时器。
+   *   帧率 / 画质 / 节流器 / 画幅一律不参与，仍是 24fps。
+   * ------------------------------------------------------------------ */
+  var MAX_STEP_MS = 250;
+  var RESUME_GAP_MS = 800;
+  var vTs = 0;              // 虚拟时间轴（唯一喂给 Ruffle 的时间戳）
+  var lastReal = 0;
+  var stallMs = 0;          // 累计被切掉的时间（诊断用）
+  var resumeN = 0;
+  var lastNoteAt = 0;
+  var pendingAlign = false; // 后台由 Ruffle 自己跑过 → 回来时对齐真实时间
+  var alignN = 0;
+
+  function dispatch(v) {
+    var cbs = [];
+    queue.forEach(function (f) { cbs.push(f); });
+    queue.clear();
+    for (var i = 0; i < cbs.length; i++) {
+      try { cbs[i](v); } catch (e) {}
+    }
+  }
+
+  function pump(ts) {
+    nativeRaf(pump);
+    if (!lastTs) { lastTs = ts; lastReal = ts; vTs = ts; return; }
+
+    /* 后台跑过一程再回来：直接对齐，不钳制。
+       ---------------------------------------------------------------
+       1.0.6 起后台由 Ruffle 自己的 Worker 驱动（见第 6 段），它喂给
+       core 的时间戳是 performance.now()。而 core 算 dt 用的是
+       「本次时间戳 − 上次时间戳」（lib.rs:1219），**没有负值保护**。
+       若这里还按「只推进 1 帧」处理，vTs 会永远落在 core 的
+       last_tick 之后 → dt 恒为负 → 帧累加器只减不增 → 画面彻底冻住。
+       所以后台真在跑的情况下，把 vTs 直接对齐到真实时间，
+       core 看到的时间戳序列是连续的，dt 恢复成 ~41ms。 */
+    if (pendingAlign) {
+      pendingAlign = false;
+      vTs = ts; lastReal = ts; lastTs = ts;
+      stallMs = 0;                       // 后台期间没有"被切断"的时间
+      acc = FRAME_MS;                    // 这一帧立即放行
+      resumeN++;
+      alignN++;
+      acc -= FRAME_MS;
+      if (ts - lastNoteAt > 8000) {
+        lastNoteAt = ts;
+        try {
+          console.warn('[MoleShell] 回到前台：后台一直在跑，时间轴已对齐真实时间'
+            + '（第 ' + alignN + ' 次，无补帧、无跳变）');
+        } catch (e) {}
+        try { if (window.__moleAfterResume) window.__moleAfterResume(0); } catch (e) {}
+      }
+      dispatch(vTs);
+      return;
+    }
+
+    var raw = ts - lastReal;
+    lastReal = ts;
+    lastTs = ts;
+    if (!(raw >= 0)) raw = 0;              // 时间戳回退（极少见）当作 0
+
+    var step = raw;
+    if (raw > RESUME_GAP_MS) {
+      step = FRAME_MS;                     // 后台恢复：只走一帧
+      resumeN++;
+    } else if (raw > MAX_STEP_MS) {
+      step = MAX_STEP_MS;                  // 单帧异常掉帧：截断
+    }
+    if (raw > step) stallMs += raw - step;
+
+    vTs += step;
+    acc += step;
+    if (acc < FRAME_MS) return;
+    acc -= FRAME_MS;
+    /* 页面被挂起很久后累积量会很大，一次性补齐会造成「补帧风暴」。
+       上面的钳制已经把单次 step 限死，这里只是兜底。 */
+    if (acc > FRAME_MS * 4) acc = 0;
+
+    if (raw > RESUME_GAP_MS && ts - lastNoteAt > 8000) {
+      lastNoteAt = ts;
+      try {
+        console.warn('[MoleShell] 长间隔 ' + Math.round(raw) + 'ms（切后台/主线程停顿）'
+          + ' → 只推进 1 帧，不补帧、不补定时器；累计切断 '
+          + Math.round(stallMs) + 'ms / 第 ' + resumeN + ' 次');
+      } catch (e) {}
+      try { if (window.__moleAfterResume) window.__moleAfterResume(raw); } catch (e) {}
+    }
+
+    dispatch(vTs);
+  }
+  nativeRaf(pump);
+
+  /* 诊断口子：Java 侧 / HUD 可直接读，用来确认钳制是否真的在生效 */
+  window.__moleClock = function () {
+    return { stallMs: Math.round(stallMs), resumes: resumeN, vTs: vTs,
+             align: alignN, pending: pendingAlign };
+  };
+
+  /* 由第 6 段在「后台确实跑过一程」之后调用：
+     把虚拟时钟标记为需要对真实时间重新对齐（等下一帧 rAF 落地）。 */
+  window.__moleAlignClock = function () {
+    pendingAlign = true;
+    return true;
+  };
+
+  window.__moleSetFps = function (n) {
+    n = Number(n);
+    if (!isFinite(n) || n < 1 || n > 120) return false;
+    TARGET_FPS = n;
+    FRAME_MS = 1000 / n;
+    return true;
+  };
+  window.__moleFps = TARGET_FPS;
+})();
+
+/* ==================================================================
+ * 0) 适配引擎：影片尺寸 → CSS 等比缩放 + 渲染分辨率预算
+ *    必须最先执行（在 ruffle.js 之前）
+ * ================================================================== */
+(function () {
+  /* ---- 0.1) 影片设计尺寸与等比缩放 ---- */
+  var MW = 960, MH = 560;          // 默认按官网 embed 的 960x560；metadata 到手后校正
+  window.__moleMovieW = MW;
+  window.__moleMovieH = MH;
+
+  window.__moleFit = function () {
+    var mw = window.__moleMovieW || MW, mh = window.__moleMovieH || MH;
+    var w = document.getElementById('wrap');
+    if (w) {
+      w.style.width = mw + 'px';
+      w.style.height = mh + 'px';
+    }
+    var vw = Math.max(1, window.innerWidth), vh = Math.max(1, window.innerHeight);
+    var f = Math.min(vw / mw, vh / mh);          // contain：保证整个舞台都可见
+    try { document.documentElement.style.setProperty('--f', f); } catch (e) {}
+    window.__moleFitScale = f;
+    return f;
+  };
+  window.addEventListener('resize', function () {
+    try { window.__moleFit(); } catch (e) {}
+  });
+  window.__moleFit();
+
+  /* ---- 0.2) 渲染分辨率预算（钳制 devicePixelRatio）----
+   * Ruffle 在 wasm 内读 window.devicePixelRatio 决定 canvas 后备缓冲尺寸。
+   * 不钳制：1.5K 手机 DPR 3.5 → 350 万像素；4K 桌面 → 830 万像素，GPU 直接跪。
+   * 注意：本版播放器元素的布局尺寸是影片原生尺寸（960x560），**不是**视口尺寸，
+   * 所以预算要按布局尺寸算，再用 CSS transform 缩到实际显示大小 ——
+   * 显示端缩放是免费的（合成器做），渲染端超预算才是真的贵。 */
+  /* 预算值由 Java 侧注入 —— 按设备与崩溃历史自动分档（正常 90 万 / 崩溃后逐级下调）。
+     为什么必须留出下调空间：真机高压场景（餐厅、牧场）崩溃的根因是
+     Adreno 驱动的 **GPU 内存池耗尽**，不是我们代码的 bug：
+       W/Adreno-GSL: sharedmem_gpumem_alloc: mmap failed errno 12 Out of memory
+       E/Adreno-GSL: kgsl_sharedmem_alloc() failed! Allocation size: (4 KB)
+       F/libc: SIGSEGV in Chrome_InProcGp ← glTexSubImage2D
+     连 4KB 都分配不出来，驱动拿到空指针就直接崩进程。
+     渲染分辨率是与 GPU 内存/带宽成正比的、我们能控制的主要杠杆，
+     所以做成可分档，崩一次自动降一档，直到稳定。 */
+  var BUDGET = 900000;
+  // 占位符未注入时 __PIXEL_BUDGET__ 是未声明标识符 → 直接求值会 ReferenceError，
+  // 用 try 兜住：注入成功则赋值，失败则保持上面的默认值，页面脚本不会整段挂掉。
+  try { BUDGET = __PIXEL_BUDGET__; } catch (e) { /* 用默认值 */ }
+  var MAXCAP = 3;         // 再高对观感已无意义
+  var FLOOR  = 0.5;       // 下限，避免超大窗口下过度降采样发虚
+
+  /* 渲染后端，同样由 Java 侧注入（见 Ruffle 配置段的说明） */
+  var RENDERER = 'wgpu-webgl';
+  try { RENDERER = __RENDERER__; } catch (e) { /* 用默认值 */ }
+  window.__moleRenderer = RENDERER;
+  var raw = window.devicePixelRatio || 1;
+
+  function compute() {
+    var w = document.getElementById('wrap');
+    var lw = (w && w.offsetWidth) || window.__moleMovieW || 960;
+    var lh = (w && w.offsetHeight) || window.__moleMovieH || 560;
+    var byBudget = Math.sqrt(BUDGET / (lw * lh));
+    return Math.max(FLOOR, Math.min(MAXCAP, raw, byBudget));
+  }
+
+  window.__moleDprRaw = raw;
+  window.__moleDprCap = compute();
+  try {
+    Object.defineProperty(window, 'devicePixelRatio', {
+      configurable: true,
+      get: function () { return compute(); }
+    });
+  } catch (e) { /* 定义失败则分辨率不受约束，功能不受影响 */ }
+
+  /* ------------------------------------------------------------------
+   * 0.3) 运行时降载接口 —— 由 Java 侧的 GPU 显存看护调用
+   * ---------------------------------------------------------------
+   * Java 每 3 秒读一次本进程的 GL mtrack（dumpsys 里的 Graphics），
+   * 一旦越过水位就调这里把渲染分辨率**就地**压低 —— 不重载页面、不掉线。
+   *
+   * 为什么需要它：原来的分档只在「下次启动」生效，必须先崩一次才降载，
+   * 而真机证明人多地图里位图纹理是几十秒内堆满的，从 Adreno 开始
+   * `mmap failed errno 12` 到 SIGTRAP 只剩几百毫秒 —— 事后降档根本来不及。
+   *
+   * 实现要点：Ruffle 只在「容器尺寸变化」时才重新读取 devicePixelRatio
+   * 来决定 canvas 后备缓冲大小，光改 getter 的返回值它不会理会。
+   * 这里对 #wrap 做一次「+1px → 下一帧回原位」的跨帧抖动：
+   *   · 视觉上完全看不出（1/960 的差别，且只存在一帧）
+   *   · 足以让 Ruffle 的 ResizeObserver 触发重建，
+   *     而重建时会读到新的、更小的 devicePixelRatio。
+   * ------------------------------------------------------------------ */
+  window.__moleSetBudget = function (px, force) {
+    try {
+      px = Number(px);
+      if (!isFinite(px) || px <= 0) return false;
+      window.__moleBudget = px;
+      /* force = 预算不变也要走一次重建（只换渲染目标、不改分辨率）。
+         1.0.3 的「无损纹理回收」靠它，见下面的 __molePurgeTex。 */
+      if (px === BUDGET && !force) return true;
+      BUDGET = px;
+      window.__moleDprCap = compute();
+
+      var w = document.getElementById('wrap');
+      if (w) {
+        var mw = window.__moleMovieW || 960, mh = window.__moleMovieH || 560;
+        w.style.width = (mw + 1) + 'px';
+        w.style.height = (mh + 1) + 'px';
+        requestAnimationFrame(function () {
+          w.style.width = mw + 'px';
+          w.style.height = mh + 'px';
+          try { window.__moleFit(); } catch (e) {}
+        });
+      }
+      try { window.dispatchEvent(new Event('resize')); } catch (e) {}
+
+      /* 600ms 后回读 canvas 尺寸，把「到底有没有真的重建」直接写进日志 ——
+         这个机制依赖 Ruffle 的 ResizeObserver 行为，属于不可只靠推理确认的一环，
+         必须有一次实测数据兜底。console.warn 会被上面的接管转发到 Java 日志。 */
+      setTimeout(function () {
+        try {
+          var p = document.querySelector('ruffle-player,ruffle-embed,ruffle-object');
+          var sh = p && p.shadowRoot;
+          var c = sh ? sh.querySelector('canvas') : null;
+          console.warn('[MoleShell] 降载 budget=' + px
+              + ' DPR=' + compute().toFixed(2)
+              + ' canvas=' + (c ? (c.width + 'x' + c.height) : '?'));
+        } catch (e) {}
+      }, 600);
+      return true;
+    } catch (e) {
+      return false;
+    }
+  };
+
+  /* ------------------------------------------------------------------
+   * 0.4) 无损纹理回收 —— 长跑卡死的对症手段（1.0.3）
+   * ---------------------------------------------------------------
+   * 现象（群友反馈）：连跑一两个小时之后画面直接冻住，进程还在、日志还在刷，
+   *   但画面不再更新、点哪儿都没反应。1.0.2 之前靠「显存越闸就整页重载」
+   *   把这个坑盖住了，代价是游戏被重启 —— 用户不接受，于是坑就露出来了。
+   *
+   * 根因：Ruffle 的 wgpu 后端把「已上传的位图纹理」缓存在 wasm 侧的纹理池里，
+   *   AVM2 的 GC 只回收 ActionScript 对象，**不会**通知 wgpu 释放已提交的纹理；
+   *   GPU 侧（Adreno / Mali 的 kgsl 池）因此单调上涨。涨到分配不出来的时候，
+   *   驱动不会崩，而是让上下文反复丢失/重建，渲染线程空转 —— 画面就是死的，
+   *   而 CPU 侧一切正常，所以 ANR 也抓不到。
+   *
+   * 做法：预算、帧率、画质**一律不动**，只让 Ruffle 重新走一遍
+   *   「容器尺寸变化 → 重建渲染目标」的既有路径。重建时旧 canvas 的
+   *   WebGL 上下文被丢弃，驱动侧那块纹理内存随之归还；而 AVM2 里的游戏状态、
+   *   已建立的 Socket 连接、登录态全部保留 —— 玩家看不到掉线，也看不到黑屏。
+   *   抖动量仍然是 1px（1/960），且只存在一帧。
+   *
+   * 频率：由 Java 侧按显存闸位触发；这里再兜一层冷却，防止闸位在临界值
+   *   反复抖动时把重建做成风暴（重建本身要重传一遍在位图，是有成本的）。
+   * ------------------------------------------------------------------ */
+  var lastPurgeAt = 0;
+  window.__molePurgeTex = function (minGapMs) {
+    try {
+      /* 后台 tick 期间不要动渲染目标。
+         purge 的做法是「改容器尺寸 → 让 Ruffle 重建渲染目标」，
+         而后台走的是 Worker 驱动的 tick_for_background：不产帧、
+         也可能压根没有可用的 WebGL 上下文。这时候去抖动尺寸，
+         只会在一个没人渲染的上下文上反复销毁/重建，纯亏。
+         等回到前台（backgroundWorker 已终止）再回收，效果一样。 */
+      try {
+        var bgp = document.querySelector('ruffle-player,ruffle-embed,ruffle-object');
+        if (bgp && bgp.backgroundWorker) return false;
+      } catch (e0) {}
+      var gap = Number(minGapMs);
+      if (!isFinite(gap) || gap <= 0) gap = 240000;      // 默认 4 分钟一次
+      var now = Date.now();
+      if (lastPurgeAt && now - lastPurgeAt < gap) return false;
+      lastPurgeAt = now;
+      var ok = window.__moleSetBudget(BUDGET, true);
+      try {
+        console.warn('[MoleShell] 无损纹理回收 -> ' + (ok ? '已触发渲染目标重建' : '失败')
+            + '（预算不变 ' + BUDGET + 'px，画质/帧率未动）');
+      } catch (e) {}
+      return ok;
+    } catch (e) {
+      return false;
+    }
+  };
+
+  /* ------------------------------------------------------------------
+   * 1) console 接管 —— 必须在 ruffle.js 之前装好。
+   *    Ruffle 的加载失败/AVM2 错误都只走 console，不转发就永远是黑屏无信息。
+   *
+   * ==================================================================
+   * 性能改造（这一版真正找到的卡顿元凶）
+   * ==================================================================
+   * 旧版每次 console 调用都干两件很贵的事：
+   *
+   *   a) 同步调 MoleBridge.log(...) —— 一次跨 JNI 的 Java 调用。
+   *      它跑在渲染线程上，**直接阻塞 Ruffle 的渲染循环**。
+   *   b) getElementById('hud') 之后 textContent += ...，再**读取** scrollTop。
+   *      即便 HUD 是 display:none，写 textContent 仍会标脏样式；
+   *      而读 scrollTop 会强制一次同步重排（layout thrashing）。
+   *
+   * 两者叠起来，效果就是「日志越多的场景越卡」—— 而人多地图恰恰是刷得最凶的。
+   * 而日志一多，主线程被占住、帧时间被拉长，GPU 侧的纹理上传又更赶，
+   * 反过来加速显存吃紧。所以这不只是「卡」，它同时是崩溃的助推器。
+   *
+   * 现在：
+   *   · HUD 关闭（正式版常态）时，**一次 DOM 都不碰**；
+   *   · 所有级别先进队列，每 600ms 或攒够 60 行才做**一次** JNI 转发；
+   *   · 默认只转发 warn/error 及以上 —— Ruffle 的 log/info/debug 数量最大、
+   *     诊断价值最低，全量转发纯属自残（原来靠 logLevel:'warn' 已经砍了一部分，
+   *     但页面自身的调用仍照转不误）。
+   * ------------------------------------------------------------------ */
+  (function () {
+    var queue = [];
+    var flushTimer = null;
+    var HUD_ON = false;
+    var hudEl = null;
+    var hudSeq = 0;
+
+    /* IP 打码：Ruffle 自己会打印 `Missing WebSocket proxy for host 1.2.3.4, port N`，
+       直接把真实服务器地址写进日志。用户明确要求不暴露服务器 IP，故在转发前统一打码。
+       只保留首段用于区分，其余遮蔽。 */
+    function maskIp(s) {
+      return String(s).replace(/\b(\d{1,3})\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/g, '$1.***.***.***');
+    }
+
+    function flush() {
+      flushTimer = null;
+      if (!queue.length) return;
+      if (queue.length > 60) queue.splice(0, queue.length - 60);
+      var joined = queue.join('\n');
+      queue.length = 0;
+      try { if (window.MoleBridge && MoleBridge.log) MoleBridge.log(joined); } catch (e) {}
+    }
+
+    function enqueue(line) {
+      queue.push(line);
+      if (!flushTimer) flushTimer = setTimeout(flush, 600);
+    }
+
+    function hudLine(line) {
+      if (!HUD_ON) return;                     // 正式版：完全不碰 DOM
+      if (!hudEl) hudEl = document.getElementById('hud');
+      if (!hudEl) return;
+      if (hudSeq++ > 300) { hudEl.textContent = ''; hudSeq = 0; }
+      hudEl.textContent += line + '\n';
+      hudEl.scrollTop = hudEl.scrollHeight;
+    }
+
+    function fwd(level, args) {
+      /* 服务器地址最准的来源，必须优先处理（零误报，且与转发级别无关）：
+         Ruffle 只在真的要去连某个 host:port 而 socketProxy 里没配时才打印这句。
+         转交 Java 侧落盘并静默热重启，界面不做任何提示。 */
+      var rawAll = '';
+      try {
+        for (var i = 0; i < args.length; i++) rawAll += String(args[i]) + ' ';
+      } catch (e) {}
+      if (rawAll.indexOf('Missing WebSocket proxy') >= 0) {
+        var mm = /for host\s+([^,\s]+)\s*,\s*port\s+(\d+)/i.exec(rawAll);
+        if (mm) {
+          try { MoleBridge.onMissingProxy(mm[1], parseInt(mm[2], 10)); } catch (e) {}
+        }
+      }
+
+      /* 默认只留 warn / error 及以上。需要全量时把 __moleVerbose 置 true 即可。 */
+      if (!window.__moleVerbose) {
+        var keep = (level === 'WARN' || level === 'ERROR'
+                 || level === 'JSERR' || level === 'REJECT');
+        /* MoleShell 自己的启动/状态日志必须留 —— 总量可控（几十行），
+           而排查时全靠它。Ruffle 的 log/info/debug 才是要砍掉的大头。 */
+        if (!keep && rawAll.indexOf('[MoleShell]') < 0) return;
+      }
+
+      var parts = [];
+      for (var j = 0; j < args.length; j++) {
+        var a = args[j];
+        try { parts.push(typeof a === 'string' ? a : (a && a.stack ? a.stack : JSON.stringify(a))); }
+        catch (e) { parts.push(String(a)); }
+      }
+      var line = maskIp(level + '| ' + parts.join(' '));
+      enqueue(line);
+      hudLine(line);
+    }
+
+    window.__moleLog = fwd;
+    window.__moleHud = function (on) {
+      HUD_ON = !!on;
+      if (!hudEl) hudEl = document.getElementById('hud');
+      if (hudEl) hudEl.className = HUD_ON ? 'on' : '';
+    };
+    var names = ['log', 'info', 'warn', 'error', 'debug'];
+    for (var i = 0; i < names.length; i++) {
+      (function (k) {
+        var orig = console[k] ? console[k].bind(console) : function () {};
+        console[k] = function () { fwd(k.toUpperCase(), arguments); try { orig.apply(null, arguments); } catch (e) {} };
+      })(names[i]);
+    }
+    window.addEventListener('error', function (e) {
+      fwd('JSERR', [e.message + ' @' + (e.filename || '') + ':' + (e.lineno || 0)]);
+    });
+    window.addEventListener('unhandledrejection', function (e) {
+      fwd('REJECT', [String(e && e.reason ? e.reason : e)]);
+    });
+  })();
+
+  /* ------------------------------------------------------------------
+   * 2) Ruffle 配置（ruffle.js 加载时立即读取 window.RufflePlayer.config）
+   *    参数照抄官网 embed：960x560 / allowScriptAccess=always / wmode=opaque
+   * ------------------------------------------------------------------ */
+  (function () {
+    var R = window.RufflePlayer = window.RufflePlayer || {};
+
+    // socketProxy / fontSources 由 Java 侧在下发本页时替换占位符注入
+    var proxy = __SOCKET_PROXY__;
+    var fontSources = __FONT_SOURCES__;
+
+    R.config = {
+      publicPath: '/',              // core.ruffle.*.js / *.wasm 落在同源根路径 → 被 App 换成本地 assets
+      autoplay: 'on',
+      /* 显式覆盖影片帧率 = SWF 的真实帧率。
+         不写的话 Ruffle 走「读取 root movie 帧率」那条路，实测在
+         高刷新率屏幕上会把逻辑推成屏幕刷新率（60Hz / 24fps ≈ 2.5 倍速）。
+         显式声明后两条路径都指向 24，避免它自作主张。 */
+      frameRate: 24,
+      unmuteOverlay: 'hidden',
+      letterbox: 'on',
+      scale: 'showAll',             // 元素尺寸 = 影片尺寸时该值实际不生效，仅作保险
+      quality: 'low',               // 手机优先帧率；清晰度由上面的 DPR 预算保证
+      /* 渲染后端。键名是 preferredRenderer（不是 renderer），取值见 Ruffle 源码枚举：
+           'webgpu' | 'wgpu-webgl'（默认，PC 实测走的就是它） | 'webgl' | 'canvas'
+         正常情况下用默认档；'canvas' 完全不碰 WebGL，是 GPU 内存耗尽时的终极降级档。
+         由 Java 侧按崩溃历史注入 —— 高压场景崩过一次就自动降一档。 */
+      preferredRenderer: window.__moleRenderer || 'wgpu-webgl',
+      /* 不透明合成。官网 embed 本身就是 wmode=opaque（首页 so.addVariable('wmode','opaque')），
+         比默认的 'window' 少一条 alpha 合成通路，GPU 缓冲更省。 */
+      wmode: 'opaque',
+      /* 切后台时**继续跑**，不是停掉。
+         ---------------------------------------------------------------
+         这一项是 1.0.6 的关键改动，原值是 'none'，后果是：
+           页面 hidden → Ruffle 的 setupTabVisibilityHandling 走 else 分支
+           → instance.pause() → 整个游戏逻辑冻结，但客户端与服务器的
+           会话还挂着。返回时 Ruffle 一次性补帧 + update_timers 补跑，
+           游戏把积压逻辑全做一遍 → 一串时间戳跳变的数据包发出去
+           → 服务器判定「时间顺序对不上」直接踢下线。
+
+         改成 'mainThread' 后走的是 Ruffle 官方的另一条分支：
+           hidden → enable_background_tick_mode() + startBackgroundTick()
+           → 用一个 Web Worker 里的 setTimeout 按影片帧率（24fps）
+             持续调 instance.tick_for_background(performance.now())
+           Worker 的定时器不受页面可见性节流，所以后台真的在跑，
+           客户端时间轴与真实时间始终连续 —— 返回时没有补帧、没有跳变。
+
+         取值来自 Ruffle 源码枚举 BackgroundExecutionMode：
+           'none' | 'mainThread'（没有第三个值，写错会回落到 none）。 */
+      backgroundExecutionMode: 'mainThread',
+      allowScriptAccess: true,
+      allowNetworking: 'all',
+      logLevel: 'warn',             // debug 会逐帧刷 naga 着色器日志，实测是显著的性能杀手
+      warnOnUnsupportedContent: true,
+      upgradeToHttps: false,
+      openUrlMode: 'allow',
+      socketProxy: proxy,
+      /**
+       * 字体：直接跟随手机。
+       * ---------------------------------------------------------------
+       * Ruffle 的 deviceFontRenderer 有两档：
+       *   'embedded'（默认）——用 Ruffle 自带的字体集去凑。web 版拿不到系统字体，
+       *                       未知字体名一律回退到自带的 Noto Sans（无 CJK 字形），
+       *                       实测日志里 SimSun/宋体/SimHei/Tahoma/Arial… 全部 `Unknown device font`，
+       *                       表现就是中文整段消失、拉丁文和设计稿不一致。
+       *   'canvas'         ——把设备字体的绘制交给浏览器的 canvas 文本渲染，
+       *                       于是字体解析走 WebView 自己的字体栈，
+       *                       未知字体名由系统 fallback 到设备自带中文字体。
+       *                       这就是「直接跟随手机字体」，零字体文件、零体积增长、
+       *                       字形与系统观感一致。
+       * 另外实测过：往 fontSources 里塞系统字体文件并不能解决 ——
+       *   Ruffle 只按字体**内部 family 名**注册，URL 文件名不参与匹配
+       *   （把 NotoSansCJK 挂在 /fonts/SimSun.ttf 下，SimSun 依旧 Unknown）。
+       */
+      deviceFontRenderer: 'canvas',
+      fontSources: fontSources,
+      splashScreen: true,           // 保留启动画面，出问题至少能看见东西
+      favorFlash: false
+    };
+    try { MoleBridge.log('[cfg] socketProxy 条目=' + proxy.length
+        + ' | 字体渲染=canvas(跟随手机)'
+        + ' | 后端=' + (window.__moleRenderer || '?')
+        + ' | 预算=' + BUDGET + 'px'
+        + ' | DPR raw=' + window.__moleDprRaw + ' 钳制后=' + window.__moleDprCap.toFixed(2)
+        + ' | 缩放=' + (window.__moleFitScale || 1).toFixed(3)
+        + ' | 视口=' + window.innerWidth + 'x' + window.innerHeight); } catch (e) {}
+  })();
+
+  /* ------------------------------------------------------------------
+   * 3) 新服务器地址：静默处理，不做任何提示
+   * ---------------------------------------------------------------
+   * 曾经这里会弹 Toast 告知「发现新服务器 xxx」—— 已按用户要求移除。
+   * 原因：地址会出现在手机屏幕上，旁观者即可抄走服务器 IP，对用户不利。
+   * 现在新地址只在应用内部落盘（SharedPreferences），
+   * 界面上不出现任何字样，日志里也只有打码后的标识。
+   * ------------------------------------------------------------------ */
+  window.__moleNewTarget = function () { /* 静默：不做任何界面提示 */ };
+
+  /* ------------------------------------------------------------------
+   * 4) 输入加固（触控 / 鼠标错乱的壳层侧修复）
+   * ---------------------------------------------------------------
+   * 现象（群友反馈）：「部分触控逻辑和鼠标逻辑完全混乱」——
+   * 点 A 出 B、拖拽跳位、双指操作过之后整块画布的命中区全部偏移且不可恢复。
+   *
+   * 根因不在 Ruffle 的输入映射，而是**浏览器的视口手势**在它之前截胡：
+   *   1. `user-scalable=no` 自 Chrome 32 起对「捏合缩放」已不再强制生效，
+   *      WebView 照样会做 visual viewport zoom。缩放后
+   *      `getBoundingClientRect()` 给的是布局坐标，触点是落在被放大的
+   *      视觉层上的 —— Ruffle 换算出的舞台坐标整体错位，
+   *      表现就是「点哪儿都不对」，而且**不会自己恢复**（除非重载）。
+   *      主修在 Java 侧（setSupportZoom/setBuiltInZoomControls 全关），
+   *      这里做兜底复位。
+   *   2. 长按会弹 callout / 文本选择，Android 上表现为一次点击被吞，
+   *      外加偶发的 contextmenu。
+   *   3. 上滑与边缘拖拽会触发 overscroll / 系统返回手势，
+   *      把 touchmove 抢走 → 拖拽类操作（拉杆、拖地图）变成「拖一下停一下」。
+   *
+   * 修法：把这三类手势拦在 Ruffle 之前，**单指事件原样放过**，
+   * 不吞任何一次点击（所以没有做「双击 300ms 去抖」—— 那会丢快速连点）。
+   * 全程不涉及帧率、画质、画幅。
+   * ------------------------------------------------------------------ */
+  (function () {
+    /* 4.1 多指：第二根手指落下就锁死，直到全部抬起。
+           游戏是单指操作，多指唯一的作用就是触发 WebView 的捏合缩放。 */
+    var multiLock = false;
+    document.addEventListener('touchstart', function (e) {
+      if (e.touches && e.touches.length > 1) { multiLock = true; e.preventDefault(); }
+    }, { passive: false, capture: true });
+    document.addEventListener('touchmove', function (e) {
+      if (multiLock || (e.touches && e.touches.length > 1)) { e.preventDefault(); }
+    }, { passive: false, capture: true });
+    document.addEventListener('touchend', function (e) {
+      if (!e.touches || e.touches.length === 0) { multiLock = false; }
+    }, { passive: true, capture: true });
+    document.addEventListener('gesturestart', function (e) { e.preventDefault(); }, { passive: false });
+
+    /* 4.2 长按选择 / 拖拽 / 右键菜单：不给默认行为 */
+    ['contextmenu', 'selectstart', 'dragstart'].forEach(function (t) {
+      document.addEventListener(t, function (e) { e.preventDefault(); }, { capture: true });
+    });
+
+    /* 4.3 万一仍被缩放（系统辅助功能、三指手势），把视口比例拉回 1:1。
+           visualViewport 不可写，只能重声明 viewport 让内核重置；
+           只在真的被缩放时才动，正常游玩零开销。 */
+    function resetZoom() {
+      try {
+        var vv = window.visualViewport;
+        if (!vv) return;
+        if (Math.abs(vv.scale - 1) > 0.01) {
+          var m = document.querySelector('meta[name=viewport]');
+          if (m) {
+            m.setAttribute('content',
+              'width=device-width,initial-scale=1.0,maximum-scale=1.0,minimum-scale=1.0,user-scalable=no,viewport-fit=cover');
+          }
+          console.warn('[MoleShell] 页面被缩放 scale=' + vv.scale.toFixed(3) + ' → 已重置');
+        }
+      } catch (e) {}
+    }
+
+    /* 4.4 软键盘 / 手势条 / 分屏引起视口变化时重做等比适配。
+           不重做的话 #wrap 的 scale 会停在旧值，画面与实际显示错位 → 命中偏差。 */
+    var fitTimer = 0;
+    function refit() {
+      clearTimeout(fitTimer);
+      fitTimer = setTimeout(function () {
+        try { window.__moleFit(); } catch (e) {}
+        resetZoom();
+      }, 120);
+    }
+    window.addEventListener('orientationchange', refit);
+    if (window.visualViewport) {
+      window.visualViewport.addEventListener('resize', refit);
+      window.visualViewport.addEventListener('scroll', resetZoom);
+    }
+
+    console.log('[MoleShell] 输入加固已装载（多指/长按/视口复位）');
+  })();
+})();
+</script>
+<script src="/__mole_ruffle__.js"></script>
+<script src="/__mole_boot__.js"></script>
+<script id="omnipad-umd">var OmniPad=(function(exports){'use strict';var Zt=Object.defineProperty;var Yt=(t,e,i)=>e in t?Zt(t,e,{enumerable:true,configurable:true,writable:true,value:i}):t[e]=i;var d=(t,e,i)=>Yt(t,typeof e!="symbol"?e+"":e,i);function re(t){try{return JSON.parse(JSON.stringify(t))}catch(e){return console.error("[OmniPad-Core] Config serialization failed. Check for circular refs.",e),t}}function ye(t,e){let i={},r=Object.keys(t);for(let o=0;o<r.length;o++){let s=r[o],n=t[s];n!==void 0&&!e.has(s)&&(i[s]=n);}return i}function oe(...t){return t.reduce((e,i)=>i?{...e,...i}:e,{})}var B=(t="omnipad")=>{let e=Date.now().toString(36),i=new Uint8Array(4),r=globalThis.crypto;if(r?.getRandomValues)r.getRandomValues(i);else for(let s=0;s<i.length;s++)i[s]=Math.floor(Math.random()*256);let o=Array.from(i).map(s=>s.toString(36).padStart(2,"0")).join("").substring(0,4);return `${t}-${e}-${o}`};function se(t){return t.startsWith("$")}var D=t=>t==null||t.value==null&&t.unit==null?void 0:`${t.value}${t.unit}`;function me(t){return {...t,left:D(t.left),top:D(t.top),right:D(t.right),bottom:D(t.bottom),width:D(t.width),height:D(t.height)}}var Fe=(t,e)=>({x:t.x*e,y:t.y*e}),C=(t,e,i)=>Math.max(e,Math.min(i,t)),W=(t,e,i)=>t+(e-t)*i,ge=(t,e=2)=>{let i=Math.pow(10,e);return Math.round(t*i)/i};var F=(t,e)=>ge(t*e/100),R=(t,e)=>e===0?0:ge(t*100/e);var S=(t,e,i=1e-4)=>Math.abs(t.x-e.x)<i&&Math.abs(t.y-e.y)<i,Ue=(t,e,i)=>{if(t<e)return 0;let r=(t-e)/(i-e);return C(r,0,1)},fe=(t,e,i)=>{let r=Math.hypot(t.x,t.y),o=e*i,s=Ue(r,o,e);if(s===0)return {x:0,y:0};let n={x:t.x/r,y:t.y/r};return Fe(n,s)};var E={INPUT_ZONE:"input-zone",TARGET_ZONE:"target-zone",BUTTON:"button",JOYSTICK:"joystick",D_PAD:"d-pad",TRACKPAD:"trackpad",ROOT_LAYER:"root-layer"},m={KEYDOWN:"keydown",KEYUP:"keyup",POINTER:"pointer",POINTERMOVE:"pointermove",POINTERDOWN:"pointerdown",POINTERUP:"pointerup",MOUSE:"mouse",MOUSEMOVE:"mousemove",MOUSEDOWN:"mousedown",MOUSEUP:"mouseup",CLICK:"click"},Z={Backspace:{type:"keyboard",key:"Backspace",code:"Backspace",keyCode:8},Tab:{type:"keyboard",key:"Tab",code:"Tab",keyCode:9},Enter:{type:"keyboard",key:"Enter",code:"Enter",keyCode:13},ShiftLeft:{type:"keyboard",key:"Shift",code:"ShiftLeft",keyCode:16},ControlLeft:{type:"keyboard",key:"Control",code:"ControlLeft",keyCode:17},AltLeft:{type:"keyboard",key:"Alt",code:"AltLeft",keyCode:18},Pause:{type:"keyboard",key:"Pause",code:"Pause",keyCode:19},CapsLock:{type:"keyboard",key:"CapsLock",code:"CapsLock",keyCode:20},Escape:{type:"keyboard",key:"Escape",code:"Escape",keyCode:27},Space:{type:"keyboard",key:" ",code:"Space",keyCode:32},PageUp:{type:"keyboard",key:"PageUp",code:"PageUp",keyCode:33},PageDown:{type:"keyboard",key:"PageDown",code:"PageDown",keyCode:34},End:{type:"keyboard",key:"End",code:"End",keyCode:35},Home:{type:"keyboard",key:"Home",code:"Home",keyCode:36},ArrowLeft:{type:"keyboard",key:"ArrowLeft",code:"ArrowLeft",keyCode:37},ArrowUp:{type:"keyboard",key:"ArrowUp",code:"ArrowUp",keyCode:38},ArrowRight:{type:"keyboard",key:"ArrowRight",code:"ArrowRight",keyCode:39},ArrowDown:{type:"keyboard",key:"ArrowDown",code:"ArrowDown",keyCode:40},PrintScreen:{type:"keyboard",key:"PrintScreen",code:"PrintScreen",keyCode:44},Insert:{type:"keyboard",key:"Insert",code:"Insert",keyCode:45},Delete:{type:"keyboard",key:"Delete",code:"Delete",keyCode:46},Digit0:{type:"keyboard",key:"0",code:"Digit0",keyCode:48},Digit1:{type:"keyboard",key:"1",code:"Digit1",keyCode:49},Digit2:{type:"keyboard",key:"2",code:"Digit2",keyCode:50},Digit3:{type:"keyboard",key:"3",code:"Digit3",keyCode:51},Digit4:{type:"keyboard",key:"4",code:"Digit4",keyCode:52},Digit5:{type:"keyboard",key:"5",code:"Digit5",keyCode:53},Digit6:{type:"keyboard",key:"6",code:"Digit6",keyCode:54},Digit7:{type:"keyboard",key:"7",code:"Digit7",keyCode:55},Digit8:{type:"keyboard",key:"8",code:"Digit8",keyCode:56},Digit9:{type:"keyboard",key:"9",code:"Digit9",keyCode:57},KeyA:{type:"keyboard",key:"a",code:"KeyA",keyCode:65},KeyB:{type:"keyboard",key:"b",code:"KeyB",keyCode:66},KeyC:{type:"keyboard",key:"c",code:"KeyC",keyCode:67},KeyD:{type:"keyboard",key:"d",code:"KeyD",keyCode:68},KeyE:{type:"keyboard",key:"e",code:"KeyE",keyCode:69},KeyF:{type:"keyboard",key:"f",code:"KeyF",keyCode:70},KeyG:{type:"keyboard",key:"g",code:"KeyG",keyCode:71},KeyH:{type:"keyboard",key:"h",code:"KeyH",keyCode:72},KeyI:{type:"keyboard",key:"i",code:"KeyI",keyCode:73},KeyJ:{type:"keyboard",key:"j",code:"KeyJ",keyCode:74},KeyK:{type:"keyboard",key:"k",code:"KeyK",keyCode:75},KeyL:{type:"keyboard",key:"l",code:"KeyL",keyCode:76},KeyM:{type:"keyboard",key:"m",code:"KeyM",keyCode:77},KeyN:{type:"keyboard",key:"n",code:"KeyN",keyCode:78},KeyO:{type:"keyboard",key:"o",code:"KeyO",keyCode:79},KeyP:{type:"keyboard",key:"p",code:"KeyP",keyCode:80},KeyQ:{type:"keyboard",key:"q",code:"KeyQ",keyCode:81},KeyR:{type:"keyboard",key:"r",code:"KeyR",keyCode:82},KeyS:{type:"keyboard",key:"s",code:"KeyS",keyCode:83},KeyT:{type:"keyboard",key:"t",code:"KeyT",keyCode:84},KeyU:{type:"keyboard",key:"u",code:"KeyU",keyCode:85},KeyV:{type:"keyboard",key:"v",code:"KeyV",keyCode:86},KeyW:{type:"keyboard",key:"w",code:"KeyW",keyCode:87},KeyX:{type:"keyboard",key:"x",code:"KeyX",keyCode:88},KeyY:{type:"keyboard",key:"y",code:"KeyY",keyCode:89},KeyZ:{type:"keyboard",key:"z",code:"KeyZ",keyCode:90},MetaLeft:{type:"keyboard",key:"Meta",code:"MetaLeft",keyCode:91},ContextMenu:{type:"keyboard",key:"ContextMenu",code:"ContextMenu",keyCode:93},Numpad0:{type:"keyboard",key:"0",code:"Numpad0",keyCode:96},Numpad1:{type:"keyboard",key:"1",code:"Numpad1",keyCode:97},Numpad2:{type:"keyboard",key:"2",code:"Numpad2",keyCode:98},Numpad3:{type:"keyboard",key:"3",code:"Numpad3",keyCode:99},Numpad4:{type:"keyboard",key:"4",code:"Numpad4",keyCode:100},Numpad5:{type:"keyboard",key:"5",code:"Numpad5",keyCode:101},Numpad6:{type:"keyboard",key:"6",code:"Numpad6",keyCode:102},Numpad7:{type:"keyboard",key:"7",code:"Numpad7",keyCode:103},Numpad8:{type:"keyboard",key:"8",code:"Numpad8",keyCode:104},Numpad9:{type:"keyboard",key:"9",code:"Numpad9",keyCode:105},NumpadMultiply:{type:"keyboard",key:"*",code:"NumpadMultiply",keyCode:106},NumpadAdd:{type:"keyboard",key:"+",code:"NumpadAdd",keyCode:107},NumpadSubtract:{type:"keyboard",key:"-",code:"NumpadSubtract",keyCode:109},NumpadDecimal:{type:"keyboard",key:".",code:"NumpadDecimal",keyCode:110},NumpadDivide:{type:"keyboard",key:"/",code:"NumpadDivide",keyCode:111},F1:{type:"keyboard",key:"F1",code:"F1",keyCode:112},F2:{type:"keyboard",key:"F2",code:"F2",keyCode:113},F3:{type:"keyboard",key:"F3",code:"F3",keyCode:114},F4:{type:"keyboard",key:"F4",code:"F4",keyCode:115},F5:{type:"keyboard",key:"F5",code:"F5",keyCode:116},F6:{type:"keyboard",key:"F6",code:"F6",keyCode:117},F7:{type:"keyboard",key:"F7",code:"F7",keyCode:118},F8:{type:"keyboard",key:"F8",code:"F8",keyCode:119},F9:{type:"keyboard",key:"F9",code:"F9",keyCode:120},F10:{type:"keyboard",key:"F10",code:"F10",keyCode:121},F11:{type:"keyboard",key:"F11",code:"F11",keyCode:122},F12:{type:"keyboard",key:"F12",code:"F12",keyCode:123},NumLock:{type:"keyboard",key:"NumLock",code:"NumLock",keyCode:144},ScrollLock:{type:"keyboard",key:"ScrollLock",code:"ScrollLock",keyCode:145},Semicolon:{type:"keyboard",key:";",code:"Semicolon",keyCode:186},Equal:{type:"keyboard",key:"=",code:"Equal",keyCode:187},Comma:{type:"keyboard",key:",",code:"Comma",keyCode:188},Minus:{type:"keyboard",key:"-",code:"Minus",keyCode:189},Period:{type:"keyboard",key:".",code:"Period",keyCode:190},Slash:{type:"keyboard",key:"/",code:"Slash",keyCode:191},Backquote:{type:"keyboard",key:"`",code:"Backquote",keyCode:192},BracketLeft:{type:"keyboard",key:"[",code:"BracketLeft",keyCode:219},Backslash:{type:"keyboard",key:"\\",code:"Backslash",keyCode:220},BracketRight:{type:"keyboard",key:"]",code:"BracketRight",keyCode:221},Quote:{type:"keyboard",key:"'",code:"Quote",keyCode:222},Mouse:{type:"mouse",button:0},MouseLeft:{type:"mouse",button:0},MouseMiddle:{type:"mouse",button:1},MouseRight:{type:"mouse",button:2}},ne={A:0,B:1,X:2,Y:3,LB:4,RB:5,LT:6,RT:7,Select:8,Start:9,L3:10,R3:11,Up:12,Down:13,Left:14,Right:15};var Jt=Object.defineProperty,qt=(t,e,i)=>e in t?Jt(t,e,{enumerable:true,configurable:true,writable:true,value:i}):t[e]=i,u=(t,e,i)=>qt(t,typeof e!="symbol"?e+"":e,i);function et(t,e){if(!(!t||!e)&&"bindDelegate"in t&&typeof t.bindDelegate=="function"){let i=Object.entries(e);for(let r=0;r<i.length;r++){let[o,s]=i[r];typeof s=="function"&&t.bindDelegate(o,s);}}}function tt(t=[],e){return t?.filter(i=>i.uid!==e)||[]}function it(t,e){return ye(t,e)}function rt(t,e,i,r,o,s){let n=oe(r,o,s);return n.id=e,n.baseType=t,n.parentId=i,n.layout=oe(r.layout,o.layout,s.layout),n}function ji(t,e=[],i){let r=e?.find(s=>s.uid===i),o=t.length>0;return t.length>1&&console.error(`[OmniPad-Validation] InputZone ${i} has multiple dynamic widgets in slot. Only the first one will be activated.`),o&&r&&console.warn(`[OmniPad-Validation] InputZone ${i} has both Slot and Config dynamic widgets. Config ignored.`),{nodeToRender:o?t[0]:r||null,isFromSlot:o}}function ot(t,e){if(!(!t||Object.keys(t).length===0)){if(!(t.config?.baseType===e||t.type===e)){undefined?.DEV&&console.warn(`[OmniPad-Validation] Type mismatch! Expected "${e}", received "${t.type}". Config ignored.`);return}return t}}var st=null;function nt(t){st=t;}var Gt=()=>st,Y=t=>setTimeout(()=>t(Date.now()),16),at=t=>clearTimeout(t);function dt(t,e){Y=t,at=e;}function de(t){let e=false,i;return function(r){i=r,e||(e=true,Y(o=>{t(i,o),e=false;}));}}function lt(t){let e=null,i=()=>{t(),e=Y(i);};return {start:()=>{e===null&&i();},stop:()=>{e!==null&&(at(e),e=null);}}}var Xt=(t=1)=>new Promise(e=>{let i=0,r=()=>{++i>=t?e():Y(r);};Y(r);}),be=Symbol.for("omnipad.registry.instance"),Se=null;function ct(t){Se=t;}var I=class pt{constructor(){u(this,"entities",new Map),undefined?.DEV&&console.log("[OmniPad-Core] Registry initialized.");}static getInstance(){let e=globalThis;return e[be]||(e[be]=new pt),e[be]}register(e){if(!e.uid){console.warn("[OmniPad-Core] Registry: Attempted to register entity without UID.",e);return}this.entities.has(e.uid),this.entities.set(e.uid,e);}unregister(e){this.entities.has(e)&&this.entities.delete(e);}getEntity(e){return this.entities.get(e)}getAllEntities(){return Array.from(this.entities.values())}getEntitiesByRoot(e){let i=this.getAllEntities();if(!e)return i;if(!this.entities.get(e))return console.warn(`[OmniPad-Core] Registry: Root entity ${e} not found.`),[];let r=new Map;i.forEach(a=>{let c=a;if(typeof c.getConfig=="function"){let h=c.getConfig();h.parentId&&(r.has(h.parentId)||r.set(h.parentId,[]),r.get(h.parentId).push(a));}});let o=[],s=[e],n=new Set;for(;s.length>0;){let a=s.shift();if(n.has(a))continue;n.add(a);let c=this.entities.get(a);if(c){o.push(c);let h=r.get(a);h&&h.forEach(p=>s.push(p.uid));}}return o}destroyByRoot(e){let i=this.getEntitiesByRoot(e);for(let r=i.length-1;r>=0;r--){let o=i[r];try{o.destroy();}catch(s){console.error(`[OmniPad-Core] Error during destroyByRoot at ${o.uid}:`,s);}}}clear(){this.entities.clear();}resetAll(){this.entities.forEach(e=>{"reset"in e&&e.reset();});}markAllRectDirty(){this.entities.forEach(e=>{"markRectDirty"in e&&e.markRectDirty();});}broadcastSignal(e,i=null){if(i&&"handleSignal"in i){i.handleSignal(e);return}if(e.targetStageId){let r=this.getEntity(e.targetStageId);if(r&&"handleSignal"in r){r.handleSignal(e);return}}Se&&Se(e);}},ae={sanitizeObject:t=>t,validateConfig:(t,e)=>e};function ut(t){ae={...ae,...t};}var Ke=100,He=512*1024,ze=10;function Qt(t){if(!t||typeof t!="object")throw new Error("[OmniPad-Validation] Profile must be a valid JSON object.");if(JSON.stringify(t).length>He)throw new Error(`[OmniPad-Validation] Profile too large (max: ${He} bytes)`);if(!Array.isArray(t.items)||t.items.length>Ke)throw new Error(`[OmniPad-Security] Profile items exceed limit (${Ke}).`);t=ae.sanitizeObject(t);let e=new Set;t.items.forEach((o,s)=>{if(!o.id||!o.type)throw new Error(`[OmniPad-Validation] Item at index ${s} missing id/type.`);if(e.has(o.id))throw new Error(`[OmniPad-Security] Duplicate Config ID detected: "${o.id}".`);e.add(o.id);});let i={name:t.meta?.name||"Untitled Profile",version:t.meta?.version||"1.0.0",author:t.meta?.author||"Unknown",description:t.meta?.description||"Enter text."},r=t.items.map(o=>({id:String(o.id),type:String(o.type),parentId:o.parentId?String(o.parentId):void 0,config:ae.validateConfig(o.type,o.config||{})}));return ei(t.gamepadMappings,e),{meta:i,items:r,gamepadMappings:t.gamepadMappings}}function ei(t,e){!t||!Array.isArray(t)||t.forEach((i,r)=>{i.buttons&&Object.values(i.buttons).forEach(o=>{if(typeof o=="string"&&!o.startsWith("$")&&!e.has(o))throw new Error(`[OmniPad-Security] Gamepad Slot ${r}: Target ID "${o}" not found in items.`)}),["dpad","leftStick","rightStick"].forEach(o=>{let s=i[o];if(s&&!s.startsWith("$")&&!e.has(s))throw new Error(`[OmniPad-Security] Gamepad Slot ${r}: ${o} target "${s}" not found.`)});});}function ti(t){let{meta:e,items:i,gamepadMappings:r}=t,o=new Map,s=(l,y="node")=>se(l)?l:(o.has(l)||o.set(l,B(y)),o.get(l));i.forEach(l=>s(l.id,l.type));let n=[];r&&r.forEach(l=>{let y={};if(l.buttons){y.buttons={};for(let[P,te]of Object.entries(l.buttons))y.buttons[P]=s(te);}l.dpad&&(y.dpad=s(l.dpad)),l.leftStick&&(y.leftStick=s(l.leftStick)),l.rightStick&&(y.rightStick=s(l.rightStick)),n.push(y);});let a=new Map,c=[];i.forEach(l=>{l.parentId?(a.has(l.parentId)||a.set(l.parentId,[]),a.get(l.parentId).push(l)):c.push(l);});let h=new Set,p=(l,y)=>{if(y>ze)throw new Error(`[OmniPad-Security] Profile exceeds max depth of ${ze}.`);if(h.has(l.id))throw new Error(`[OmniPad-Security] Critical layout error. Node "${l.id}" is either part of a loop or has multiple parents.`);h.add(l.id);let P=re({...l.config});P?.targetStageId&&(P.targetStageId=s(P.targetStageId)),P?.dynamicWidgetId&&(P.dynamicWidgetId=s(P.dynamicWidgetId));let te=(a.get(l.id)||[]).map(ie=>p(ie,y+1));return {uid:s(l.id),type:l.type,config:P,children:te}},f={};if(c.forEach(l=>{f[l.id]=p(l,0);}),h.size<i.length){let l=i.filter(y=>!h.has(y.id)).map(y=>y.id);throw new Error(`[OmniPad-Integrity] Found ${l.length} unreachable nodes (orphans or isolated loops). These nodes will NOT be rendered: ${l.join(", ")}`)}return {meta:e,roots:f,runtimeGamepadMappings:n}}function $i(t){let e;if(typeof t=="string")try{e=JSON.parse(t);}catch{throw new Error("[OmniPad-Core] Failed to parse input string as valid JSON.")}else e=t;let i=Qt(e);return ti(i)}function Zi(t,e,i){let r=I.getInstance(),o=[];if(!e||e.length===0)o=r.getAllEntities();else {let p=new Set;e.forEach(f=>{r.getEntitiesByRoot(f).forEach(l=>p.add(l));}),o=Array.from(p);}let s=new Map,n=0,a=p=>se(p)?p:(s.has(p)||s.set(p,`node_${++n}`),s.get(p)),c=o.map(p=>{let f=p.getConfig(),l=p.uid,y={...f};y.targetStageId&&(y.targetStageId=a(y.targetStageId)),y.dynamicWidgetId&&(y.dynamicWidgetId=a(y.dynamicWidgetId));let{id:P,parentId:te,...ie}=y;return {id:a(l),type:p.type,parentId:f.parentId?a(f.parentId):void 0,config:{...ie,layout:me(ie.layout)}}}),h=[];return i&&i.forEach(p=>{let f={};if(p.buttons){f.buttons={};for(let[l,y]of Object.entries(p.buttons))s.has(y)&&(f.buttons[l]=s.get(y));}p.dpad&&s.has(p.dpad)&&(f.dpad=s.get(p.dpad)),p.leftStick&&s.has(p.leftStick)&&(f.leftStick=s.get(p.leftStick)),p.rightStick&&s.has(p.rightStick)&&(f.rightStick=s.get(p.rightStick)),Object.keys(f).length>0?h.push(f):h.push({});}),{meta:t,items:c,gamepadMappings:Object.keys(h).length>0?h:void 0}}var je=class{constructor(){u(this,"listeners",new Set);}subscribe(t){return this.listeners.add(t),()=>this.listeners.delete(t)}emit(t){this.listeners.forEach(e=>{try{e(t);}catch(i){console.error("[OmniPad-Core] Emitter callback error:",i);}});}clear(){this.listeners.clear();}},N=class{constructor(t,e,i,r){u(this,"uid"),u(this,"type"),u(this,"config"),u(this,"state"),u(this,"rectProvider",null),u(this,"_onMarkDirtyCb",null),u(this,"stateEmitter",new je),u(this,"configEmitter",new je),this.uid=t,this.type=e,this.config=i,this.state=r;}getConfig(){return this.config}subscribeConfig(t){return t(this.config),this.configEmitter.subscribe(t)}updateConfig(t){let e={...this.config,...t};this.config=re(e),this.configEmitter.emit(this.config);}getState(){return this.state}setState(t){this.state={...this.state,...t},this.stateEmitter.emit(this.state);}subscribeState(t){return t(this.state),this.stateEmitter.subscribe(t)}destroy(){this.reset(),this.stateEmitter.clear(),this.configEmitter.clear(),I.getInstance().unregister(this.uid);}get rect(){return this.rectProvider?this.rectProvider():null}bindRectProvider(t,e){this.rectProvider=t,e&&(this._onMarkDirtyCb=e);}markRectDirty(){this._onMarkDirtyCb?.();}},$e=32,ii=255,ve="__NO_TARGET__",T=class{constructor(t,e){u(this,"isPressed",false),u(this,"mapping"),u(this,"targetId"),u(this,"_cachedTarget",null),this.update(t,e);}update(t,e){this.isPressed&&this.reset(),this.targetId=t,this.mapping=typeof e=="string"?Z[e]??void 0:this.hydrate(e),this._cachedTarget=null;}hydrate(t){if(!t||typeof t!="object")return;let{type:e,key:i,code:r,keyCode:o,button:s,fixedPoint:n}=t;if(e==="mouse")return {type:"mouse",button:typeof s=="number"&&s>=0&&s<=2?s:0,fixedPoint:n&&typeof n.x=="number"?{x:Number(n.x),y:Number(n.y)}:void 0};let a=typeof i=="string"?i.substring(0,$e):void 0,c=typeof r=="string"?r.substring(0,$e):void 0,h=typeof o=="number"&&Number.isFinite(o)?Math.floor(Math.min(o,ii)):void 0;if(a||c||h){let p=Object.values(Z).find(f=>f.type!=="keyboard"?false:f.code===c||f.key===a||f.keyCode===h);return p?{type:"keyboard",key:a??p.key,code:c??p.code,keyCode:h??p.keyCode}:{type:"keyboard",key:a||"unknown",code:c||"Unknown",keyCode:h||0}}}press(){if(!this.mapping||this.isPressed)return;this.isPressed=true;let t=this.mapping.type==="keyboard"?m.KEYDOWN:m.MOUSEDOWN;this.emitSignal(t);}release(t=true){if(!this.mapping||!this.isPressed)return;this.isPressed=false;let e=this.mapping.type==="keyboard"?m.KEYUP:m.MOUSEUP;this.emitSignal(e),this.mapping.type==="mouse"&&t&&this.emitSignal(m.CLICK);}move(t){this.mapping?.type==="mouse"&&this.emitSignal(m.MOUSEMOVE,t);}reset(){this._cachedTarget=null,this.isPressed&&this.release(false);}async tap(t=true){this.isPressed||(this.press(),await Xt(2),this.isPressed&&this.release(t));}emitSignal(t,e={}){if(!this.mapping)return;let i=this._cachedTarget;i||(i=I.getInstance().getEntity(this.targetId||""),i&&"handleSignal"in i?this._cachedTarget=i:this._cachedTarget=ve),I.getInstance().broadcastSignal({targetStageId:i===ve?"":this.targetId||"",type:t,payload:{key:this.mapping.key,code:this.mapping.code,keyCode:this.mapping.keyCode,button:this.mapping.button,point:this.mapping.fixedPoint,...e}},i===ve?null:i);}},ke={isActive:false,isPressed:false,pointerId:null,value:0},ht=class extends N{constructor(t,e,i){super(t,i||E.BUTTON,e,ke),u(this,"emitter"),this.emitter=new T(e.targetStageId,e.mapping);}get activePointerId(){return this.state.pointerId}onPointerDown(t){this.setState({isActive:true,isPressed:true,pointerId:t.pointerId}),this.emitter.press();}onPointerUp(t){!this.state.isActive||t.pointerId!==this.state.pointerId||this.handleRelease(true);}onPointerCancel(){this.handleRelease(false);}onPointerMove(){}reset(){this.setState(ke),this.emitter.reset();}updateConfig(t){super.updateConfig(t),this.emitter.update(this.config.targetStageId,this.config.mapping);}handleRelease(t){this.setState(ke),this.emitter.release(t);}triggerDown(){this.state.isPressed||(this.setState({isActive:true,isPressed:true}),this.emitter.press());}triggerUp(){this.state.isPressed&&(this.setState({isActive:false,isPressed:false}),this.emitter.release(true));}},Ze={isActive:false,pointerId:null,vector:{x:0,y:0}},Ye=.15,Je=.002,qe=.3,yt=class extends N{constructor(t,e,i){super(t,i||E.D_PAD,e,Ze),u(this,"emitters");let r=e.targetStageId;this.emitters={up:new T(r,e.mapping?.up),down:new T(r,e.mapping?.down),left:new T(r,e.mapping?.left),right:new T(r,e.mapping?.right)};}get activePointerId(){return this.state.pointerId}onPointerDown(t){this.setState({isActive:true,pointerId:t.pointerId,vector:{x:0,y:0}}),this.processInput(t,true);}onPointerMove(t){!this.state.isActive||t.pointerId!==this.state.pointerId||this.processInput(t);}onPointerUp(t){!this.state.isActive||t.pointerId!==this.state.pointerId||this.reset();}onPointerCancel(){this.reset();}processInput(t,e=false){if(!this.state.isActive)return;let i=this.rect;if(!i)return;let r=i.left+i.width/2,o=i.top+i.height/2,s=i.width/2,n=i.height/2,a=(t.clientX-r)/s,c=(t.clientY-o)/n;if(e&&(a!=C(a,-1,1)||c!=C(c,-1,1))){this.setState({vector:{x:0,y:0}}),this.markRectDirty();return}let h={x:C(a,-1,1),y:C(c,-1,1)};S(h,this.state.vector,Je)||(this.setState({vector:h}),this.handleDigitalKeys(h));}handleDigitalKeys(t){let e=this.config.threshold??Ye;t.y<-e?(this.emitters.up.press(),this.emitters.down.release()):t.y>e?(this.emitters.down.press(),this.emitters.up.release()):(this.emitters.up.release(),this.emitters.down.release()),t.x<-e?(this.emitters.left.press(),this.emitters.right.release()):t.x>e?(this.emitters.right.press(),this.emitters.left.release()):(this.emitters.left.release(),this.emitters.right.release());}reset(){this.emitters.up.reset(),this.emitters.down.reset(),this.emitters.left.reset(),this.emitters.right.reset(),this.setState(Ze);}updateConfig(t){super.updateConfig(t),this.emitters.up.update(this.config.targetStageId,this.config.mapping?.up),this.emitters.down.update(this.config.targetStageId,this.config.mapping?.down),this.emitters.left.update(this.config.targetStageId,this.config.mapping?.left),this.emitters.right.update(this.config.targetStageId,this.config.mapping?.right);}triggerVector(t,e){let i=this.config.threshold??Ye;if(Math.abs(t)<i&&Math.abs(e)<i){this.state.isActive&&this.reset();return}this.state.isActive||this.setState({isActive:true});let r=W(this.state.vector.x,t,qe),o=W(this.state.vector.y,e,qe),s={x:r,y:o};S(s,this.state.vector,Je)||(this.setState({vector:s}),this.handleDigitalKeys(s));}},ri={isDynamicActive:false,dynamicPointerId:null,dynamicPosition:{x:0,y:0}},mt=class extends N{constructor(t,e,i){super(t,i||E.INPUT_ZONE,e,ri),u(this,"delegates",{dynamicWidgetPointerDown:()=>{},dynamicWidgetPointerMove:()=>{},dynamicWidgetPointerUp:()=>{},dynamicWidgetPointerCancel:()=>{}});}bindDelegate(t,e){Object.prototype.hasOwnProperty.call(this.delegates,t)?this.delegates[t]=e:undefined?.DEV&&console.warn(`[OmniPad-Core] TargetZone attempted to bind unknown delegate: ${t}`);}get activePointerId(){return this.state.dynamicPointerId}onPointerDown(t){if(this.state.isDynamicActive)return;let e=this.calculateRelativePosition(t.clientX,t.clientY);this.setState({isDynamicActive:true,dynamicPointerId:t.pointerId,dynamicPosition:e}),this.delegates.dynamicWidgetPointerDown?.(t);}onPointerMove(t){this.state.isDynamicActive&&this.delegates.dynamicWidgetPointerMove?.(t);}onPointerUp(t){this.delegates.dynamicWidgetPointerUp?.(t),this.reset();}onPointerCancel(t){this.delegates.dynamicWidgetPointerCancel?.(t),this.reset();}calculateRelativePosition(t,e){let i=this.rect;return i?{x:R(t-i.left,i.width),y:R(e-i.top,i.height)}:{x:0,y:0}}get isInterceptorRequired(){return !!(this.config.dynamicWidgetId||this.config.preventFocusLoss)}reset(){this.setState({isDynamicActive:false,dynamicPointerId:null});}},gt=class{constructor(t={}){u(this,"options"),u(this,"startTime",0),u(this,"startPos",{x:0,y:0}),u(this,"lastTapTime",0),u(this,"hasMoved",false),u(this,"isDoubleTapHolding",false),this.options={tapTime:250,tapDistance:10,doubleTapGap:300,...t};}onPointerDown(t,e){let i=Date.now();this.startTime=i,this.startPos={x:t,y:e},this.hasMoved=false,i-this.lastTapTime<this.options.doubleTapGap?(this.isDoubleTapHolding=true,this.options.onDoubleTapHoldStart?.()):this.isDoubleTapHolding=false;}onPointerMove(t,e){this.hasMoved||Math.hypot(t-this.startPos.x,e-this.startPos.y)>this.options.tapDistance&&(this.hasMoved=true);}onPointerUp(){let t=Date.now(),e=t-this.startTime;this.isDoubleTapHolding?(this.isDoubleTapHolding=false,this.options.onDoubleTapHoldEnd?.(),this.lastTapTime=0):e<=this.options.tapTime&&!this.hasMoved&&(this.options.onTap?.(),t-this.lastTapTime<this.options.doubleTapGap?(this.options.onDoubleTap?.(),this.lastTapTime=0):this.lastTapTime=t);}reset(){this.isDoubleTapHolding&&this.options.onDoubleTapHoldEnd?.(),this.isDoubleTapHolding=false,this.hasMoved=false,this.startTime=0,this.lastTapTime=0;}},Ge={isActive:false,isPressed:false,pointerId:null,value:0,vector:{x:0,y:0}},Ce=.15,Pe=.002,Xe=.3,ft=class extends N{constructor(t,e,i){super(t,i||E.JOYSTICK,e,Ge),u(this,"emitters"),u(this,"stickEmitter"),u(this,"cursorEmitter"),u(this,"gesture"),u(this,"ticker");let r=e.targetStageId,o=e.mapping||{};this.emitters={up:new T(r,o.up),down:new T(r,o.down),left:new T(r,o.left),right:new T(r,o.right)},this.stickEmitter=new T(r,o.stick),this.cursorEmitter=new T(r,"Mouse"),this.gesture=new gt({onTap:async()=>{this.setState({isPressed:true}),await this.stickEmitter.tap(),this.setState({isPressed:false});},onDoubleTapHoldStart:()=>{this.setState({isPressed:true}),this.stickEmitter.press();},onDoubleTapHoldEnd:()=>{this.setState({isPressed:false}),this.stickEmitter.release(false);}}),this.ticker=lt(()=>{this.handleCursorTick();});}get activePointerId(){return this.state.pointerId}onPointerDown(t){this.setState({isActive:true,pointerId:t.pointerId,vector:{x:0,y:0}}),this.gesture.onPointerDown(t.clientX,t.clientY),this.processInput(t,true);}onPointerMove(t){!this.state.isActive||t.pointerId!==this.state.pointerId||(this.gesture.onPointerMove(t.clientX,t.clientY),this.config.cursorMode&&this.ticker.start(),this.processInput(t));}onPointerUp(t){!this.state.isActive||t.pointerId!==this.state.pointerId||(this.gesture.onPointerUp(),this.handleRelease());}onPointerCancel(){this.handleRelease();}handleRelease(){this.setState({isActive:false,pointerId:null,vector:{x:0,y:0}}),this.ticker.stop(),Object.values(this.emitters).forEach(t=>t?.reset());}processInput(t,e=false){if(!this.state.isActive)return;let i=this.rect;if(!i)return;let r=i.left+i.width/2,o=i.top+i.height/2,s=i.width/2,n=i.height/2,a=(t.clientX-r)/s,c=(t.clientY-o)/n;if(e&&(a!=C(a,-1,1)||c!=C(c,-1,1))){this.setState({vector:{x:0,y:0}}),this.markRectDirty();return}let h=fe({x:a,y:c},1,this.config.threshold??Ce);S(h,this.state.vector,Pe)||(this.setState({vector:h}),this.handleDigitalKeys(h));}handleCursorTick(){let{vector:t,isActive:e}=this.state;if(!e||!this.config.cursorMode||S(t,{x:0,y:0},Pe)){this.ticker.stop();return}let i=this.config.cursorSensitivity??1,r={x:t.x*Math.abs(t.x)*i,y:t.y*Math.abs(t.y)*i};(Math.abs(r.x)>0||Math.abs(r.y)>0)&&this.cursorEmitter.move({delta:r});}handleDigitalKeys(t){let e=this.config.threshold??Ce;t.y<-e?(this.emitters.up.press(),this.emitters.down.release()):t.y>e?(this.emitters.down.press(),this.emitters.up.release()):(this.emitters.up.release(),this.emitters.down.release()),t.x<-e?(this.emitters.left.press(),this.emitters.right.release()):t.x>e?(this.emitters.right.press(),this.emitters.left.release()):(this.emitters.left.release(),this.emitters.right.release());}reset(){this.setState(Ge),this.gesture.reset(),this.handleRelease(),this.stickEmitter.reset(),this.cursorEmitter.reset();}updateConfig(t){super.updateConfig(t);let e=this.config.targetStageId,i=this.config.mapping||{};this.emitters.up.update(e,i.up),this.emitters.down.update(e,i.down),this.emitters.left.update(e,i.left),this.emitters.right.update(e,i.right),this.stickEmitter.update(e,i.stick),this.cursorEmitter.update(e);}triggerDown(){this.state.isPressed||(this.setState({isActive:true,isPressed:true}),this.stickEmitter.press());}triggerUp(){this.state.isPressed&&(this.setState({isActive:false,isPressed:false}),this.stickEmitter.release(true));}triggerVector(t,e){let i=this.config.threshold??Ce;if(Math.hypot(t,e)<i){this.state.isActive&&this.handleRelease();return}this.state.isActive||this.setState({isActive:true});let r=W(this.state.vector.x,t,Xe),o=W(this.state.vector.y,e,Xe),s={x:r,y:o};S(s,this.state.vector,Pe)||(this.setState({vector:s}),this.handleDigitalKeys(s)),this.config.cursorMode&&this.ticker.start();}},oi={isHighlighted:false},bt=class extends N{constructor(t,e,i){super(t,i||E.ROOT_LAYER,e,oi);}reset(){}},we=null,xe=()=>we||(we=Gt(),we),si={position:{x:50,y:50},isVisible:false,isPointerDown:false,isFocusReturning:false},M=1,vt=class extends N{constructor(t,e,i){super(t,i||E.TARGET_ZONE,e,si),u(this,"hideTimer",null),u(this,"focusFeedbackTimer",null),u(this,"throttledMoveExecution"),u(this,"delegates",{dispatchKeyboardEvent:(r,o)=>xe()?.dispatchKeyboard(r,o),dispatchPointerEventAtPos:(r,o,s,n)=>xe()?.dispatchPointerAtPos(r,o,s,n),reclaimFocusAtPos:(r,o)=>xe()?.reclaimFocus(r,o)}),this.throttledMoveExecution=de(r=>{this.executeMouseAction(m.POINTERMOVE,r);});}bindDelegate(t,e){Object.prototype.hasOwnProperty.call(this.delegates,t)?this.delegates[t]=e:undefined?.DEV&&console.warn(`[OmniPad-Core] TargetZone attempted to bind unknown delegate: ${t}`);}get activePointerId(){return null}onPointerDown(t){this.processPhysicalEvent(t,m.MOUSEDOWN);}onPointerMove(t){this.processPhysicalEvent(t,m.MOUSEMOVE);}onPointerUp(t){this.processPhysicalEvent(t,m.MOUSEUP),this.processPhysicalEvent(t,m.CLICK);}onPointerCancel(t){this.processPhysicalEvent(t,m.MOUSEUP);}processPhysicalEvent(t,e){let i=this.rect;if(!i)return;let r={x:R(t.clientX-i.left,i.width),y:R(t.clientY-i.top,i.height)};this.handleSignal({targetStageId:this.uid,type:e,payload:{point:r,button:t.button}});}handleSignal(t){let{type:e,payload:i}=t;switch((e===m.KEYDOWN||e===m.MOUSEDOWN||e===m.CLICK||e===m.MOUSEMOVE&&!this.state.isPointerDown&&!this.state.isVisible)&&this.ensureFocus(),e){case m.KEYDOWN:case m.KEYUP:this.delegates.dispatchKeyboardEvent?.(e,i);break;case m.MOUSEMOVE:i.point?this.updateCursorPosition(i.point):i.delta&&this.updateCursorPositionByDelta(i.delta),this.config.cursorEnabled&&this.showCursor(),this.throttledMoveExecution(i);break;case m.MOUSEDOWN:case m.MOUSEUP:case m.CLICK:i.point&&this.updateCursorPosition(i.point),this.config.cursorEnabled&&this.showCursor(),this.executeMouseAction(e.startsWith(m.MOUSE)?e.replace(m.MOUSE,m.POINTER):e,i);break}}executeMouseAction(t,e){let i=this.rect;if(!i)return;t===m.POINTERDOWN&&this.setState({isPointerDown:true}),t===m.POINTERUP&&this.setState({isPointerDown:false});let r=e.point||this.state.position,o=C(i.left+F(r.x,i.width),i.left+M,i.left+i.width-M),s=C(i.top+F(r.y,i.height),i.top+M,i.top+i.height-M);this.delegates.dispatchPointerEventAtPos?.(t,o,s,{button:e.button??0,buttons:this.state.isPointerDown?1:0,pressure:this.state.isPointerDown?.5:0});}ensureFocus(){let t=this.rect;if(!t)return;let e=C(t.left+F(this.state.position.x,t.width),t.left+M,t.left+t.width-M),i=C(t.top+F(this.state.position.y,t.height),t.top+M,t.top+t.height-M);this.delegates.reclaimFocusAtPos?.(e,i)&&this.triggerFocusFeedback();}triggerFocusFeedback(){this.setState({isFocusReturning:true}),this.focusFeedbackTimer&&clearTimeout(this.focusFeedbackTimer),this.focusFeedbackTimer=setTimeout(()=>this.setState({isFocusReturning:false}),500);}updateCursorPosition(t){S(t,this.state.position)||this.setState({position:{...t}});}updateCursorPositionByDelta(t){if(S(t,{x:0,y:0}))return;let e=this.rect;if(!e)return;let i=R(t.x,e.width),r=R(t.y,e.height);this.updateCursorPosition({x:C(this.state.position.x+i,0,100),y:C(this.state.position.y+r,0,100)});}showCursor(){this.setState({isVisible:true}),this.hideTimer&&clearTimeout(this.hideTimer),this.config.cursorAutoDelay&&this.config.cursorAutoDelay>0&&(this.hideTimer=setTimeout(()=>this.setState({isVisible:false}),this.config.cursorAutoDelay));}reset(){this.state.isPointerDown&&this.executeMouseAction(m.POINTERUP,{}),this.hideTimer&&clearTimeout(this.hideTimer),this.focusFeedbackTimer&&clearTimeout(this.focusFeedbackTimer),this.setState({isVisible:false,isPointerDown:false,isFocusReturning:false});}},Qe={isActive:false,isPressed:false,pointerId:null,value:0},kt=class extends N{constructor(t,e,i){super(t,i||E.TRACKPAD,e,Qe),u(this,"lastPointerPos",{x:0,y:0}),u(this,"gesture"),u(this,"emitter");let r=e.mapping||"Mouse";this.emitter=new T(e.targetStageId,r),this.gesture=new gt({onTap:()=>{this.setState({isPressed:true}),this.emitter.tap();},onDoubleTapHoldStart:()=>{this.setState({isPressed:true}),this.emitter.press();},onDoubleTapHoldEnd:()=>{this.setState({isPressed:false}),this.emitter.release(false);}});}get activePointerId(){return this.state.pointerId}onPointerDown(t){this.lastPointerPos={x:t.clientX,y:t.clientY},this.gesture.onPointerDown(t.clientX,t.clientY),this.setState({isActive:true,pointerId:t.pointerId});}onPointerMove(t){!this.state.isActive||t.pointerId!==this.state.pointerId||(this.gesture.onPointerMove(t.clientX,t.clientY),this.processInput(t));}processInput(t){if(!this.state.isActive)return;let e=t.clientX-this.lastPointerPos.x,i=t.clientY-this.lastPointerPos.y,r=this.rect;if(!r)return;let o=e/r.width*100*(this.config.sensitivity??1),s=i/r.height*100*(this.config.sensitivity??1),n={x:o,y:s};S(n,{x:0,y:0})||this.emitter.move({delta:n}),this.lastPointerPos={x:t.clientX,y:t.clientY};}onPointerUp(t){!this.state.isActive||t.pointerId!==this.state.pointerId||(this.gesture.onPointerUp(),this.handleRelease());}onPointerCancel(){this.handleRelease();}reset(){this.gesture.reset(),this.emitter.reset(),this.handleRelease();}updateConfig(t){super.updateConfig(t),this.emitter.update(this.config.targetStageId,this.config.mapping);}handleRelease(){this.setState(Qe);}},Te=Symbol.for("omnipad.gamepad_manager.instance"),Ct=()=>[];function Pt(t){Ct=t;}var Yi=class wt{constructor(){u(this,"config",null),u(this,"lastButtonStates",[]),u(this,"ticker"),u(this,"tick",()=>{let e=Ct();this.config?.forEach((i,r)=>{let o=e[r];o&&o.connected&&i&&(this.lastButtonStates[r]||(this.lastButtonStates[r]=[]),this.processButtons(o,i,r),this.processDPad(o,i),this.processAxes(o,i));});}),this.ticker=lt(()=>this.tick());}static getInstance(){let e=globalThis;return e[Te]||(e[Te]=new wt),e[Te]}setConfig(e){this.config=e;}getConfig(){return this.config}start(){this.ticker.start();}stop(){this.ticker.stop();}processButtons(e,i,r){i.buttons&&Object.entries(i.buttons).forEach(([o,s])=>{let n=ne[o];if(n===void 0||!e.buttons[n])return;let a=e.buttons[n].pressed,c=this.lastButtonStates[r][n]||false;a&&!c?this.triggerVirtualEntity(s,"down"):!a&&c&&this.triggerVirtualEntity(s,"up"),this.lastButtonStates[r][n]=a;});}processDPad(e,i){let r=i?.dpad;if(!r)return;let o=e.buttons[12]?.pressed?-1:0,s=e.buttons[13]?.pressed?1:0,n=e.buttons[14]?.pressed?-1:0,a=e.buttons[15]?.pressed?1:0,c=n+a,h=o+s;this.triggerVirtualEntity(r,"vector",{x:c,y:h});}processAxes(e,i){let r=i?.deadzone??.1;if(i?.leftStick){let o=Math.abs(e.axes[0])>r?e.axes[0]:0,s=Math.abs(e.axes[1])>r?e.axes[1]:0;this.triggerVirtualEntity(i.leftStick,"vector",{x:o,y:s});}if(i?.rightStick){let o=Math.abs(e.axes[2])>r?e.axes[2]:0,s=Math.abs(e.axes[3])>r?e.axes[3]:0;this.triggerVirtualEntity(i.rightStick,"vector",{x:o,y:s});}}triggerVirtualEntity(e,i,r){let o=I.getInstance().getEntity(e);!o||o.activePointerId!=null||(i==="down"&&typeof o.triggerDown=="function"&&o.triggerDown(),i==="up"&&typeof o.triggerUp=="function"&&o.triggerUp(),i==="vector"&&typeof o.triggerVector=="function"&&r&&o.triggerVector(r.x,r.y));}};var ni=Object.defineProperty,ai=(t,e,i)=>e in t?ni(t,e,{enumerable:true,configurable:true,writable:true,value:i}):t[e]=i,k=(t,e,i)=>ai(t,typeof e!="symbol"?e+"":e,i),Ee=(t,e,i="omnipad-prevent")=>{let r=document.elementsFromPoint(t,e).find(o=>!(o.classList&&o.classList.contains(i)));if(!r)return null;for(;r.shadowRoot;){let o=r.shadowRoot.elementsFromPoint(t,e).find(s=>!(s.classList&&s.classList.contains(i)));if(!o||o===r)break;r=o;}return r},Ie=()=>{let t=document.activeElement;for(;t&&t.shadowRoot&&t.shadowRoot.activeElement;)t=t.shadowRoot.activeElement;return t},De=t=>{if(!t)return null;if(t.startsWith("#")){let e=t.slice(1),i=document.getElementById(e);if(i)return i}try{return document.querySelector(t)}catch{return null}},xt=(t,e,i)=>{let r=Ie();return typeof i=="function"&&r&&r.tagName.toLowerCase()==="iframe"?(i(r,t,e),true):di(t,e)},di=(t,e)=>{let i=new KeyboardEvent(t,{...e,which:e.keyCode,bubbles:true,cancelable:true,view:window});return window.dispatchEvent(i)},Tt=(t,e,i,r,o)=>{let s=Ee(e,i);return s?typeof o=="function"&&s.tagName.toLowerCase()==="iframe"?(o(s,t,e,i,r),true):li(s,t,e,i,r):false},li=(t,e,i,r,o)=>{if(!Number.isFinite(i)||!Number.isFinite(r))return  false;let s={bubbles:true,cancelable:true,composed:true,clientX:i,clientY:r,view:window,...o};if(e.startsWith("pointer")){t.dispatchEvent(new PointerEvent(e,{isPrimary:true,pointerId:9999,pointerType:"mouse",...s}));let n=e.replace("pointer","mouse");return t.dispatchEvent(new MouseEvent(n,s))}else return t.dispatchEvent(new MouseEvent(e,s))},St=(t,e,i)=>{let r=Ee(t,e);return r?(typeof i=="function"&&r.tagName.toLowerCase()==="iframe"&&i(r,t,e),ci(r)):false},ci=t=>Ie()===t?false:(t.hasAttribute("tabindex")||t.setAttribute("tabindex","-1"),t.focus({preventScroll:true}),true),le="__OMNIPAD_IPC_V1__";function Oe(t){let e=null,i=true;return {get:()=>((i||!e)&&(e=t(),i=false),e),markDirty:()=>{i=true;}}}var pi={rect:["left","right","top","bottom","width","height"]};function ui(t,e){let i={};for(let r=0;r<e.length;r++){let o=e[r];i[o]=t[o];}return i}var J=t=>ui(t,pi.rect);var hi=["px","%","vh","vw","vmin","vmax","rem","em"],b={ActionTypes:m,CssUnits:hi,Types:E};var Le=Symbol.for("omnipad.element_observer.instance"),q=class Ot{constructor(){k(this,"_ro"),k(this,"_roRegistry",new Map),k(this,"_elToRoCb",new WeakMap),k(this,"_io"),k(this,"_ioRegistry",new Map),k(this,"_elToIoCb",new WeakMap);let e=de(i=>{for(let r of i)this._elToRoCb.get(r.target)?.();});this._ro=new ResizeObserver(i=>{e(i);}),this._io=new IntersectionObserver(i=>{for(let r of i)this._elToIoCb.get(r.target)?.(r.isIntersecting);},{threshold:0});}static getInstance(){let e=globalThis;return e[Le]||(e[Le]=new Ot),e[Le]}observeResize(e,i,r){this.unobserveResize(e),this._roRegistry.set(e,i),this._elToRoCb.set(i,r),this._ro.observe(i);}unobserveResize(e){let i=this._roRegistry.get(e);i&&(this._ro.unobserve(i),this._elToRoCb.delete(i),this._roRegistry.delete(e));}observeIntersect(e,i,r){this.unobserveIntersect(e),this._ioRegistry.set(e,i),this._elToIoCb.set(i,r),this._io.observe(i);}unobserveIntersect(e){let i=this._ioRegistry.get(e);i&&(this._io.unobserve(i),this._elToIoCb.delete(i),this._ioRegistry.delete(e));}disconnect(e){this.unobserveResize(e),this.unobserveIntersect(e);}},Re=Symbol.for("omnipad.iframe_manager.instance"),ce=class Lt{constructor(){k(this,"trustedOrigins",new Set),k(this,"managedIframes",new Map),k(this,"deniedIframes",new WeakSet),this.trustedOrigins.add(window.location.origin);}static getInstance(){let e=globalThis;return e[Re]||(e[Re]=new Lt),e[Re]}addTrustedOrigin(e){if(e==="*"&&(console.error("[OmniPad-IPC] Using wildcard origin is UNSAFE!"),console.error('For production, use: addTrustedOrigin("https://game-provider.com")'),!undefined?.DEV))throw new Error("Wildcard origin forbidden in production.");if(!/^https?:\/\//.test(e))throw new Error("[OmniPad-Security] Origin must be a valid HTTP(S) URL.");this.trustedOrigins.add(e);}getVerifiedIframeData(e){if(!e.isConnected)return null;let i=this.managedIframes.get(e);if(i)return i;if(this.deniedIframes.has(e))return null;let r=this.getSecureOrigin(e);if(!(this.trustedOrigins.has("*")||this.trustedOrigins.has(r)))return undefined?.DEV&&console.warn(`[OmniPad-Security] Blocking untrusted iframe from origin: ${r}`),this.deniedIframes.add(e),null;let o=B("iframe-proxy"),s=this.captureRect(e),n={uid:o,rect:s,origin:r,isVisible:true};this.managedIframes.set(e,n);let a=q.getInstance();return a.observeResize(o,e,()=>{n.rect=this.captureRect(e);}),a.observeIntersect(o,e,c=>{n.isVisible=c;}),n}forwardPointerEvent(e,i,r,o,s){if(!e.contentWindow||!Number.isFinite(r)||!Number.isFinite(o))return;let n=this.getVerifiedIframeData(e);if(!n)return;let a=r-n.rect.left,c=o-n.rect.top;e.contentWindow.postMessage({signature:le,type:"pointer",action:i,payload:{x:a,y:c,opts:s},depth:1},n.origin);}forwardKeyboardEvent(e,i,r){if(!e.contentWindow)return;let o=this.getVerifiedIframeData(e);o&&e.contentWindow.postMessage({signature:le,type:"keyboard",action:i,payload:r,depth:1},o.origin);}forwardFocusReclaim(e,i,r){if(!e.contentWindow)return;let o=this.getVerifiedIframeData(e);if(!o)return;let s=i-o.rect.left,n=r-o.rect.top;e.contentWindow.postMessage({signature:le,type:"focus",action:"reclaim",payload:{x:s,y:n},depth:1},o.origin);}captureRect(e){let i=e.getBoundingClientRect();return J(i)}getSecureOrigin(e){try{if(!e.src)return "null";let i=new URL(e.src,window.location.href);return ["about:","blob:","data:"].includes(i.protocol)?"null":i.origin}catch{return "null"}}markAllRectDirty(){undefined?.DEV&&console.debug("[OmniPad-IPC] Refreshing all iframe rects due to environment change."),this.managedIframes.forEach((e,i)=>{if(!i.isConnected){this.unmanageIframe(i,e.uid);return}e.rect=this.captureRect(i);});}unmanageIframe(e,i){q.getInstance().disconnect(i),this.managedIframes.set(e,void 0),this.managedIframes.delete(e),this.deniedIframes.delete(e);}clearAll(){this.managedIframes.forEach((e,i)=>{this.unmanageIframe(i,e.uid);});}},Rt=(t,e)=>xt(t,e,(i,r,o)=>{ce.getInstance().forwardKeyboardEvent(i,r,o);}),mi=(t,e,i,r)=>Tt(t,e,i,r,(o,s,n,a,c)=>{ce.getInstance().forwardPointerEvent(o,s,n,a,c);}),gi=(t,e)=>St(t,e,(i,r,o)=>{ce.getInstance().forwardFocusReclaim(i,r,o);}),fi=/^[a-zA-Z0-9\s._#$\-*>+~]+$/,bi=Object.freeze(["__proto__","constructor","prototype"]),vi=Object.freeze(["script","javascript:","onerror","onload","eval","expression"]);function ki(t,e=""){if(!t)return e;let i=t.trim();return i.length>256?e:fi.test(i)?vi.some(r=>i.toLowerCase().includes(r))?e:i:(undefined?.DEV&&console.warn(`[OmniPad-Validation] Unsafe DOM string blocked: "${i}"`),e)}var Ci=/^[a-zA-Z0-9\-_]+$/;function Pi(t){return t?t.split(/\s+/).filter(e=>Ci.test(e)).join(" "):""}function wi(t){let e=new Set([...bi]),i=r=>{if(r===null||typeof r!="object")return r;if(Array.isArray(r))return r.map(n=>i(n));let o={},s=Object.keys(r);for(let n=0;n<s.length;n++){let a=s[n];if(e.has(a)){console.warn(`[OmniPad-Security] Stripped dangerous key: "${a}"`);continue}let c=r[a];o[a]=c!==null&&typeof c=="object"?i(c):c;}return o};return i(t)}function x(t){if(t==null)return;if(typeof t=="object"&&"unit"in t&&"value"in t)return Et(t);if(typeof t=="number")return {value:Number.isFinite(t)?t:0,unit:"px"};let e=t.trim().toLowerCase(),i=parseFloat(e);if(isNaN(i))return {value:0,unit:"px"};let r=e.slice(String(i).length).trim();return Et({value:i,unit:r})}var Et=t=>{let{value:e,unit:i}=t;return !isNaN(e)&&b.CssUnits.includes(i)?{value:e,unit:i}:(console.warn(`[OmniPad-Core] Blocked invalid CSS unit: ${i}`),{value:isNaN(e)?0:e,unit:"px"})};function xi(t){return {...t,left:x(t.left),top:x(t.top),right:x(t.right),bottom:x(t.bottom),width:x(t.width),height:x(t.height),stickySelector:ki(t.stickySelector)}}function Ti(t,e,i){let r=t.left!==void 0?x(t.left):null,o=t.right!==void 0?x(t.right):null,s=t.top!==void 0?x(t.top):null,n=t.bottom!==void 0?x(t.bottom):null,a=t.width!==void 0?x(t.width):null,c=t.height!==void 0?x(t.height):null;i||(i=(y,P)=>y?y.unit==="%"?y.value/100*P:y.value:0);let h,p;if(a!=null&&a.value!==0)h=i(a,e.width),r!=null?p=e.left+i(r,e.width):o!=null?p=e.right-i(o,e.width)-h:p=e.left;else {let y=r!=null?i(r,e.width):0,P=o!=null?i(o,e.width):0;p=e.left+y,h=Math.max(0,e.width-y-P);}let f,l;if(c!=null&&c.value!==0)f=i(c,e.height),s!=null?l=e.top+i(s,e.height):n!=null?l=e.bottom-i(n,e.height)-f:l=e.top;else {let y=s!=null?i(s,e.height):0,P=n!=null?i(n,e.height):0;l=e.top+y,f=Math.max(0,e.height-y-P);}return {...t,left:`${p}px`,top:`${l}px`,width:`${h}px`,height:`${f}px`,right:void 0,bottom:void 0}}var Mt=t=>{if(Object.keys(t??{}).length===0)return {};let e={};e.position=t.stickySelector?"fixed":"absolute",t.isSquare&&(e.aspectRatio="1/1"),["left","top","right","bottom","width","height"].forEach(r=>{let o=t[r];if(o!=null){let s=x(o);s!=null&&(e[r]=D(s));}}),t.zIndex!==void 0&&(e.zIndex=t.zIndex);let i={"top-left":"translate(0, 0)","top-center":"translate(-50%, 0)","top-right":"translate(-100%, 0)","center-left":"translate(0, -50%)",center:"translate(-50%, -50%)","center-right":"translate(-100%, -50%)","bottom-left":"translate(0, -100%)","bottom-center":"translate(-50%, -100%)","bottom-right":"translate(-100%, -100%)"};return t.anchor&&(e.transform=i[t.anchor]),e},Be=(t,e,i=false)=>{let r=C(t.x+1,0,2),o=C(t.y+1,0,2);return i?{width:"100cqw",height:"100cqh",x:`${r*50}cqw`,y:`${o*50}cqh`}:{width:`${e.x}px`,height:`${e.y}px`,x:`${r*e.x/2}px`,y:`${o*e.y/2}px`}},pe=(t,e,i=false)=>{let r={x:t.x/50-1,y:t.y/50-1};return Be(r,i?r:e(),i)},Si=(t,e)=>{if(t instanceof Element)try{t.setPointerCapture(e);}catch(i){undefined?.DEV&&console.warn("[OmniPad-DOM] Failed to set pointer capture:",i);}},It=(t,e)=>{if(t instanceof Element&&t.hasPointerCapture(e))try{t.releasePointerCapture(e);}catch{}};function ue(t,e={}){return {onPointerDown(i){if(!i.isTrusted||e?.requireDirectHit&&i.target!==i.currentTarget||t.activePointerId!=null)return;i.cancelable&&i.preventDefault(),i.stopPropagation();let r=i.currentTarget;r&&Si(r,i.pointerId),t.onPointerDown(i);},onPointerMove(i){i.isTrusted&&(t.activePointerId!=null&&t.activePointerId!==i.pointerId||(i.cancelable&&i.preventDefault(),t.onPointerMove(i)));},onPointerUp(i){if(!i.isTrusted||t.activePointerId!=null&&t.activePointerId!==i.pointerId)return;i.cancelable&&i.preventDefault();let r=i.currentTarget;r&&It(r,i.pointerId),t.onPointerUp(i);},onPointerCancel(i){if(!i.isTrusted||t.activePointerId!=null&&t.activePointerId!==i.pointerId)return;let r=i.currentTarget;r&&It(r,i.pointerId),t.onPointerCancel(i);}}}var Me,U=()=>(Me!==void 0||(Me=typeof window<"u"&&!!window.CSS?.supports?.("width: 1cqw")),Me);function Ei(t,e){if(!t)return 0;switch(t.unit){case "px":return t.value;case "%":return t.value/100*e;case "vw":return t.value/100*window.innerWidth;case "vh":return t.value/100*window.innerHeight;case "vmin":return t.value/100*Math.min(window.innerWidth,window.innerHeight);case "vmax":return t.value/100*Math.max(window.innerWidth,window.innerHeight);case "rem":case "em":{let i=parseFloat(getComputedStyle(document.documentElement).fontSize)||16;return t.value*i}default:return t.value}}function At(t,e){return Ti(t,e,Ei)}var Ii=class{constructor(t,e,i,r){this.finder=e,this.rectProvider=i,this.presenceChecker=r,k(this,"_selector"),k(this,"_cachedTarget",null),k(this,"_rectCache"),this._selector=t,this._rectCache=Oe(()=>{let o=this.getTarget();return o?this.rectProvider(o):null});}getTarget(){return this._cachedTarget&&this.presenceChecker(this._cachedTarget)?this._cachedTarget:(this._cachedTarget=this.finder(this._selector),this._cachedTarget)}getRect(){return this._rectCache.get()}markDirty(){this._rectCache.markDirty();}updateSelector(t){return this._selector===t?false:(this._selector=t,this._cachedTarget=null,this.markDirty(),true)}},Bt=t=>new Ii(t,e=>De(e),e=>{let i=e.getBoundingClientRect();return J(i)},e=>e.isConnected),Nt=class{constructor(t,e){this.instance=t,this.onUpdate=e;}get uid(){return this.instance.uid+"-sticky"}handleSelectorChange(t,e,i){let r=q.getInstance();if(!t)return r.disconnect(this.uid),{provider:null,updated:true};let o=e,s=false;if(o?s=o.updateSelector(t):(o=i(t),s=true),s){let n=o.getTarget();n&&(r.observeResize(this.uid,n,()=>{o?.markDirty(),this.instance.markRectDirty(),this.onUpdate();}),r.observeIntersect(this.uid,n,a=>{a||this.instance.reset();}),this.onUpdate());}return {provider:o,updated:s}}onCleanUp(){q.getInstance().disconnect(this.uid);}};function Vt(t,e,i,r){if(!t.uid)return ()=>{};let o=t.uid,s=q.getInstance();if("bindRectProvider"in t){let n=t,a=Oe(()=>i(e));n.bindRectProvider(a.get,()=>{a.markDirty(),r&&r.markDirty();}),s.observeResize(o,e,()=>{n.markRectDirty();});}if("reset"in t){let n=t;s.observeIntersect(o,e,a=>{a||n.reset();});}return ()=>{s.disconnect(o);}}var Ae=Symbol.for("omnipad.window_manager.instance"),Wt=class Ft{constructor(){k(this,"_isListening",false),k(this,"throttledReset"),k(this,"handleGlobalReset",()=>{undefined?.DEV&&console.debug("[OmniPad-DOM] Safety reset triggered by environment change."),I.getInstance().resetAll(),I.getInstance().markAllRectDirty(),ce.getInstance().markAllRectDirty();}),k(this,"handleResizeReset",()=>{this.throttledReset(null);}),k(this,"handleBlurReset",()=>{let e=document.activeElement;e&&e.tagName.toLowerCase()==="iframe"||this.handleGlobalReset();}),k(this,"handleScrollReset",()=>{this.throttledReset(null);}),k(this,"handleVisibilityChangeReset",()=>{document.visibilityState==="hidden"&&this.handleGlobalReset();}),this.throttledReset=de(()=>{this.handleGlobalReset();});}static getInstance(){let e=globalThis;return e[Ae]||(e[Ae]=new Ft),e[Ae]}init(){this._isListening||(window.addEventListener("resize",this.handleResizeReset),window.addEventListener("blur",this.handleBlurReset),window.addEventListener("scroll",this.handleScrollReset,{capture:true,passive:true}),document.addEventListener("visibilitychange",this.handleVisibilityChangeReset),this._isListening=true,undefined?.DEV&&console.log("[OmniPad-DOM] Global WindowManager monitoring started."));}async toggleFullscreen(e){let i=e||document.documentElement;try{document.fullscreenElement?(this.handleGlobalReset(),await document.exitFullscreen()):(this.handleGlobalReset(),await i.requestFullscreen());}catch(r){console.error("[OmniPad-DOM] Fullscreen toggle failed:",r);}}isFullscreen(){return !!document.fullscreenElement}destroy(){window.removeEventListener("resize",this.handleResizeReset),window.removeEventListener("blur",this.handleBlurReset),window.removeEventListener("scroll",this.handleScrollReset,{capture:true}),window.removeEventListener("visibilitychange",this.handleVisibilityChangeReset),this._isListening=false;}};typeof window<"u"&&dt(window.requestAnimationFrame.bind(window),window.cancelAnimationFrame.bind(window));nt({dispatchKeyboard:Rt,dispatchPointerAtPos:mi,reclaimFocus:gi});ct(t=>{(t.type===b.ActionTypes.KEYDOWN||t.type===b.ActionTypes.KEYUP)&&Rt(t.type,t.payload);});var Dt=[null,null,null,null];typeof navigator<"u"&&navigator.getGamepads&&Pt(()=>{let t=navigator.getGamepads();for(let e=0;e<4;e++)Dt[e]=t[e]||null;return Dt});ut({sanitizeObject:t=>wi(t),validateConfig:(t,e)=>({...e,layout:xi(e.layout),cssClass:Pi(e.cssClass)})});var Ve={};function O(t,e){Ve[t]=e;}function he(t){return t&&Ve[t]||null}function Di(t){return !!he(t)}function Ut(t){return Ve[t]||Ne}function G(t,e){let i=he(e.type)||he(e.config?.baseType)||Ut(e.type);return new i(t,{treeNode:e})}var Ne=class{constructor(e,i={}){d(this,"uid");d(this,"el");this.uid=i.treeNode?.uid||"unknown-widget",this.el=document.createElement("div"),this.el.id=this.uid,this.el.textContent=`[Unknown: ${i.treeNode?.type||"component"}]`,Object.assign(this.el.style,{color:"#ff4d4f",fontFamily:"monospace",position:"absolute"}),e.appendChild(this.el);}destroy(){this.el.remove();}};var Oi=["position","left","top","right","bottom","width","height","zIndex","aspectRatio","transform"];function g(t){let e=document.createElement("div");return We(e,t),e}function We(t,e){let i=_t(e);i.length>0&&t.classList.add(...i);}function _t(t){return t?(Array.isArray(t)?t.join(" "):t).split(/\s+/).filter(Boolean):[]}function Kt(t,e,i){e.length>0&&t.classList.remove(...e);let r=_t(i);return r.length>0&&t.classList.add(...r),r}function A(t,e){for(let r of Oi)t.style[r]="";if(!e)return;let i=Mt(e);Object.assign(t.style,i);}function _(t,e){for(let[i,r]of Object.entries(e))r==null?t.style.removeProperty(i):t.style.setProperty(i,String(r));}function v(t,e){t.replaceChildren(),e&&t.appendChild(e);}function Ht(t){return t.closest("[data-omnipad-parent-id]")?.getAttribute("data-omnipad-parent-id")||void 0}function zt(t){return {x:t?.width||0,y:t?.height||0}}function jt(t){return e=>t(e)}var Li=Object.freeze(["treeNode","widgetId","parentId","customType","append","children","nodes","dynamicWidget","renderBase","renderContent","renderStick","renderCursor","renderWithCursor","renderFocusFeedback"]);function $t(t,e,i={},r={},o=[]){let s=ot(i.treeNode,t),n=i.parentId||s?.config?.parentId||Ht(e),a=i.widgetId||s?.uid||B(t),c=new Set([...Li,...o]),h=s?.config||{},p=it(i,c);return {uid:a,treeNode:s,customType:i.customType||s?.type,initialConfig:rt(t,a,n,r,h,p)}}var w=class{constructor(e){d(this,"uid");d(this,"el");d(this,"core");d(this,"config");d(this,"state");d(this,"options");d(this,"append");d(this,"disposers",[]);d(this,"eventDisposers",[]);d(this,"customClasses",[]);d(this,"spatialCleanup",null);d(this,"stickyController",null);d(this,"stickyProvider",null);d(this,"pointerHandlers",null);d(this,"mounted",false);this.options=e.options||{},this.append=this.options.append!==false;let i=$t(e.requiredType,e.container,this.options,e.defaultProps,e.extraSkipProps);this.uid=i.uid,this.config=i.initialConfig,this.core=e.createCore(this.uid,this.config,i.customType),this.el=g(e.baseClasses),this.el.id=this.uid,We(this.el,"omnipad-prevent"),e.markAsParent&&this.el.setAttribute("data-omnipad-parent-id",this.uid);}mount(e){this.mounted||(this.mounted=true,this.append&&e.appendChild(this.el),I.getInstance().register(this.core),this.subscribeCore(),Wt.getInstance().init(),this.spatialCleanup=Vt(this.core,this.el,i=>J(i.getBoundingClientRect()),this.stickyProvider));}attachPointerBridge(e={}){"onPointerDown"in this.core&&(this.pointerHandlers=ue(this.core,e),this.addPointerListener("pointerdown",i=>this.onPointerDown(i)),this.addPointerListener("pointermove",i=>this.onPointerMove(i)),this.addPointerListener("pointerup",i=>this.onPointerUp(i)),this.addPointerListener("pointercancel",i=>this.onPointerCancel(i)),this.addPointerListener("lostpointercapture",i=>this.onPointerCancel(i)));}bindDelegates(e){et(this.core,e);}updateConfig(e){this.core.updateConfig(e);}markRectDirty(){"markRectDirty"in this.core&&this.core.markRectDirty();}onPointerDown(e){this.pointerHandlers?.onPointerDown(e);}onPointerMove(e){this.pointerHandlers?.onPointerMove(e);}onPointerUp(e){this.pointerHandlers?.onPointerUp(e);}onPointerCancel(e){this.pointerHandlers?.onPointerCancel(e);}destroy(){for(let e of this.eventDisposers.splice(0))e();for(let e of this.disposers.splice(0))e();this.spatialCleanup?.(),this.stickyController?.onCleanUp(),this.core.destroy(),this.el.remove();}renderConfig(e){this.syncLayout(e),this.customClasses=Kt(this.el,this.customClasses,e.cssClass);}renderState(e){}getEffectiveLayout(e){let i=e.layout,r=this.stickyProvider?.getRect();return r?At(i,r):i}syncLayout(e){A(this.el,this.getEffectiveLayout(e));}addPointerListener(e,i){let r=jt(i);this.el.addEventListener(e,r),this.eventDisposers.push(()=>this.el.removeEventListener(e,r));}subscribeCore(){if("subscribeConfig"in this.core){let e=this.core.subscribeConfig(i=>{this.config=i,this.renderConfig(i),this.syncSticky(i),this.syncLayout(i);});this.disposers.push(e);}if("subscribeState"in this.core){let e=this.core.subscribeState(i=>{this.state=i,this.renderState(i);});this.disposers.push(e);}}syncSticky(e){let i=e.layout?.stickySelector;this.stickyController||(this.stickyController=new Nt(this.core,()=>this.syncLayout(this.config)));let r=this.stickyController.handleSelectorChange(i,this.stickyProvider,o=>Bt(o));this.stickyProvider=r.provider;}};var V=class{constructor(e,i={}){d(this,"uid","virtual-layer");d(this,"el");d(this,"children",[]);d(this,"append");this.append=i.append!==false,this.el=g(["omnipad-virtual-layer-base","omnipad-prevent"]),this.renderNodes(i.nodes||[]),i.renderContent?.(this.el),this.append&&e.appendChild(this.el);}updateNodes(e){for(let i of this.children.splice(0))i.destroy();this.el.replaceChildren(),this.renderNodes(e);}destroy(){for(let e of this.children.splice(0))e.destroy();this.el.remove();}renderNodes(e){for(let i of e)this.children.push(G(this.el,i));}};var X=class extends w{constructor(i,r={}){super({container:i,requiredType:b.Types.INPUT_ZONE,options:r,baseClasses:["omnipad-input-zone"],markAsParent:true,createCore:(s,n,a)=>new mt(s,n,a)});d(this,"fixedLayer");d(this,"trigger");d(this,"dynamicMount");d(this,"useNativeContainerQueries",U());d(this,"triggerDisposers",[]);d(this,"dynamicWidget",null);let o=tt(r.children||r.treeNode?.children,this.config.dynamicWidgetId||"");this.fixedLayer=new V(this.el,{nodes:o,renderContent:s=>r.renderContent?.(s,this)}),this.trigger=g(["omnipad-input-zone-trigger","omnipad-prevent"]),this.dynamicMount=g("dynamic-widget-mount"),this.trigger.appendChild(this.dynamicMount),this.el.appendChild(this.trigger),this.attachTriggerBridge(),this.resolveDynamicWidget(r.dynamicWidget),this.mount(i);}destroy(){for(let i of this.triggerDisposers.splice(0))i();this.dynamicWidget?.destroy(),this.fixedLayer.destroy(),super.destroy();}renderConfig(i){super.renderConfig(i),this.trigger.style.display=this.dynamicWidget||this.core.isInterceptorRequired?"":"none";}renderState(i){if(!i.isDynamicActive){this.dynamicMount.style.visibility="hidden",this.dynamicMount.style.opacity="0",this.dynamicMount.style.pointerEvents="none";return}let r=pe(i.dynamicPosition,()=>({x:this.core.rect?.width||0,y:this.core.rect?.height||0}),this.useNativeContainerQueries);_(this.dynamicMount,{"--dynamic-widget-mount-x":r.x,"--dynamic-widget-mount-y":r.y}),this.dynamicMount.style.zIndex="100",this.dynamicMount.style.visibility="visible",this.dynamicMount.style.opacity="1",this.dynamicMount.style.pointerEvents="auto";}attachTriggerBridge(){let i=ue(this.core,{requireDirectHit:true}),r=(o,s)=>{let n=a=>s(a);this.trigger.addEventListener(o,n),this.triggerDisposers.push(()=>this.trigger.removeEventListener(o,n));};r("pointerdown",i.onPointerDown),r("pointermove",i.onPointerMove),r("pointerup",i.onPointerUp),r("pointercancel",i.onPointerCancel),r("lostpointercapture",i.onPointerCancel);}resolveDynamicWidget(i){let r=i||this.getDynamicNodeFromConfig();r&&(typeof r=="function"?this.dynamicWidget=r(this.dynamicMount)||null:"destroy"in r&&"el"in r?(this.dynamicWidget=r,this.dynamicMount.appendChild(r.el)):this.dynamicWidget=G(this.dynamicMount,r),this.dynamicWidget&&(this.updateConfig({dynamicWidgetId:this.dynamicWidget.uid}),this.bindDelegates({dynamicWidgetPointerDown:o=>{this.dynamicWidget?.markRectDirty?.(),this.dynamicWidget?.onPointerDown?.(o);},dynamicWidgetPointerMove:o=>{this.dynamicWidget?.onPointerMove?.(o);},dynamicWidgetPointerUp:o=>{this.dynamicWidget?.onPointerUp?.(o);},dynamicWidgetPointerCancel:o=>{this.dynamicWidget?.onPointerCancel?.(o);}})));}getDynamicNodeFromConfig(){let i=this.config.dynamicWidgetId;return i&&this.options.treeNode?.children?.find(r=>r.uid===i)||null}};var Q=class extends w{constructor(i,r={}){super({container:i,requiredType:b.Types.ROOT_LAYER,options:r,baseClasses:["omnipad-root-layer"],markAsParent:true,createCore:(o,s,n)=>new bt(o,s,n)});d(this,"layer");this.layer=new V(this.el,{nodes:r.children||r.treeNode?.children||[],renderContent:r.renderContent}),this.mount(i);}destroy(){this.layer.destroy(),super.destroy();}};var ee=class extends w{constructor(i,r={}){super({container:i,requiredType:b.Types.TARGET_ZONE,options:r,defaultProps:{cursorAutoDelay:2500},baseClasses:["omnipad-target-zone"],markAsParent:true,createCore:(o,s,n)=>new vt(o,s,n)});d(this,"focusLayer");d(this,"cursorLayer");d(this,"cursorFollowLayer");d(this,"contentLayer");d(this,"defaultFocus");d(this,"defaultCursor");d(this,"useNativeContainerQueries",U());this.focusLayer=g("omnipad-target-focus-layer"),this.cursorLayer=g("omnipad-virtual-cursor"),this.cursorFollowLayer=g("omnipad-virtual-cursor"),this.contentLayer=g("omnipad-target-content-layer"),this.defaultFocus=g("omnipad-default-focus-border-feedback"),this.defaultCursor=g("omnipad-default-cursor-dot"),this.cursorLayer.appendChild(this.defaultCursor),this.el.append(this.focusLayer,this.cursorLayer,this.cursorFollowLayer,this.contentLayer),this.attachPointerBridge(),this.mount(i);}renderConfig(i){super.renderConfig(i),this.renderTarget();}renderState(i){this.state=i,this.renderTarget();}renderTarget(){if(!this.state)return;let i=this.createContext(this.state),r=!!this.config.cursorEnabled;this.cursorLayer.style.display=r?"":"none",this.cursorFollowLayer.style.display=r?"":"none";let o=pe(this.state.position,()=>({x:this.core.rect?.width||0,y:this.core.rect?.height||0}),this.useNativeContainerQueries);for(let s of [this.cursorLayer,this.cursorFollowLayer])_(s,{"--omnipad-virtual-cursor-x":o.x,"--omnipad-virtual-cursor-y":o.y}),s.style.opacity=this.state.isVisible?"1":"0";this.defaultCursor.classList.toggle("is-down",this.state.isPointerDown),this.options.renderCursor?v(this.cursorLayer,this.options.renderCursor(i)||null):this.cursorLayer.contains(this.defaultCursor)||v(this.cursorLayer,this.defaultCursor),this.options.renderWithCursor&&v(this.cursorFollowLayer,this.options.renderWithCursor(i)||null),this.options.renderFocusFeedback?v(this.focusLayer,this.state.isFocusReturning&&this.options.renderFocusFeedback(i)||null):v(this.focusLayer,this.state.isFocusReturning?this.defaultFocus:null),this.options.renderContent&&v(this.contentLayer,this.options.renderContent(i)||null);}createContext(i){return {state:i,isDown:i.isPointerDown,isReturning:i.isFocusReturning,cursorPos:i.position}}};var L=class{constructor(e=g()){d(this,"el");d(this,"baseLayer");d(this,"contentLayer");d(this,"defaultBase");d(this,"defaultLabel");this.el=e,this.el.classList.add("omnipad-button-base","omnipad-prevent"),this.el.tabIndex=-1,this.defaultBase=g("omnipad-default-button-base"),this.defaultLabel=document.createElement("span"),this.defaultLabel.className="omnipad-default-button-label",this.baseLayer=g("omnipad-button-visual-layer"),this.contentLayer=g("omnipad-button-content-layer"),this.baseLayer.appendChild(this.defaultBase),this.contentLayer.appendChild(this.defaultLabel),this.el.append(this.baseLayer,this.contentLayer);}update(e){A(this.el,e.layout),this.defaultBase.classList.toggle("is-active",e.isActive);let i={isActive:e.isActive,label:e.label};e.renderBase?v(this.baseLayer,e.renderBase(i)||null):this.baseLayer.contains(this.defaultBase)||v(this.baseLayer,this.defaultBase),e.renderContent?v(this.contentLayer,e.renderContent(i)||null):(this.defaultLabel.textContent=e.label||"",this.defaultLabel.style.display=e.label?"":"none",this.contentLayer.contains(this.defaultLabel)||v(this.contentLayer,this.defaultLabel));}};var K=class extends w{constructor(i,r={}){super({container:i,requiredType:b.Types.BUTTON,options:r,defaultProps:{label:"BTN"},baseClasses:["omnipad-button"],createCore:(o,s,n)=>new ht(o,s,n)});d(this,"view");this.view=new L(this.el),this.attachPointerBridge(),this.mount(i);}renderConfig(i){super.renderConfig(i),this.renderButton();}renderState(i){this.state=i,this.renderButton();}renderButton(){this.view.update({layout:this.getEffectiveLayout(this.config),isActive:!!this.state?.isPressed,label:this.config.label,renderBase:this.options.renderBase,renderContent:this.options.renderContent});}},Ri=K;var H=class{constructor(e){this.el=e;d(this,"bg");d(this,"stickContainer");d(this,"contentLayer");d(this,"defaultStick");d(this,"useNativeContainerQueries",U());this.el.classList.add("omnipad-axis-base","omnipad-prevent"),this.el.tabIndex=-1,this.bg=g("omnipad-axis-bg"),this.stickContainer=g("omnipad-axis-stick-container"),this.contentLayer=g("omnipad-axis-content-layer"),this.defaultStick=g("omnipad-default-axis-stick"),this.stickContainer.appendChild(this.defaultStick),this.el.append(this.bg,this.stickContainer,this.contentLayer);}update(e){let i=e.state?.vector||{x:0,y:0},r=!!e.state?.isActive;this.el.classList.toggle("is-active",r),this.defaultStick.classList.toggle("is-active",r),this.stickContainer.style.display=e.showStick?"":"none";let o=Be(i,e.baseSize,this.useNativeContainerQueries);if(_(this.stickContainer,{"--omnipad-axis-stick-container-x":o.x,"--omnipad-axis-stick-container-y":o.y,"--omnipad-axis-stick-width":o.width,"--omnipad-axis-stick-height":o.height}),this.stickContainer.style.transition=r?"none":"transform 0.1s ease-out",!e.state)return;let s={isActive:r,vector:i,state:e.state};e.renderStick?v(this.stickContainer,e.renderStick(s)||null):this.stickContainer.contains(this.defaultStick)||v(this.stickContainer,this.defaultStick),e.renderContent&&v(this.contentLayer,e.renderContent(s)||null);}getBaseSize(e){return this.useNativeContainerQueries?{x:0,y:0}:zt(e)}};var z=class extends w{constructor(i,r={}){super({container:i,requiredType:b.Types.D_PAD,options:r,defaultProps:{showStick:false,threshold:.3},baseClasses:["omnipad-dpad"],createCore:(o,s,n)=>new yt(o,s,n)});d(this,"axis");d(this,"cross");this.axis=new H(this.el),this.cross=this.createCross(),this.axis.bg.appendChild(this.cross.root),this.attachPointerBridge(),this.mount(i);}renderConfig(i){super.renderConfig(i),this.renderDPad();}renderState(i){this.state=i,this.renderDPad();}renderDPad(){A(this.el,this.getEffectiveLayout(this.config));let i=this.state,r=this.config.threshold??.3;this.options.renderBase&&i?v(this.axis.bg,this.options.renderBase({isActive:i.isActive,vector:i.vector,state:i})||null):this.axis.bg.contains(this.cross.root)||v(this.axis.bg,this.cross.root);let o=i?.vector||{x:0,y:0};this.cross.top.classList.toggle("on",o.y<-r),this.cross.bottom.classList.toggle("on",o.y>r),this.cross.left.classList.toggle("on",o.x<-r),this.cross.right.classList.toggle("on",o.x>r),this.axis.update({state:i,showStick:!!this.config.showStick,baseSize:this.axis.getBaseSize(this.core.rect),renderStick:this.options.renderStick,renderContent:this.options.renderContent});}createCross(){let i=g("omnipad-dpad-cross-bg"),r=g(["dpad-arm","top"]),o=g(["dpad-arm","bottom"]),s=g(["dpad-arm","left"]),n=g(["dpad-arm","right"]);return i.append(r,o,s,n,g("dpad-center")),{root:i,top:r,bottom:o,left:s,right:n}}},Mi=z;var j=class extends w{constructor(i,r={}){super({container:i,requiredType:b.Types.JOYSTICK,options:r,defaultProps:{label:"PUSH",threshold:.2,cursorMode:false,cursorSensitivity:1},baseClasses:["omnipad-joystick"],createCore:(o,s,n)=>new ft(o,s,n)});d(this,"axis");d(this,"stickButton");this.axis=new H(this.el),this.stickButton=new L,this.attachPointerBridge(),this.mount(i);}renderConfig(i){super.renderConfig(i),this.renderJoystick();}renderState(i){this.state=i,this.renderJoystick();}renderJoystick(){A(this.el,this.getEffectiveLayout(this.config));let i=this.state;this.options.renderBase&&i&&v(this.axis.bg,this.options.renderBase({isActive:i.isActive,vector:i.vector,state:i})||null),this.stickButton.update({layout:{width:"100%",height:"100%"},isActive:!!i?.isPressed,label:this.config.label,renderBase:this.options.renderStickBase,renderContent:this.options.renderStickContent}),this.axis.update({state:i,showStick:true,baseSize:this.axis.getBaseSize(this.core.rect),renderStick:this.options.renderStick||(()=>this.stickButton.el),renderContent:this.options.renderContent});}},Ai=j;var $=class extends w{constructor(i,r={}){super({container:i,requiredType:b.Types.TRACKPAD,options:r,defaultProps:{label:"TRACKPAD",sensitivity:1},baseClasses:["omnipad-trackpad"],createCore:(o,s,n)=>new kt(o,s,n)});d(this,"view");this.view=new L(this.el),this.attachPointerBridge(),this.mount(i);}renderConfig(i){super.renderConfig(i),this.renderTrackpad();}renderState(i){this.state=i,this.renderTrackpad();}renderTrackpad(){this.view.update({layout:this.getEffectiveLayout(this.config),isActive:!!this.state?.isPressed,label:this.config.label,renderBase:this.options.renderBase,renderContent:this.options.renderContent});}},Bi=$;O(b.Types.BUTTON,K);O(b.Types.INPUT_ZONE,X);O(b.Types.ROOT_LAYER,Q);O(b.Types.TARGET_ZONE,ee);O(b.Types.TRACKPAD,$);O(b.Types.D_PAD,z);O(b.Types.JOYSTICK,j);
+exports.BaseEntity=N;exports.Button=Ri;exports.ButtonBaseView=L;exports.ButtonCore=ht;exports.DPad=Mi;exports.DPadCore=yt;exports.ElementObserver=q;exports.GamepadManager=Yi;exports.IframeManager=ce;exports.InputZone=X;exports.InputZoneCore=mt;exports.Joystick=Ai;exports.JoystickCore=ft;exports.PROTO_POLLUTION_KEYS=bi;exports.Registry=I;exports.RootLayer=Q;exports.RootLayerCore=bt;exports.StickyController=Nt;exports.StickyProvider=Ii;exports.TargetZone=ee;exports.TargetZoneCore=vt;exports.Trackpad=Bi;exports.TrackpadCore=kt;exports.VirtualButton=K;exports.VirtualDPad=z;exports.VirtualJoystick=j;exports.VirtualLayerBase=V;exports.VirtualTrackpad=$;exports.WindowManager=Wt;exports.XXS_DANGEROUS_KEYWORDS=vi;exports.bindEntityDelegates=et;exports.createPointerBridge=ue;exports.createRafThrottler=de;exports.createTicker=lt;exports.createWebStickyProvider=Bt;exports.createWidgetFromNode=G;exports.delayFrames=Xt;exports.dispatchKeyboardEvent=Rt;exports.dispatchPointerEventAtPos=mi;exports.exportProfile=Zi;exports.filterNotDynamicChildren=tt;exports.flattenRelativeLayout=Ti;exports.flattenToHostLayout=At;exports.getComponent=Ut;exports.getComponentSafe=he;exports.getDeepActiveElement=Ie;exports.getDeepElement=Ee;exports.getOverrideProps=it;exports.hasRegisteredComponent=Di;exports.mergeWidgetConfig=rt;exports.parseLength=x;exports.parseProfileForest=$i;exports.projectPercentToBox=pe;exports.projectVectorToBox=Be;exports.reclaimFocusAtPos=gi;exports.registerComponent=O;exports.resolveDynamicWidget=ji;exports.resolveLayoutStyle=Mt;exports.safeReleaseCapture=It;exports.safeSetCapture=Si;exports.sanitizeCssClass=Pi;exports.sanitizeDomString=ki;exports.sanitizeParsedLength=Et;exports.sanitizePrototypePollution=wi;exports.setDispatcherProvider=nt;exports.setGamepadProvider=Pt;exports.setGlobalSignalHandler=ct;exports.setRafProvider=dt;exports.setSecurityPolicy=ut;exports.setupSpatialLogic=Vt;exports.smartQuerySelector=De;exports.supportsContainerQueries=U;exports.toAbsolutePx=Ei;exports.validateLayoutBox=xi;exports.validateProfile=Qt;exports.validateWidgetNode=ot;return exports;})({});</script>
+<script>
+/* ==================================================================
+ * 5) 虚拟触控板注入（OmniPad）—— 让「鼠标悬停才弹出」的菜单在手机上能用
+ * ==================================================================
+ * 现象：摩尔庄园里大量菜单是「鼠标移上去才展开」，而手机只有 tap。
+ *   一次触摸在浏览器里是 pointerdown/up 同帧完成，悬停态根本来不及存在，
+ *   于是这些菜单在手机上等于不存在。
+ *
+ * 采用群友给的 OmniPad（github.com/omnipad-js/omnipad，MIT，
+ * @omnipad/vanilla 0.7.3）。按仓库要求的 tag 引入方式接入，
+ * 只是把 unpkg 的 UMD 与 CSS 换成本地内联（App 里没有外网 CDN）：
+ *   · TargetZone      铺满舞台的靶区，把触点翻译成 canvas 上的
+ *                     PointerEvent + MouseEvent，穿过 Ruffle 的
+ *                     Shadow DOM；单指点哪就点哪，原有手感不变。
+ *   · VirtualTrackpad 黑边里的触控板，像笔记本触摸板：
+ *                     拖动 = 只移动光标（悬停菜单因此能停住），
+ *                     轻点 = 在当前光标处按下并松开。
+ *
+ * 与游戏本体无关：画质 / 画幅 / 帧率 / 节流器 / 服务器地址一律不碰。
+ * 出问题时的退路：__molePad.off() 立即拆掉图层，恢复原生触控。
+ * ================================================================== */
+(function () {
+  var TAG = '[MoleShell]';
+  function log(m) { try { console.log(TAG + ' ' + m); } catch (e) {} }
+
+  var OP = window.OmniPad;
+  var padRoot = null, stage = null, pad = null, lastKey = '', curZone = '';
+  var padMode = 'auto';     // 'auto'：黑边里显示；'off'：手动隐藏（只改外观）
+  var forceCorner = false;  // 只在 __molePad.corner(true) 时置位：没黑边也硬塞一块
+
+  /* 落点常量，全部是 CSS px。
+     ⚠ 1.0.5/1.0.6 那个「黑边 ≥104px」的阈值是按物理像素估的，但 WebView 里
+     window.innerWidth 是 CSS px：2800x1260、DPR≈3.5 的机器 CSS 视口只有
+     800x360，12:7 的舞台在 20:9 屏上算下来左右黑边各约 91px —— 永远差一点，
+     于是每一台真机都掉进「压右下角 168x112」的兜底，那块板子正好盖住
+     游戏的右下操作区。这才是「右下角点不动」的真正原因。 */
+  var EDGE_GUARD = 20;   // 让开系统边缘手势区，否则从屏边一划就被系统「返回」截走
+  var STAGE_GAP  = 6;    // 与舞台留一条缝，别贴着游戏画面
+  var MIN_BAR    = 44;   // 板子窄于此值就不做（再窄按不准）
+  var MAX_BAR    = 220;  // 竖条最大宽度：再宽拇指够不着，收益递减
+  var PAD_RATIO  = 0.93; // 高 / 宽：接近正方，横竖拖动速度才基本一致
+  var MIN_H      = 96;   // 竖条最小高度：窄黑边时也留出拇指落点
+  var MAX_H_FRAC = 0.5;  // 竖条最高不超过屏高的一半
+  /* 仅 __molePad.corner(true) 会用：会压住游戏画面，默认不启用 */
+  var CORNER_LAYOUT = { right: '10px', bottom: '10px', width: '168px', height: '112px' };
+
+  function wrapEl() { return document.getElementById('wrap'); }
+  function playerEl() { return document.querySelector('ruffle-player,ruffle-embed,ruffle-object'); }
+  /* Ruffle 的渲染画布在 shadow root 里，是所有合成事件的落点。
+     找不到它就说明影片还没真正起画面 —— 这时候挂上去也没有意义，
+     等下一轮（500ms 后）再试。OmniPad 的 Shadow DOM 穿透正是按它工作的。 */
+  function canvasEl() {
+    var p = playerEl();
+    if (!p) return null;
+    try {
+      var sh = p.shadowRoot;
+      return sh ? sh.querySelector('canvas') : null;
+    } catch (e) { return null; }
+  }
+
+  /* ------------------------------------------------------------------
+   * 5.1 触控板落脚点：只吃黑边，一个像素都不压舞台（1.0.7）
+   * ------------------------------------------------------------------
+   * 规则：
+   *   1. 黑边宽度按 CSS px 自适应，扣掉系统手势区与舞台缝后 ≥ MIN_BAR 才进；
+   *   2. 右侧优先（用户要求：用屏幕右半边那条黑边当触控板），
+   *      其次左侧，再其次下边、上边；
+   *   3. 四边都没有可用黑边（16:9 满幅）就**根本不挂触控板**，
+   *      只保留靶区，点哪走哪，绝不拿浮层去压画面；
+   *   4. 非要在这种机器上用悬停菜单，__molePad.corner(true) 显式打开。
+   *
+   * 板子的高宽比刻意接近 1:1：TrackpadCore 的位移换算基准是**板子自身**的
+   * 宽高（deltaX/rect.width、deltaY/rect.height），板子又窄又长会让
+   * 横竖方向手感差出好几倍。1:1 附近，两个方向的移动速度才基本一致。
+   * ------------------------------------------------------------------ */
+  function labelFor(lay) {
+    var w = parseInt(lay && lay.width, 10) || 0;
+    if (w >= 120) return '拖动 · 轻点';
+    if (w >= 72) return '拖动';
+    return '';
+  }
+
+  function computeLayout() {
+    var el = wrapEl();
+    if (!el) return null;
+    var r = el.getBoundingClientRect();
+    if (!r || !r.width || !r.height) return null;
+    var vw = Math.max(1, window.innerWidth || 1);
+    var vh = Math.max(1, window.innerHeight || 1);
+    var mR = vw - r.right, mL = r.left, mB = vh - r.bottom, mT = r.top;
+
+    /* 竖条：贴着屏幕边缘竖向铺开，宽度取黑边可用宽度 */
+    function vertical(bar, side) {
+      var avail = bar - EDGE_GUARD - STAGE_GAP;
+      if (avail < MIN_BAR) return null;
+      var pw = Math.round(Math.min(avail, MAX_BAR));
+      var ph = Math.round(Math.max(MIN_H, Math.min(pw / PAD_RATIO, vh * MAX_H_FRAC)));
+      var off = Math.round(EDGE_GUARD + (avail - pw) / 2);
+      var o = { top: Math.round((vh - ph) / 2) + 'px',
+                width: pw + 'px', height: ph + 'px' };
+      if (side === 'right') o.right = off + 'px'; else o.left = off + 'px';
+      return o;
+    }
+
+    /* 横条：4:3 平板、分屏时黑边在上下 */
+    function horizontal(bar, side) {
+      var avail = bar - EDGE_GUARD - STAGE_GAP;
+      if (avail < MIN_BAR) return null;
+      var ph = Math.round(Math.min(avail, 150));
+      var pw = Math.round(Math.max(190, Math.min(ph / PAD_RATIO, vw * 0.5)));
+      var off = Math.round(EDGE_GUARD + (avail - ph) / 2);
+      var o = { left: Math.round((vw - pw) / 2) + 'px',
+                width: pw + 'px', height: ph + 'px' };
+      if (side === 'bottom') o.bottom = off + 'px'; else o.top = off + 'px';
+      return o;
+    }
+
+    var lay;
+    lay = vertical(mR, 'right');    if (lay) return { layout: lay, zone: 'right' };
+    lay = vertical(mL, 'left');     if (lay) return { layout: lay, zone: 'left' };
+    lay = horizontal(mB, 'bottom'); if (lay) return { layout: lay, zone: 'bottom' };
+    lay = horizontal(mT, 'top');    if (lay) return { layout: lay, zone: 'top' };
+    return null;                    // 满幅舞台：交给上层「不挂」
+  }
+
+  function resolve() {
+    if (forceCorner) return { layout: CORNER_LAYOUT, zone: 'corner' };
+    return computeLayout();
+  }
+
+  /* ------------------------------------------------------------------
+   * 5.2 落地：按当前几何创建 / 移动 / 拆除触控板
+   * ------------------------------------------------------------------ */
+  function keyOf(lay) { return JSON.stringify(lay) + '|' + labelFor(lay); }
+
+  function setVisual(zone) {
+    curZone = zone || '';
+    if (!padRoot) return;
+    /* 黑边里：显示（那里本来就是黑的，看得见才找得到位置）；
+       压画面（角落兜底）或用户手动关：视觉隐藏，但交互照旧 ——
+       opacity:0 的元素仍参与命中测试，拖动手感一点不变。 */
+    var show = (padMode === 'auto') && !!curZone && curZone !== 'corner';
+    try { padRoot.className = show ? '' : 'pad-invisible'; } catch (e) {}
+  }
+
+  function createPad(lay) {
+    pad = new OP.VirtualTrackpad(padRoot, {
+      widgetId: '$pad',
+      label: labelFor(lay),
+      targetStageId: '$stage',
+      mapping: { type: 'mouse', button: 0 },
+      /* 满幅拖动 ≈ 舞台宽度的 60%：够快，又能落在小按钮上 */
+      sensitivity: 0.6,
+      layout: lay
+    });
+    lastKey = keyOf(lay);
+    try { if (stage && stage.markRectDirty) stage.markRectDirty(); } catch (e) {}
+    log('触控板就位 ' + lastKey);
+  }
+
+  function destroyPad(why) {
+    if (!pad) return;
+    try { pad.destroy(); } catch (e) {}                       // destroy 内部会 el.remove()
+    try { if (pad.el && pad.el.parentNode) pad.el.parentNode.removeChild(pad.el); } catch (e) {}
+    pad = null; lastKey = '';
+    log('触控板已停用：' + why);
+  }
+
+  /* 唯一的落地入口：挂载、转屏、恢复前台、手动开关都走它 */
+  function applyLayout() {
+    if (!padRoot || !OP) return false;
+    var res = resolve();
+    if (!res) {
+      destroyPad('四边都没有可用黑边（满幅舞台），只留靶区，绝不压住画面');
+      setVisual('');
+      return false;
+    }
+    if (!pad) {
+      createPad(res.layout);
+    } else {
+      var k = keyOf(res.layout);
+      if (k !== lastKey) {
+        try { pad.updateConfig({ layout: res.layout, label: labelFor(res.layout) }); }
+        catch (e) { return false; }        // 失败就下一轮再试，别把 lastKey 写脏
+        lastKey = k;
+        try { if (stage && stage.markRectDirty) stage.markRectDirty(); } catch (e) {}
+        log('触控板重新定位 ' + k);
+      }
+    }
+    setVisual(res.zone);
+    return true;
+  }
+
+  /* ------------------------------------------------------------------
+   * 5.3 后台恢复钩子（由第 0 段的时间轴钳制在判定「后台恢复」后调用）
+   *     Java 侧 onPause 会调 element.pause()，而 Ruffle 自己的
+   *     visibilitychange 回调用的是「挂起前的播放状态」，两者存在竞态：
+   *     若 pause() 先跑，挂起前记录的状态就是 false，回来后不会自动 play，
+   *     于是停在暂停态（还会多出个播放按钮）。
+   *     这里在恢复时兜一次底：确实是暂停态就 play()，不重复开循环。
+   * ------------------------------------------------------------------ */
+  window.__moleAfterResume = function (gapMs) {
+    try { if (window.__moleFit) window.__moleFit(); } catch (e) {}
+    applyLayout();
+    var p = playerEl();
+    if (!p) return;
+    try {
+      if (p.instance && p.isPlaying === false) {
+        p.play();
+        log('后台恢复：播放器停在暂停态，已重新 play（挂起 ' + Math.round(gapMs) + 'ms）');
+      }
+    } catch (e) {}
+  };
+
+  /* 退路 / 诊断口子：无论 OmniPad 在不在都要有，
+     出问题时一句 __molePad.off() 就能立刻回到原生触控。 */
+  window.__molePad = {
+    on: function () { return OP ? mount() : false; },
+    off: function () {
+      try { if (padRoot && padRoot.parentNode) padRoot.parentNode.removeChild(padRoot); } catch (e) {}
+      padRoot = null; stage = null; pad = null; lastKey = ''; curZone = '';
+      log('OmniPad 已拆除，恢复原生触控');
+      return true;
+    },
+    /* 触控板外观开关（只碰外观，不碰命中测试）：
+       'off'  = 隐藏；其余 = 回到默认策略（黑边里显示、压画面时隐藏） */
+    trackpad: function (v) {
+      padMode = (v === 'off' || v === false || v === 0) ? 'off' : 'auto';
+      setVisual(curZone);
+      var hidden = !padRoot || padRoot.className === 'pad-invisible';
+      log('触控板视觉 ' + (hidden ? '已隐藏（交互保留）' : '已显示'));
+      return hidden;
+    },
+    /* 满幅舞台（没有任何黑边）时的兜底：强行在右下角开一块。
+       会压住游戏画面的那一角，只在明知道代价时才用。 */
+    corner: function (v) {
+      forceCorner = !(v === false || v === 0);
+      if (padRoot) applyLayout();
+      log('角落兜底 ' + (forceCorner ? '已开启（会压住一小块画面）' : '已关闭'));
+      return forceCorner;
+    },
+    state: function () {
+      return { mounted: !!padRoot, layout: lastKey, zone: curZone,
+               trackpad: !!pad, omni: !!OP,
+               trackpadVisible: !!padRoot && padRoot.className !== 'pad-invisible' };
+    }
+  };
+
+  if (!OP || typeof OP.TargetZone !== 'function' || typeof OP.VirtualTrackpad !== 'function') {
+    log('OmniPad 未装载（内核过旧或脚本未执行），保留原生触控，不影响游玩');
+    return;
+  }
+
+  /* 5.4 挂载：等 Ruffle 的播放器元素真正出现再建图层 */
+  function mount() {
+    if (padRoot) return true;
+    if (!OP) return false;
+    if (!wrapEl() || !playerEl()) return false;
+    if (!canvasEl()) return false;      // 有播放器还没画布：还没起画面，下一轮再试
+
+    padRoot = document.createElement('div');
+    padRoot.id = 'pad';
+    padRoot.className = 'pad-invisible';   // 先藏起来，applyLayout 再按落点决定
+    document.body.appendChild(padRoot);
+
+    /* 靶区：严格吸附在舞台上，坐标换算用它的 getBoundingClientRect，
+       所以舞台被 CSS transform 缩放后依然精确。 */
+    stage = new OP.TargetZone(padRoot, {
+      widgetId: '$stage',
+      cursorEnabled: true,
+      layout: { stickySelector: '#wrap' }
+    });
+
+    log('OmniPad 已挂载：舞台靶区');
+    if (!applyLayout()) {
+      log('本机四边都没有可用黑边：只提供靶区（点哪走哪），不挂触控板、不压画面；'
+        + '确实要用悬停菜单可执行 __molePad.corner(true)');
+    }
+    return true;
+  }
+
+  var tries = 0;
+  var wait = setInterval(function () {
+    tries++;
+    if (mount()) {
+      clearInterval(wait);
+      setInterval(applyLayout, 1000);   // 转屏 / 分辨率校正 / 分屏后重新贴边
+    } else if (tries >= 60) {         // 30s 仍未就绪：放弃，不影响游戏
+      clearInterval(wait);
+      log('OmniPad 放弃挂载：30s 内未等到「播放器 + 画布」'
+        + '（有播放器=' + !!playerEl() + '，有画布=' + !!canvasEl() + '），保持原生触控');
+    }
+  }, 500);
+})();
+
+/* ==================================================================
+ * 6) 后台保活 —— 切后台不暂停，游戏在后台继续跑
+ * ==================================================================
+ * 现象（群友反馈）：切到后台再回来，服务器收到一批**时间顺序对不上**
+ *   的数据包，随即被踢下线。
+ *
+ * 根因（Ruffle 源码实证，ruffle.js 内联 bundle）：
+ *   setupTabVisibilityHandling() 里
+ *     let A = this.loadedConfig?.backgroundExecutionMode ?? vA.None;
+ *     document.hidden
+ *       ? (A===MainThread ? (enable_background_tick_mode(),
+ *                            lastActivePlayingState && startBackgroundTick())
+ *                         : this.instance.pause())
+ * 也就是说这条分支走哪边**完全由配置决定**。壳层原来把
+ * backgroundExecutionMode 写成 'none'，于是页面一 hidden 就 pause()：
+ *   · 游戏逻辑冻结，会话还挂着（不发心跳、不动时间轴）
+ *   · 回来时 lib.rs 的 dt = 当前时间戳 − 上次时间戳 = 挂起时长
+ *   · player.rs 的 frame_accumulator += dt 后连跑 5 帧
+ *     （max_frames_per_tick），timer.rs 再把所有到期定时器补跑一遍
+ *     （MAX_TICKS=10）
+ *   · 游戏把积压逻辑一次性做完，每个包都带着跳变后的时间戳
+ *   → 服务器看到的正是「时间倒挂 / 顺序错乱」。
+ *
+ * 解法：配置改成 'mainThread'（第 2 段），让 Ruffle 走官方那条
+ *   「后台继续 tick」的路径：它自己起一个 Web Worker，里面按影片帧率
+ *   （24fps）setTimeout 调 instance.tick_for_background(performance.now())。
+ *   Worker 的定时器不受页面可见性节流，所以后台**真的在按 24fps 跑**，
+ *   客户端时间轴与真实时间始终连续 —— 没有积压，也就没有补帧。
+ *
+ * 本段只做三件 Ruffle 自己没做好的事：
+ *   ① startBackgroundTick 不判重：它自己的 visibilitychange 分支和
+ *      我们的兜底都会去调，重复调用会 new 出第二个 Worker，
+ *      两个 Worker 各推 24fps → 游戏两倍速。这里包成幂等。
+ *   ② 兜底接管：极少数 WebView 在 Activity 不可见时不派发
+ *      visibilitychange（document.hidden 一直是 false），那样 Ruffle
+ *      永远等不到 hidden 分支。此时由 Java 的 onPause → __moleEnterBackground
+ *      代劳一次。
+ *   ③ 时间轴对齐：后台喂给 core 的是 performance.now()，而前台喂的是
+ *      第 0 段的虚拟时间轴 vTs。回来时不把 vTs 对齐，core 算出的
+ *      dt 会恒为负（lib.rs:1219 没有负值保护）→ 帧累加器只减不增
+ *      → 画面彻底冻住。所以「后台真跑过」之后必须对齐。
+ *
+ * 与游戏本体无关：帧率 / 画质 / 画幅 / 服务器地址一律不碰。
+ * ================================================================== */
+(function () {
+  var TAG = '[MoleShell]';
+  function log(m) { try { console.log(TAG + ' ' + m); } catch (e) {} }
+
+  /* 后台「真的跑过一程」的证据。只有它为真才允许对齐时间轴：
+     没跑过就对齐，等于把挂起时长原样喂给 core，那才是补帧风暴。 */
+  var bgSeen = false;
+
+  function playerEl() { return document.querySelector('ruffle-player,ruffle-embed,ruffle-object'); }
+
+  /* Ruffle 的 startBackgroundTick / stopBackgroundTick 都挂在原型上，
+     实例上覆盖一次就行，且顺便把「跑过」这件事记下来 ——
+     Ruffle 自己的 visible 分支会先 stopBackgroundTick，等我们反应过来
+     backgroundWorker 已经是 null 了，只有拦在方法里才抓得住。 */
+  function patch(p) {
+    if (!p || p.__moleBgPatched) return;
+    try {
+      if (typeof p.startBackgroundTick === 'function') {
+        var origStart = p.startBackgroundTick;
+        p.startBackgroundTick = function () {
+          if (this.backgroundWorker) { bgSeen = true; return; }   // 已有在跑，别开第二个
+          var r = origStart.apply(this, arguments);
+          if (this.backgroundWorker) bgSeen = true;
+          return r;
+        };
+      }
+      if (typeof p.stopBackgroundTick === 'function') {
+        var origStop = p.stopBackgroundTick;
+        p.stopBackgroundTick = function () {
+          if (this.backgroundWorker) bgSeen = true;               // 停之前确实在跑
+          return origStop.apply(this, arguments);
+        };
+      }
+      p.__moleBgPatched = 1;
+    } catch (e) {}
+  }
+
+  /* 页面可见性变化时顺手 patch —— Ruffle 的 player 可能比本段晚创建 */
+  document.addEventListener('visibilitychange', function () {
+    try { patch(playerEl()); } catch (e) {}
+  }, true);
+
+  /* Java onPause → 这里。幂等，重复调用无副作用。 */
+  window.__moleEnterBackground = function () {
+    var p = playerEl();
+    if (!p || !p.instance) return false;
+    patch(p);
+    if (p.backgroundWorker) { bgSeen = true; return true; }   // Ruffle 已接管
+    if (document.hidden) return false;      // 正在 hidden：等它自己的分支跑，别抢
+
+    /* 走到这里说明 WebView 没派发 visibilitychange（或派发前就被叫来了）。
+       代劳一次 Ruffle 的 hidden 分支。游戏本来就是暂停态时什么都不做 ——
+       后台不需要为「已经暂停的游戏」维持时间轴。 */
+    try {
+      var playing = p.instance.is_playing();
+      p.lastActivePlayingState = playing;
+      if (!playing) return false;
+      p.instance.enable_background_tick_mode();
+      p.startBackgroundTick();
+      log('visibility 未变，已手动接管后台运行（Worker='
+        + !!p.backgroundWorker + '）');
+      return !!p.backgroundWorker;
+    } catch (e) {
+      log('手动接管后台运行失败：' + e);
+      return false;
+    }
+  };
+
+  /* Java onResume → 这里。 */
+  window.__moleLeaveBackground = function () {
+    var p = playerEl();
+    var worker = false;
+    try { worker = !!(p && p.backgroundWorker); } catch (e) {}
+
+    if (worker) {
+      /* Ruffle 的 visible 分支没跑（否则 worker 已经被它 stop 掉了），
+         我们代劳：停 Worker → 恢复动画循环 → 必要的 play。
+         注意不能无条件 restart_animation_loop：Ruffle 的 visible 分支
+         已经 restart 过一次，再调一次会多登记一个 rAF 回调，
+         游戏就变双倍速了。 */
+      try { p.stopBackgroundTick(); } catch (e) {}
+      try { if (p.instance) p.instance.restart_animation_loop(); } catch (e) {}
+      try {
+        if (p.lastActivePlayingState && p.instance && !p.instance.is_playing()) {
+          p.instance.play();
+        }
+      } catch (e) {}
+      log('回到前台：已接管恢复（Worker 已停）');
+    }
+
+    var aligned = false;
+    if (bgSeen) {
+      try { aligned = window.__moleAlignClock() === true; } catch (e) {}
+      if (aligned) {
+        log('回到前台：后台一直在跑，时间轴对齐真实时间（不补帧、不跳变）');
+      }
+    }
+    var r = { worker: worker, ranInBackground: bgSeen, aligned: aligned };
+    bgSeen = false;
+    return r;
+  };
+
+  /* 诊断口子 */
+  window.__moleBg = function () {
+    var p = playerEl();
+    return { hidden: !!document.hidden, ran: bgSeen,
+             worker: !!(p && p.backgroundWorker),
+             playing: !!(p && p.instance && p.instance.is_playing()) };
+  };
+})();
+</script>
+</body>
+</html>
