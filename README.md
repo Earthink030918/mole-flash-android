@@ -292,6 +292,7 @@ hap-sign-tool verify-app ...     # 期望 Digest verify result: true
 │   ├── web/                   shell.html + mole_boot.js
 │   └── manifest/              AndroidManifest.xml（AXML 解码）
 ├── third_party/ruffle/        Ruffle 的 MIT / Apache-2.0 许可证原文
+├── tests/                     离线断言测试（从 shell.html 切真实代码跑，共 157 项）
 ├── tools/run_decompile.py     可复现的反编译脚本
 └── CONTRIBUTING.md / CHANGELOG.md / THIRD-PARTY-NOTICES.md
 ```
@@ -421,8 +422,9 @@ OmniPad 解析失败（WebView 内核过旧）时只打一条日志，游戏照�
 
 - **崩溃报告必须带日志**：`adb logcat -s MoleShell:V MoleSocketBridge:V`（鸿蒙用 `hdc hilog`）。
   没有日志的「闪退」「卡死」基本无法定位
-- **改壳层请说明验证方式**：`shell.html` 的改动可以用 `patches/` 里的离线测试脚本跑断言，
-  不要只写「应该可以」
+- **改壳层请说明验证方式**：`shell.html` 的改动请跑 `tests/` 下的离线断言
+  （`node tests/clock_test.js` / `bg_test.js` / `pad_test.js`，共 157 项），
+  不要只写「应该可以」。测试说明见 [tests/README.md](tests/README.md)
 
 ---
 
