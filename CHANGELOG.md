@@ -2,6 +2,52 @@
 
 格式参照 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## [1.1.0] - 2026-10-25
+
+自 1.0.3 之后的三轮内部迭代（`1.0.5` / `1.0.6` / `1.0.7`，均未单独发布）合并为本次发布，
+内容分两类：**操作方式**（触控）与**后台存活**（时序）。Android 与 HarmonyOS 同步到同一版本。
+
+### Added
+
+- **虚拟触控板**：接入 [OmniPad](https://github.com/omnipad-js/omnipad) `@omnipad/vanilla@0.7.3`（commit `c91b3828`，MIT），按仓库 README 的 UMD 方式引入，仅把 unpkg 的 JS / CSS 换成本地内联（App 内无外网 CDN）。UMD 与 CSS 原样保留，逻辑未改
+  - `TargetZone`：吸附在 `#wrap` 上的靶区，把触点翻译成 canvas 上的 `PointerEvent` / `MouseEvent`（`pointerType:'mouse'`、`composed:true`），穿透 Ruffle 的 Shadow DOM
+  - `VirtualTrackpad`：`sensitivity 0.6`、`mapping {type:'mouse'}`；**拖动只移动光标**（悬停才展开的菜单因此能停住），**轻点才在当前光标处按下并松开**
+  - 板子只挂在屏幕黑边里，优先级 右 → 左 → 下 → 上；四边都没有余量时**不挂**，只保留靶区，绝不覆盖游戏画面
+  - 板子做成接近正方（`PAD_RATIO 0.93`）而非细长条，因为 `TrackpadCore.processInput` 以板子自身尺寸换算位移，窄长板会让竖直方向速度只剩水平的 1/5
+  - 新增调试口：`__molePad.state()` / `.on()` / `.off()` / `.trackpad('on'|'off')` / `.corner(true)`
+- **虚拟时间轴**：`shell.html` §0 的 rAF 泵改为可注入虚拟时间戳，`__moleClock()` 返回 `{stallMs, resumes, vTs}`
+- **后台保活接口**：`window.__moleEnterBackground()` / `__moleLeaveBackground()`，供宿主生命周期调用
+
+### Fixed
+
+- **切后台返回被服务器踢下线**（紧急）：`onPause` 里 `element.pause()` + `web.onPause()` + `web.pauseTimers()` 让 rAF 停摆，返回时首个 `dt` 等于挂起时长，一次 tick 连跑 5 帧（`max_frames_per_tick`）并把到期的 `setInterval` 各补跑最多 10 次，影片时间轴凭空前进数分钟，期间发出的每个包都带跳变时间戳——服务器看到的就是「时间倒挂 / 顺序错乱」
+  - 根因修复：`backgroundExecutionMode` 由 `'none'` 改为 `'mainThread'`，切后台时 Ruffle 在 Worker 里按 41.67ms 持续推进，时间轴连续
+  - 兜底：虚拟时间轴把 `>800ms` 的间隔钳制为「只推进 1 帧」，`>250ms` 截断到 250ms；平时与真实时间 1:1，帧率仍是 24fps
+  - `startBackgroundTick` 在 Ruffle 原实现里不判重（重复调用会起两个 Worker、双倍速），壳层覆盖为幂等
+  - 部分 WebView 不派发 `visibilitychange`，改为同时检查 `document.hidden`
+  - `dt` 无负值保护：只有「后台确实跑过」才用 `__moleAlignClock()` 对齐真实时间，否则仍走钳制
+- **悬停菜单点不到**：触摸的 down/up 同帧完成，`update_mouse_state()` 算出 `rollOver` 时手指已抬起，子菜单来不及展开；由触控板的「拖动移光标 + 轻点落点」还原 PC 式交互
+- **触控板遮挡游戏右下角**：1.0.5 / 1.0.6 的落点判据用物理像素估算（`MIN_MARGIN=104`），但 `window.innerWidth` 是 CSS px（2800×1260、DPR≈3.5 → 视口 800×360 → 单侧黑边 91px），判据永远不满足，每台真机都退到右下角 168×112 浮层。1.0.7 全部重写为 CSS px 几何
+
+### Changed
+
+- `MainActivity.onPause` 只下发 `__moleEnterBackground()`，删除 `BLUR_JS`、`WebView.onPause()`、`pauseTimers()`；`onResume` 恢复 `onResume()` + `resumeTimers()` + `__moleLeaveBackground()` + `goImmersive()`
+- 触控板默认**可见**（在黑边里，看得见才找得到）；压画面或 `trackpad('off')` 时用 `opacity:0` 隐藏——不用 `display:none` / `visibility:hidden`，那会让元素退出命中测试、拖动当场失效
+- `versionName` `1.0.3` → `1.1.0`；`versionCode` Android `4` → `9`、HarmonyOS `4` → `5`（中间 5~8 为内部迭代占用，不跳号回溯）
+- HarmonyOS 端 `rawfile/ruffle/shell.html` 同步为同一份文件，UA 由 `MoleShell/1.0.3` 改为 `MoleShell/1.1.0`
+
+### Unchanged
+
+- 画幅（`960x560`、`letterbox`）、`frameRate 24`、`quality low`、节流器与画面参数一律未动
+- 服务器地址与端口池未动
+- Ruffle 二进制未动：`ruffle.js` 与两份 `*.wasm.gz` 字节级一致；Android 侧 `classes.dex` 也未改（本次差异只在 `shell.html`、`AndroidManifest`、`META-INF`）
+
+### Known Issues
+
+- 后台仍耗 GPU 与电量：`tick_for_background` 内部就是完整 `tick()`（含 `core.render()`），这是「不被踢」的代价
+- 16:9 满幅机型（如 640×360 视口）四边皆无黑边，触控板不会出现，只能靠靶区直接点
+- 未做真机长跑验证：切后台 3~5 分钟返回是否仍被踢，需用户按 `回到前台：后台一直在跑，时间轴对齐真实时间` 日志确认
+
 ## [1.0.3] - 2026-10-23
 
 修复自 `1.0.1` 以来的稳定性与适配问题，含未单独发布的 `1.0.2` 内部迭代。
