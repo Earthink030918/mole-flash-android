@@ -5452,6 +5452,7 @@
     # 只影响进程存活优先级，不碰渲染、帧率、画质、节流器。
     # ==================================================================
     .line 694
+    :try_start_rp
     sget v0, Landroid/os/Build$VERSION;->SDK_INT:I
 
     const/16 v1, 0x1a
@@ -5463,6 +5464,13 @@
     const/4 v1, 0x0
 
     invoke-static {v0, v1}, Landroid/webkit/WebView;->setRendererPriorityPolicy(IZ)V
+    :try_end_rp
+    .catch Ljava/lang/Throwable; {:try_start_rp .. :try_end_rp} :catch_rp
+
+    goto :cond_rp_done
+
+    :catch_rp
+    move-exception v0
 
     :cond_rp_done
     .line 695
