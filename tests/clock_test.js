@@ -196,5 +196,64 @@ console.log('=== 6) 后台真跑过 → 回前台对齐真实时间（不钳制�
      'advance=' + (seen[seen.length - 1] - v0).toFixed(2));
 }
 
+console.log('=== 7) 后台跑过 → 回前台从合成轴接续（1.1.1 新行为） ===');
+{
+  const env = makeEnv();
+  const seen = attachProbe(env.window);
+  let t = 0; env.frame(t);
+  for (let i = 1; i <= 10; i++) { t = i * 16.67; env.frame(t); }
+  const vFront = env.window.__moleClock().vTs;
+
+  /* 后台合成轴：从上一帧起严格每帧 +41.666，跑了 720 帧（30 秒）。
+     注意它比真实时间略快/略慢都无所谓，重要的是「与真实时间脱钩」。 */
+  const FR = 1000 / 24;
+  const bgTs = vFront + 720 * FR;
+  env.window.__moleAlignClock(bgTs);
+  ok('调用后 pending=true', env.window.__moleClock().pending === true);
+
+  env.frame(t + 30000);                    // 真实时间过了 30 秒
+  const c = env.window.__moleClock();
+  ok('vTs 落在合成轴下一帧（不是真实时间）',
+     near(c.vTs, bgTs + FR, 0.01), 'vTs=' + c.vTs.toFixed(2) + ' want=' + (bgTs + FR).toFixed(2));
+  ok('core 侧看到的 dt 恒为 41.67（不跳变）',
+     near(c.vTs - bgTs, FR, 0.01), 'dt=' + (c.vTs - bgTs).toFixed(3));
+  ok('探针收到的就是这个值', near(seen[seen.length - 1], bgTs + FR, 0.01));
+
+  /* 之后前台恢复：真实 rAF 每 16.67ms 一次，vTs 按节流泵 24fps 推进 */
+  const v0 = seen[seen.length - 1];
+  for (let k = 1; k <= 10; k++) env.frame(t + 30000 + k * 16.67);
+  const adv = seen[seen.length - 1] - v0;
+  ok('随后 10 个真实帧推进约 166.7ms（24fps，无加速）',
+     adv > 160 && adv < 175, 'advance=' + adv.toFixed(2));
+  ok('偏移保持不变（vTs 与真实时间同步走）',
+     near(env.window.__moleClock().vTs - (t + 30000 + 10 * 16.67), bgTs + FR - (t + 30000), 1.0),
+     'offset drift=' + (env.window.__moleClock().vTs - (t + 30000 + 166.7)
+       - (bgTs + FR - (t + 30000))).toFixed(2));
+}
+
+console.log('=== 8) 同一回调重复登记只保留一份（防双倍速） ===');
+{
+  /* Ruffle 的 visible 分支和壳层回前台都会调 restart_animation_loop()，
+     两次 requestAnimationFrame(同一个闭包)。不去重的话一帧 dispatch 两次，
+     Ruffle 一帧被推两帧逻辑 = 双倍速。 */
+  const env = makeEnv();
+  const calls = [];
+  function cb(v) { calls.push(v); }
+  const id1 = env.window.requestAnimationFrame(cb);
+  const id2 = env.window.requestAnimationFrame(cb);
+  ok('两次登记返回不同 id', id1 !== id2, id1 + ' vs ' + id2);
+
+  env.frame(1000);       // 首帧只做初始化
+  env.frame(1041.67);    // 这一帧才 dispatch
+  ok('一帧只派发一次（不是两次）', calls.length === 1, 'calls=' + calls.length);
+
+  /* 不同回调不受影响 */
+  const other = [];
+  env.window.requestAnimationFrame(function a(v) { other.push('a'); });
+  env.window.requestAnimationFrame(function b(v) { other.push('b'); });
+  env.frame(1083.34);
+  ok('两个不同回调都能派发', other.length === 2, 'got=' + other.join(','));
+}
+
 console.log('\n' + (fail === 0 ? 'ALL PASS' : 'FAILED') + '  pass=' + pass + ' fail=' + fail);
 process.exit(fail === 0 ? 0 : 1);

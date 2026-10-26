@@ -2,6 +2,93 @@
 
 格式参照 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## [1.1.1] - 2026-10-26
+
+修掉 1.1.0 后台挂机的两个硬伤：**音乐爆破音**、**仍然被踢**。两者同源，
+问题不在「有没有继续跑」，而在「跑的时候一次推了多久」。改动只落在
+`shell.html` §6 与 §0 的十几行节拍逻辑上，画幅 / 帧率 / 画质 / 节流器 /
+服务器地址 / Ruffle 二进制一律未动。
+
+### Fixed
+
+- **后台挂机音乐严重爆破音**
+  - 现象：切后台后游戏 BGM 持续出现撕裂式爆音，回前台即恢复
+  - 根因：`startBackgroundTick()` 拼出的 Worker 是 `setTimeout(41.67) → postMessage`
+    的递归节拍，主线程收到就 `tick_for_background(performance.now())`。
+    它假定 Worker 的定时器不受页面可见性节流 —— 错的，hidden 之后
+    Chromium 对 Dedicated Worker 的 timer 同样有 1 秒下限。
+    于是 `dt` 一跳就是 1000ms，`Player::tick` 末尾的 `self.audio.tick()`
+    一次生成 44100 个样本（整整 1 秒）压进 WebAudio 队列，而音频线程
+    这一秒只消费真实经过的那一点，队列立刻错位、环形缓冲互相覆盖，
+    接缝处就是爆音。dt 每抖一次响一次
+  - 修法：节拍改由壳层接管，时间轴换成自维护的合成轴，**每拍只推一帧**
+    （恒 41.666ms）。音频每帧固定 1837 个样本，首尾相接，不再有接缝
+- **仍然因「数据包对不上」被服务器踢**
+  - 根因同上，只是落在另外两条路径上：
+    ① `frame_accumulator += 1000` 之后 `max_frames_per_tick` 只让跑 5 帧
+    （208ms），剩余 `if frame_accumulator >= frame_duration { = ZERO }`
+    被直接丢弃 → 每秒只推进 208ms，逻辑时间落后真实时间约 79%，
+    `getTimer()` 随之变慢，包时间戳越来越滞后；
+    ② `update_timers(dt)` 收到 1000ms，一次把 `MAX_TICKS`(10) 个到期
+    定时器全部补跑，心跳与动作包在同一毫秒连发十个 → 服务器看到
+    「时间倒挂 / 顺序错乱」
+  - 修法：同一条合成轴。每帧 `update_timers(41.67)` 最多出 1 个回调，
+    逻辑时间按真实墙钟推进，时间戳不再漂移
+- **两个节拍器互相打架**（1.0.6 隐患）：Ruffle 的 hidden 分支会
+  `startBackgroundTick()`，壳层也在推，一个喂 `performance.now()`、
+  一个喂合成轴，`dt` 正负横跳。现在把实例上的 `startBackgroundTick`
+  摘成空函数，Worker 根本不会创建（`__moleBg().worker === false` 可验）
+- **回前台可能双倍速**（1.0.6 隐患）：Ruffle 的 visible 分支和壳层
+  各调一次 `restart_animation_loop()`，rAF 队列里就有两个同样的 handler，
+  一帧推两帧逻辑。§0 的 `requestAnimationFrame` 现在对同一回调去重
+- **`__moleAlignClock()` 会把欠账一次性喂给 core**：原实现回前台时把
+  `vTs` 对齐到真实 rAF 戳。后台若被冻结过，差值几秒 → 一次大 `dt` →
+  补帧风暴重演。改成接收合成轴最后一帧，从 `bg.ts + 41.67` **接续**，
+  core 侧看到的 `dt` 仍是 41.67，一帧都不多给
+
+### Added
+
+- **AudioWorklet 节拍器**：跑在音频线程上，页面 hidden 时完全不受 timer
+  节流 —— 这是「B 站式后台听歌」能持续的原因。每攒够一个影片帧的采样数
+  就 `postMessage` 一次，主线程收到即推进。输出全零、只接 `destination`
+  当心跳负载，不产生声音、不影响 Ruffle 自己那条音频链
+- **定时器兜底**：`setInterval(50)` 与 worklet 同时叫同一个 `pump()`，
+  后者按 `performance.now()` 自己算欠几帧，天然幂等。worklet 不可用
+  （老内核 / `addModule` 失败 / `AudioWorkletNode` 构造失败）时自动降级，
+  被节流到 1 秒一次也只是「一次补 24 帧」，每帧仍是 +41.67ms，无跳变
+- **AudioContext 保活**：进后台立刻 `resume()`，并监听 `statechange`
+  反复拉回。Android WebView 在页面 hidden / 失去音频焦点时会把上下文
+  挂起，挂起后音频线程停摆 —— 既没声音，worklet 节拍器也停
+- 诊断口子扩写：`__moleBg()` 现在返回
+  `{on, hidden, mode, ticks, catchup, ts, audio, disarmed, worker, playing}`，
+  `mode` 会告诉你节拍器是 `worklet` 还是 `timer`
+
+### Changed
+
+- `__moleAlignClock(contTs)` 新增可选参数：传合成轴时间戳则接续，
+  不传仍退回「对齐真实时间」（保持向后兼容）
+- `versionName` `1.1.0` → `1.1.1`；`versionCode` Android `9` → `10`、
+  HarmonyOS `5` → `6`；UA `MoleShell/1.1.1`
+- 后台日志口径改为
+  `回到前台：后台推进 N 帧 / 墙钟 Xms（单轮最多 M 帧，节拍器=worklet）`
+
+### Unchanged
+
+- 画幅（`960x560`、`letterbox`）、`frameRate 24`、`quality low`、
+  节流器与画面参数
+- 服务器地址与端口池
+- Ruffle 二进制：`ruffle.js` 与两份 `*.wasm.gz` 字节级一致；
+  `classes.dex` 未改（本次差异只在 `assets/ruffle/shell.html`）
+
+### Known Issues
+
+- 后台仍耗 GPU：`tick_for_background` 内部走完整 `tick()`，渲染由
+  `needs_render()` 门控，但每帧仍在跑 `core.render()`
+- 页面被系统整体冻结（长时间后台且系统回收）时，合成轴会落后；
+  `catchup` 上限 120 帧（5 秒）是防死循环的保险，超出部分不追
+- 未做真机长跑验证，需用户按
+  `回到前台：后台推进` 与 `后台节拍器：AudioWorklet` 两条日志确认
+
 ## [1.1.0] - 2026-10-25
 
 自 1.0.3 之后的三轮内部迭代（`1.0.5` / `1.0.6` / `1.0.7`，均未单独发布）合并为本次发布，

@@ -400,11 +400,13 @@ OmniPad 解析失败（WebView 内核过旧）时只打一条日志，游戏照�
 
 ## 版本与更新日志
 
-当前 **v1.1.0**（2026-10-25）。完整记录见 [CHANGELOG.md](CHANGELOG.md)，
+当前 **v1.1.0**（2026-10-25，线上版本）。`1.1.1`（2026-10-26）已出包，
+正在等待真机验证，暂未发布。完整记录见 [CHANGELOG.md](CHANGELOG.md)，
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
 | 版本 | 要点 |
 | --- | --- |
+| **1.1.1** | 后台节拍器改音频时钟驱动（AudioWorklet）、每拍只推一帧 41.67ms；修后台爆破音与仍被踢（待验证，未发布） |
 | **1.1.0** | 虚拟触控板（OmniPad）、切后台不掉线、时间轴钳制、触控板只挂黑边；Android 与 HarmonyOS 同步 |
 | 1.0.7 | 触控板挪进屏幕右侧黑边，不再压住游戏右下角（内部迭代） |
 | 1.0.6 | 触控板视觉隐藏、`onPause` 不再暂停 Ruffle（内部迭代） |
