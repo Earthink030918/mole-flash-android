@@ -2,6 +2,40 @@
 
 格式参照 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## [1.1.3] - 2026-10-26（未发布，待真机验证）
+
+**只修一件事：切到后台之后 App 自己没了，切回来是从头启动的。**
+
+### 根因
+
+1. `WebView` 的渲染进程优先级默认是 `RENDERER_PRIORITY_WAIVED` +
+   `waivedWhenNotVisible = true` —— 看不见了就别管它的死活。1.1.2 把后台做成
+   「完全冻结」（不出帧、不出声、无定时器工作），渲染进程就成了系统眼里
+   「占着上百 MB 却什么都不干」的头号回收对象。
+2. `MainActivity$6` 没实现 `onRenderProcessGone`。渲染进程一死，WebView 的默认
+   处理是 `Process.killProcess(myPid())` —— 整个 App 无声消失，连崩溃弹窗都没有；
+   任务留在最近任务里，再点回来就是系统重建 Activity，看起来像「自动重启」。
+
+1.1.0 / 1.1.1 是「挂久了才崩」，因为那时候后台还在出声出帧、能多扛一阵；
+1.1.2 一冻结就立刻变成可回收对象。
+
+### Fixed
+
+- `onCreate()` 里在 `new WebView()` 之前调用
+  `WebView.setRendererPriorityPolicy(RENDERER_PRIORITY_IMPORTANT, false)`（API 26+），
+  不可见时不再把渲染进程的优先级作废
+- `MainActivity$6` 实现 `onRenderProcessGone`：返回 `true` 接管，不再让 WebView
+  杀进程；把 `didCrash` / `rendererPriorityAtExit` 打进 logcat（`MoleShell`）
+- 渲染进程真的死掉时：Toast 提示 + 前台立刻 `recreate()`、后台等 `onResume`
+  再重建。进程不死、任务不丢，只是页面重载
+- `onPause` / `onResume` 增加 `rendererGone` 判断，不再往已经死掉的 WebView
+  下发 JS
+
+### 没有动
+
+`shell.html` 一行没改（后台冻结逻辑原样保留），帧率 / 画幅 / 画质预算 / 节流器 /
+服务器地址 / 前台服务保活逻辑全部不动。
+
 ## [1.1.2] - 2026-10-26（未发布，待真机验证）
 
 **换掉了 1.1.1 的思路。** 1.1.1 试图「把后台跑准」，1.1.2 承认那件事在

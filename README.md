@@ -406,6 +406,7 @@ OmniPad 解析失败（WebView 内核过旧）时只打一条日志，游戏照�
 
 | 版本 | 要点 |
 | --- | --- |
+| **1.1.3** | 修「切后台后 App 静默死亡、回前台自动重启」：渲染进程优先级改为 `RENDERER_PRIORITY_IMPORTANT` 且不可见不作废，并实现 `onRenderProcessGone` 接管善后（默认行为是直接 `killProcess` 整个 App）。只改壳层，`shell.html` 未动（待验证，未发布） |
 | **1.1.2** | 放弃「后台继续跑」，改为**逻辑 + 音频原子冻结**：`inst.pause()` 一次停掉 core 与 AudioContext，冻结前淡出、恢复后淡入，屏蔽 Ruffle 无条件的 `play()`；新增前台服务保活进程。修爆音 / 卡顿 / 挂久崩溃（待验证，未发布） |
 | 1.1.1 | 后台节拍器改音频时钟驱动（AudioWorklet）、每拍只推一帧 41.67ms。**真机验证不成立，已被 1.1.2 取代** |
 | **1.1.0** | 虚拟触控板（OmniPad）、切后台不掉线、时间轴钳制、触控板只挂黑边；Android 与 HarmonyOS 同步 |
