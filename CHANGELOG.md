@@ -2,6 +2,87 @@
 
 格式参照 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## [1.1.2] - 2026-10-26（未发布，待真机验证）
+
+**换掉了 1.1.1 的思路。** 1.1.1 试图「把后台跑准」，1.1.2 承认那件事在
+WebView 里做不到，改成「逻辑与音频原子冻结」+ 前台服务保活。基线取自
+v1.1.0 的壳层，不是 1.1.1 的补丁。
+
+### 为什么 1.1.1 那条路走不通
+
+`core/src/backend/audio.rs` 的 `audio_skew_time()` 每个 tick 都比一次：
+
+```rust
+let stream_pos   = audio.get_sound_position(instance) / 1000.0;
+let timeline_pos = (clip.current_frame() - start_frame) / frame_rate + offset_ms / 1000.0;
+if (stream_pos - timeline_pos).abs() >= STREAM_RESTART_THRESHOLD {   // 1.0s
+    audio.stop_sound(instance);
+}
+```
+
+`timeline_pos` 由我们喂的 `dt` 决定，`stream_pos` 却由「`mix()` 被调用了
+几次」决定 —— 而 `mix()` 只在 `web/src/audio.rs` 的 `Buffer::play()` 里被调，
+`play()` 只由上一块 `AudioBufferSourceNode` 的 `onended` 触发。**`onended`
+是主线程事件**。页面 hidden 后主线程被压到 1Hz，`stream_pos` 每秒只能走
+92~743ms，`timeline_pos` 走 1000ms，每秒欠 0.3~0.9 秒，1~4 秒必破阈值
+→ `stop_sound` 硬切波形 → 爆音，然后影片下一帧 `start_stream` 重启，循环。
+
+这是 pull 模型对主线程节流的硬依赖，改喂法救不回来：
+
+| 版本 | 后台喂法 | 结果 |
+| --- | --- | --- |
+| 1.0.6 | Ruffle 自己的 Worker（setTimeout） | Worker 定时器同样被节流，dt 一秒起步 |
+| 1.1.0 | 让 Ruffle 补帧 | `frame_accumulator` 被清零，逻辑倒退 79% |
+| 1.1.1 | 固定步长喂 `tick_for_background` | timeline 准了，`stream_pos` 照样掉队 |
+
+### Fixed
+
+- **切后台 / 回前台的声音爆破音**
+  - 冻结前先用 70ms 把音量淡到 0：`AudioContext.suspend()` 会在波形中途
+    切断输出，不淡出就是那声「啪」
+  - 回前台先 `set_volume(0)` 盖住恢复瞬间，`play()` 之后再 120ms 淡回原音量
+  - 屏蔽 Ruffle 自己的 `visibilitychange`：它回前台是**无条件**
+    `instance.play()` + `audio_context().resume()`，对已经在播的流再来一次
+    就是硬重启。我们在 `window` 捕获阶段 `stopImmediatePropagation()`,
+    `document` 上的监听器一个都跑不到
+- **回前台的画面卡顿**
+  - 根因是回前台第一帧的 `dt = 挂起时长`，`Player::tick` 里连跑 5 帧
+    （`max_frames_per_tick`）+ 补跑 10 个定时器（`MAX_TICKS`）+ 重渲染
+  - 修法：§0 的时钟在冻解期**整段不推进 `vTs`、不 dispatch**。恢复时
+    `dt` 恒为 1 个帧长，与 core 的 `last_tick` 停在哪一帧无关
+  - 删掉 1.1.0 的 `__moleAlignClock()`：它把 `vTs` 对齐到真实时间，
+    等于给 core 一个几分钟的 `dt`，正是卡顿的来源
+- **后台挂久了应用崩溃**
+  - 根因一：后台还在 tick，`audio.tick()` 按 dt 生成样本，而 mixer 只能靠
+    `onended` 拉取，供大于求 → 样本被丢、`buffer_size` 一路翻倍到
+    MAX(16384)，解码器与事件队列在 1Hz 下堆积 → OOM / 被判死
+  - 根因二：没有前台服务，应用进 cached 状态后被系统冻结或回收
+  - 修法：冻结期间零 tick、零 CPU、零内存增长；新增 `MoleKeepAlive`
+    前台服务（`mediaPlayback` 类型，`START_NOT_STICKY`），
+    `onPause` 起、`onResume` / `onDestroy` 停
+- **`__moleAfterResume` 不再擅自 `play()`**：播放状态统一由 §6 管，
+  两边都去 `play()` 就是对同一条流连续 resume 两次
+
+### Changed
+
+- §6 整段重写为「原子冻结」状态机：`inst.pause()` / `inst.play()`。
+  这两个在 web 后端本来就是一对：`set_run_state(Suspended)` 顺带
+  `AudioBackend::pause()` → `AudioContext.suspend()`，逻辑与音频停在同一时刻
+- 用 handle 的 `pause()` 而**不是** element 的 `pause()`：后者会把
+  播放器 UI 置成暂停态，回前台会多出一个播放按钮
+
+### Unchanged
+
+画幅 960x560、`frameRate 24`、`quality low`、DPR 预算、节流器、服务器地址、
+Ruffle 二进制与 `classes.dex` 的游戏逻辑 —— 差异只在 `shell.html` §0/§6
+与新增的一个 Service 类。
+
+### Known Issues
+
+后台期间游戏逻辑是**停**的（这正是零爆音的前提）。如果服务器有空闲超时，
+长时间挂机可能要求重新连接 —— 这是「后台不跑」的代价，不是 bug。
+前台服务只保证进程不被杀、回前台是热恢复。
+
 ## [1.1.1] - 2026-10-26
 
 修掉 1.1.0 后台挂机的两个硬伤：**音乐爆破音**、**仍然被踢**。两者同源，

@@ -1,21 +1,28 @@
 /*
- * bg_test.js —— 验证 1.1.1 的「后台固定步长推进」
- * ==============================================
- * 直接从 shell.html 里切出第 6 段跑，player / instance / AudioContext /
- * AudioWorkletNode 全部用桩替代。测的是我们自己写的那层节拍逻辑。
+ * bg_test.js —— 验证 1.1.2 的「逻辑 + 音频原子冻结」
+ * ==================================================
+ * 直接从 shell.html 里切出第 6 段跑，player / instance / AudioContext
+ * 全部用桩替代。测的是我们写的那层冻结状态机。
  *
- * 这一版针对用户实测的两个现象：
- *   a) 后台挂机音乐爆破音
- *   b) 仍然因数据包对不上被踢
+ * 针对用户 1.1.1 实测的两条：「切回来有严重爆破音」「切回来画面卡顿」，
+ * 以及新报的「挂久了应用自己崩溃」。
  *
- * 两者同源：Ruffle 的 startBackgroundTick 用 setTimeout 递归驱动，
- * 页面 hidden 时被节流到 1 秒起步，喂进 core 的 dt 一跳一秒 →
- * 音频一次生成 44100 样本（撕裂=爆破音）、frame_accumulator 只跑 5 帧
- * 就归零（逻辑时间落后 79%）、update_timers 一次补 10 个回调（包乱序=被踢）。
+ * 结论性事实（都能在源码里对上）：
+ *   core/src/backend/audio.rs  audio_skew_time()
+ *     stream_pos   = get_sound_position()          // 音频后端已混音到第几秒
+ *     timeline_pos = current_frame / frame_rate    // 时间轴走到第几秒
+ *     if skew.abs() >= 1.0 { stop_sound(); }       // 硬切流音 = 爆破音
+ *   web/src/audio.rs  Buffer::play() 才调 mix()，play() 只由 onended 触发
+ *   → onended 是主线程事件，页面 hidden 被压到 1Hz，stream_pos 必然掉队
+ *   → 只要后台还在 tick，就一定会周期性 stop_sound。这是 pull 模型的硬约束。
  *
- * 所以要守住的断言只有一条主心骨：
- *   相邻两次喂给 core.tick_for_background 的时间戳差 **恒等于** 41.666ms，
- *   不论节拍器被节流成多慢、单轮补多少帧。
+ * 所以 1.1.2 的做法是「一起停」：
+ *   A. inst.pause() 是一对原子操作（core → Suspended，AudioContext → suspend），
+ *      两条时间轴同时冻结，skew 不再增长；
+ *   B. 冻结前必须先把音量淡到 0（suspend 会在波形中途切断 = 那声「啪」）；
+ *   C. 回前台必须先静音再 play()，再淡回原音量；
+ *   D. 全程不调 enable_background_tick_mode / restart_animation_loop，
+ *      也不让 Ruffle 自己的 visibilitychange 跑到（否则它会无条件 play()）。
  */
 const fs = require('fs');
 const vm = require('vm');
@@ -26,307 +33,269 @@ const src = fs.readFileSync(path.resolve(shell), 'utf8');
 
 const blocks = [...src.matchAll(/<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/g)].map(m => m[1]);
 const block = blocks[blocks.length - 1];
-const at = block.indexOf(' * 6) 后台保活');
+const at = block.indexOf('6) 后台：逻辑与音频');
 if (at < 0) throw new Error('未找到第 6 段');
 const code = block.slice(block.lastIndexOf('/*', at));
-
-const FRAME_MS = 1000 / 24;
 
 let pass = 0, fail = 0;
 function ok(name, cond, extra) {
   if (cond) { pass++; console.log('  PASS  ' + name); }
   else { fail++; console.log('  FAIL  ' + name + (extra ? '  → ' + extra : '')); }
 }
-function flush() { return new Promise(r => setImmediate(r)); }
+const near = (a, b, eps = 0.001) => Math.abs(a - b) <= eps;
 
 function makeEnv(opt = {}) {
-  const st = {
-    bgMode: 0, restarts: 0, plays: 0, aligns: 0, alignTs: null,
-    resumes: 0, workerStarts: 0, ticks: [], blobs: 0, workletModules: 0
-  };
   let now = 1000;
-  const listeners = [];
+  const timers = [];
   const intervals = [];
-  const workletNodes = [];
-  let stateListener = null;
+  const winListeners = [];
+  const docListeners = [];
+
+  const log = {
+    events: [],
+    vol: [],
+    pause: 0, play: 0, bgTick: 0, restart: 0,
+    ctxResume: 0, ctxSuspend: 0, worker: 0
+  };
 
   const perf = { now() { return now; } };
 
-  const audioCtx = {
-    state: opt.audioState || 'running',
-    destination: { id: 'dest' },
-    audioWorklet: {
-      addModule() { st.workletModules++; return Promise.resolve(); }
-    },
-    resume() { st.resumes++; this.state = 'running'; return Promise.resolve(); },
-    addEventListener(t, fn) { if (t === 'statechange') stateListener = fn; }
+  const ctx = {
+    state: opt.ctxState || 'running',
+    resume() { log.ctxResume++; this.state = 'running'; return Promise.resolve(); },
+    suspend() { log.ctxSuspend++; this.state = 'suspended'; return Promise.resolve(); }
   };
 
-  class AudioWorkletNodeMock {
-    constructor(ctx, name) {
-      this.ctx = ctx;
-      this.name = name;
-      this.port = { onmessage: null };
-      this.connected = 0;
-      workletNodes.push(this);
-    }
-    connect() { this.connected++; }
-    disconnect() { this.connected = 0; }
-  }
-
-  const player = {
-    backgroundWorker: null,
-    lastActivePlayingState: false,
-    instance: {
-      _playing: opt.playing !== false,
-      is_playing() { return this._playing; },
-      play() { this._playing = true; st.plays++; },
-      pause() { this._playing = false; },
-      enable_background_tick_mode() { st.bgMode++; },
-      restart_animation_loop() { st.restarts++; },
-      audio_context() { return opt.noAudio ? null : audioCtx; },
-      tick_for_background(ts) { st.ticks.push(ts); }
-    },
-    /* 模拟 Ruffle 原型上的原始实现：一调就 new 一个 Worker */
-    startBackgroundTick() {
-      st.workerStarts++;
-      this.backgroundWorker = { id: st.workerStarts };
-    },
-    stopBackgroundTick() {
-      this.backgroundWorker = null;
-    }
+  const instance = {
+    __playing: opt.playing !== false,
+    __vol: (opt.vol == null ? 1 : opt.vol),
+    is_playing() { return this.__playing; },
+    play() { log.play++; log.events.push('play'); this.__playing = true; ctx.resume(); },
+    pause() { log.pause++; log.events.push('pause'); this.__playing = false; ctx.suspend(); },
+    volume() { return this.__vol; },
+    set_volume(v) { log.vol.push(v); log.events.push('vol:' + v.toFixed(3)); this.__vol = v; },
+    audio_context() { return ctx; },
+    enable_background_tick_mode() { log.bgTick++; log.events.push('bgTick'); },
+    restart_animation_loop() { log.restart++; log.events.push('restart'); }
   };
 
-  const doc = {
-    hidden: !!opt.hidden,
-    querySelector: () => (opt.noPlayer ? null : player),
-    addEventListener(t, fn) { if (t === 'visibilitychange') listeners.push(fn); }
-  };
+  const player = { instance, lastActivePlayingState: true };
 
   const win = {
     performance: perf,
-    __moleAlignClock(ts) { st.aligns++; st.alignTs = ts; return true; }
+    addEventListener(t, fn, cap) { winListeners.push({ t, fn, cap }); },
+    setTimeout(fn, ms) { timers.push({ fn, ms }); return timers.length; },
+    setInterval(fn, ms) { intervals.push(fn); return intervals.length; }
   };
 
-  const ctx = {
+  const doc = {
+    hidden: false,
+    querySelector() { return player; },
+    addEventListener(t, fn) { docListeners.push({ t, fn }); }
+  };
+
+  const sandbox = {
     window: win, document: doc, performance: perf,
     console: { log() {}, warn() {}, error() {} },
-    JSON, Math, Number, String, Object, Array, Boolean,
-    isFinite, isNaN, Date,
-    setInterval(fn, ms) { const o = { fn, ms }; intervals.push(o); return intervals.length; },
-    clearInterval(id) { const o = intervals[id - 1]; if (o) o.fn = null; },
-    setTimeout(fn) { fn(); return 0; },
-    clearTimeout() {},
-    Blob: class { constructor(parts) { this.parts = parts; } },
-    URL: {
-      createObjectURL() { st.blobs++; return 'blob:mock'; },
-      revokeObjectURL() {}
-    },
-    AudioWorkletNode: AudioWorkletNodeMock
+    setTimeout: win.setTimeout, setInterval: win.setInterval,
+    Math, Number, Date, Promise, Object, String, isFinite
   };
-  vm.createContext(ctx);
-  vm.runInContext(code, ctx);
+  vm.createContext(sandbox);
+  vm.runInContext(code, sandbox);
 
   return {
-    win, player, doc, st, listeners, audioCtx, workletNodes,
-    audioStateListener() { return stateListener; },
+    win, doc, instance, player, log, ctx,
+    frozen() { return win.__moleBgFrozen(); },
+    enter() { return win.__moleEnterBackground(); },
+    leave() { return win.__moleLeaveBackground(); },
+    bg() { return win.__moleBg(); },
     advance(ms) { now += ms; },
-    now() { return now; },
-    /* 只触发 50ms 的兜底轮询（第 6 段还有一个 2000ms 的 disarm 轮询） */
-    fireTimer() {
-      intervals.filter(o => o.fn && o.ms === 50).forEach(o => o.fn());
+    /* 把当前排队的 setTimeout 全部跑完（淡出/淡入） */
+    flush(max = 400) {
+      let n = 0;
+      while (timers.length && n++ < max) timers.shift().fn();
+      return n;
     },
-    fireWorklet() {
-      workletNodes.forEach(n => { if (n.port.onmessage) n.port.onmessage({ data: 1 }); });
+    /* 模拟一次 visibilitychange：先走 window 捕获，再决定放不放给 document */
+    fireVis() {
+      const e = { stopped: false, stopImmediatePropagation() { this.stopped = true; } };
+      winListeners.filter(l => l.t === 'visibilitychange' && l.cap).forEach(l => l.fn(e));
+      let docRan = 0;
+      if (!e.stopped) {
+        docListeners.filter(l => l.t === 'visibilitychange').forEach(l => { docRan++; l.fn({}); });
+      }
+      return { stopped: e.stopped, docRan };
     },
-    fireVisibility() { listeners.forEach(f => f()); }
+    /* 模拟 Ruffle 自己的监听器（用来证明它被拦掉了） */
+    installRuffleListener() {
+      doc.addEventListener('visibilitychange', () => {
+        log.events.push('ruffle-vis');
+        if (!doc.hidden) { instance.play(); ctx.resume(); }
+        else { instance.enable_background_tick_mode(); instance.pause(); }
+      });
+    }
   };
 }
 
-function maxStep(xs) {
-  let m = 0;
-  for (let i = 1; i < xs.length; i++) m = Math.max(m, Math.abs((xs[i] - xs[i - 1]) - FRAME_MS));
-  return m;
+console.log('=== 1) 进后台：先淡出到 0，再原子冻结 ===');
+{
+  const env = makeEnv();
+  ok('进后台前 frozen=false', env.frozen() === false);
+  ok('进后台返回 true', env.enter() === true);
+  ok('立刻进入冻结态（时钟据此停）', env.frozen() === true);
+
+  env.flush();
+  ok('淡出走完，最后一步音量是 0',
+     near(env.log.vol[env.log.vol.length - 1], 0, 1e-9),
+     'last=' + env.log.vol[env.log.vol.length - 1]);
+  ok('音量是逐步降下去的（不是硬切）', env.log.vol.length >= 5, 'steps=' + env.log.vol.length);
+  ok('单调下降',
+     env.log.vol.every((v, i) => i === 0 || v <= env.log.vol[i - 1] + 1e-9),
+     JSON.stringify(env.log.vol));
+
+  /* 顺序：pause 必须在最后一次 set_volume(0) 之后 */
+  const iLastVol = env.log.events.map(e => e.indexOf('vol:')).lastIndexOf(0);
+  const iPause = env.log.events.indexOf('pause');
+  ok('pause() 发生在淡出之后', iPause > 0 && env.log.events[iPause - 1].indexOf('vol:') === 0,
+     JSON.stringify(env.log.events));
+  ok('pause() 只调一次', env.log.pause === 1);
+  ok('AudioContext 被挂起（suspend 由 pause 带出）', env.ctx.state === 'suspended');
+  ok('没有用 enable_background_tick_mode 抢 rAF', env.log.bgTick === 0);
 }
 
-(async function main() {
+console.log('=== 2) 幂等：Java onPause 与 visibilitychange 各叫一次 ===');
+{
+  const env = makeEnv();
+  env.enter(); env.flush();
+  env.enter(); env.flush();
+  ok('pause() 仍然只有 1 次', env.log.pause === 1, 'pause=' + env.log.pause);
+  ok('冻结态保持', env.frozen() === true);
+  ok('enters 计数 1', env.bg().enters === 1, 'enters=' + env.bg().enters);
+}
 
-  console.log('=== 1) Ruffle 自己的 setTimeout Worker 必须被摘掉 ===');
-  {
-    const env = makeEnv({ playing: true });
-    env.win.__moleEnterBackground();
-    const r = env.player.startBackgroundTick();
-    ok('startBackgroundTick 返回 false', r === false);
-    ok('没有创建 backgroundWorker', env.player.backgroundWorker === null);
-    ok('workerStarts === 0', env.st.workerStarts === 0, 'starts=' + env.st.workerStarts);
-    ok('诊断口子报告 disarmed', env.win.__moleBg().disarmed === true);
+console.log('=== 3) 回前台：静音 → play() → 淡回原音量 ===');
+{
+  const env = makeEnv({ vol: 0.5 });
+  env.enter(); env.flush();
+  ok('冻结时记住了原音量 0.5', near(env.bg().vol, 0.5, 1e-9), 'vol=' + env.bg().vol);
+
+  env.log.events.length = 0;
+  const r = env.leave();
+  ok('返回 ran=true', r.ran === true);
+  ok('返回 resumed=true', r.resumed === true);
+  ok('第一件事是把音量压到 0', env.log.events[0] === 'vol:0.000',
+     'first=' + env.log.events[0]);
+  ok('紧接着才 play()', env.log.events[1] === 'play', JSON.stringify(env.log.events.slice(0, 3)));
+  ok('play() 只有 1 次', env.log.play === 1);
+  ok('没有调 restart_animation_loop（防双倍速）', env.log.restart === 0);
+
+  env.flush();
+  ok('淡入结束回到原音量 0.5', near(env.instance.__vol, 0.5, 1e-9),
+     'vol=' + env.instance.__vol);
+  ok('淡入是逐步升上去的', env.log.vol.filter(v => v > 0).length >= 4, JSON.stringify(env.log.vol));
+  ok('解冻后 frozen=false', env.frozen() === false);
+}
+
+console.log('=== 4) 冻结前就是暂停态：回前台不许擅自 play() ===');
+{
+  const env = makeEnv({ playing: false });
+  env.enter(); env.flush();
+  ok('冻结时记下 wasPlaying=false', env.bg().wasPlaying === false);
+  env.leave(); env.flush();
+  ok('没有调用 play()', env.log.play === 0, 'play=' + env.log.play);
+  ok('音量照样还回去', near(env.instance.__vol, 1, 1e-9), 'vol=' + env.instance.__vol);
+}
+
+console.log('=== 5) 没冻结过时 leave 是纯 no-op ===');
+{
+  const env = makeEnv({ vol: 0.7 });
+  const r = env.leave();
+  ok('返回 ran=false', r.ran === false, JSON.stringify(r));
+  ok('没有碰音量', env.log.vol.length === 0, JSON.stringify(env.log.vol));
+  ok('没有 play()', env.log.play === 0);
+}
+
+console.log('=== 6) 快切（淡出还没走完就回来）不许把游戏冻住 ===');
+{
+  const env = makeEnv();
+  env.enter();                 // 只走了第一步淡出，定时器还没跑
+  const r = env.leave();       // 立刻回前台
+  env.flush();
+  ok('最终没有 pause()', env.log.pause === 0, 'pause=' + env.log.pause);
+  ok('状态已解冻', env.frozen() === false);
+  ok('音量回到 1', near(env.instance.__vol, 1, 1e-9), 'vol=' + env.instance.__vol);
+  ok('leave 认为自己在跑', r.ran === true);
+}
+
+console.log('=== 7) 拦掉 Ruffle 的 visibilitychange（它会无条件 play） ===');
+{
+  const env = makeEnv();
+  env.installRuffleListener();
+
+  env.doc.hidden = true;
+  const e1 = env.fireVis();
+  ok('捕获阶段就 stopImmediatePropagation', e1.stopped === true);
+  ok('document 上的监听器一次都没跑', e1.docRan === 0, 'docRan=' + e1.docRan);
+  ok('Ruffle 的 hidden 分支没执行', env.log.events.indexOf('ruffle-vis') < 0);
+  ok('我们自己没调 enable_background_tick_mode', env.log.bgTick === 0);
+
+  env.flush();
+  ok('hidden 之后确实进冻结态', env.frozen() === true);
+  ok('pause 恰好一次', env.log.pause === 1);
+
+  env.doc.hidden = false;
+  const e2 = env.fireVis();
+  ok('visible 同样被拦下', e2.stopped === true && e2.docRan === 0);
+  ok('解冻', env.frozen() === false);
+  ok('play() 只有我们自己那一次', env.log.play === 1, 'play=' + env.log.play);
+}
+
+console.log('=== 8) 摘掉 Ruffle 的后台 Worker ===');
+{
+  const env = makeEnv();
+  env.enter(); env.flush();
+  ok('startBackgroundTick 被摘成空函数（返回 false）',
+     env.player.startBackgroundTick() === false);
+  ok('stopBackgroundTick 可直接调用不抛错', (() => {
+    try { env.player.stopBackgroundTick(); return true; } catch (e) { return false; }
+  })());
+  ok('disarmed 标记已置', env.player.__moleDisarmed === 1);
+}
+
+console.log('=== 9) 分辨率无关：音量 0 / 1 的边界 ===');
+{
+  const e0 = makeEnv({ vol: 0 });
+  e0.enter(); e0.flush();
+  ok('原音量 0 时不出现负数', e0.log.vol.every(v => v >= 0), JSON.stringify(e0.log.vol));
+  e0.leave(); e0.flush();
+  ok('回前台仍是 0', near(e0.instance.__vol, 0, 1e-9), 'vol=' + e0.instance.__vol);
+
+  const e1 = makeEnv({ vol: 1 });
+  e1.enter(); e1.flush();
+  ok('原音量 1 时不超过 1', e1.log.vol.every(v => v <= 1), JSON.stringify(e1.log.vol));
+  e1.leave(); e1.flush();
+  ok('回前台仍是 1', near(e1.instance.__vol, 1, 1e-9));
+}
+
+console.log('=== 10) 连续 10 轮切后台/回前台，状态不漂 ===');
+{
+  const env = makeEnv({ vol: 0.8 });
+  for (let i = 0; i < 10; i++) {
+    env.advance(60000);
+    env.enter(); env.flush();
+    if (!env.frozen()) { ok('第 ' + (i + 1) + ' 轮冻结失败', false); break; }
+    env.leave(); env.flush();
+    if (env.frozen()) { ok('第 ' + (i + 1) + ' 轮解冻失败', false); break; }
   }
+  ok('10 轮后 pause/play 各 10 次', env.log.pause === 10 && env.log.play === 10,
+     'pause=' + env.log.pause + ' play=' + env.log.play);
+  ok('10 轮后音量仍是 0.8', near(env.instance.__vol, 0.8, 1e-9), 'vol=' + env.instance.__vol);
+  ok('音频上下文最终是 running', env.ctx.state === 'running', env.ctx.state);
+  ok('诊断计数 10 进 10 出', env.bg().enters === 10 && env.bg().leaves === 10,
+     JSON.stringify({ e: env.bg().enters, l: env.bg().leaves }));
+  ok('没有偷偷调 enable_background_tick_mode / restart_animation_loop',
+     env.log.bgTick === 0 && env.log.restart === 0);
+}
 
-  console.log('=== 2) 进后台：只取消 rAF、只拉音频，不建 Worker ===');
-  {
-    const env = makeEnv({ playing: true, audioState: 'suspended' });
-    const r = env.win.__moleEnterBackground();
-    ok('enter 返回 true', r === true);
-    ok('enable_background_tick_mode 调了 1 次', env.st.bgMode === 1);
-    ok('AudioContext 被 resume', env.st.resumes >= 1, 'resumes=' + env.st.resumes);
-    ok('没有 Worker', env.player.backgroundWorker === null);
-  }
-
-  console.log('=== 3) 核心：一拍只推一帧，dt 恒为 41.666ms ===');
-  {
-    const env = makeEnv({ playing: true });
-    env.win.__moleEnterBackground();
-    env.advance(1000);                 // 模拟被节流到 1 秒一次
-    env.fireTimer();
-
-    const ts = env.st.ticks;
-    ok('一秒补了 24 帧', ts.length === 24, 'got=' + ts.length);
-    ok('相邻间隔误差 < 0.01ms', maxStep(ts) < 0.01, 'maxErr=' + maxStep(ts).toFixed(4));
-    ok('首帧没有吃掉那 1 秒', ts[0] - 1000 < FRAME_MS + 0.01,
-       'first=' + (ts[0] - 1000).toFixed(2));
-  }
-
-  console.log('=== 4) 连续 10 轮慢节拍，全程不出现跳变 ===');
-  {
-    const env = makeEnv({ playing: true });
-    env.win.__moleEnterBackground();
-    for (let i = 0; i < 10; i++) { env.advance(1000); env.fireTimer(); }
-
-    const ts = env.st.ticks;
-    ok('总帧数量级正确（≈240）', ts.length >= 235 && ts.length <= 245, 'got=' + ts.length);
-    ok('240 帧全程 dt 误差 < 0.01ms', maxStep(ts) < 0.01, 'maxErr=' + maxStep(ts).toFixed(4));
-    ok('时间轴单调递增', ts.every((v, i) => i === 0 || v > ts[i - 1]));
-  }
-
-  console.log('=== 5) 极端节流（10 秒才叫一次）也只能推 CATCHUP_MAX 帧 ===');
-  {
-    const env = makeEnv({ playing: true });
-    env.win.__moleEnterBackground();
-    env.advance(10000);
-    env.fireTimer();
-    ok('单轮不超过 120 帧', env.st.ticks.length <= 120, 'got=' + env.st.ticks.length);
-    ok('仍然没有跳变', maxStep(env.st.ticks) < 0.01);
-  }
-
-  console.log('=== 6) AudioWorklet 就绪后接管节拍 ===');
-  {
-    const env = makeEnv({ playing: true });
-    env.win.__moleEnterBackground();
-    await flush();
-
-    ok('addModule 被调用', env.st.workletModules === 1);
-    ok('worklet 节点已创建', env.workletNodes.length === 1);
-    ok('节点已接到 destination', env.workletNodes[0].connected === 1);
-    ok('诊断口子 mode=worklet', env.win.__moleBg().mode === 'worklet');
-
-    env.advance(FRAME_MS);
-    env.fireWorklet();
-    ok('worklet 触发也能推进', env.st.ticks.length >= 1);
-    ok('worklet 推进的 dt 仍是 41.67', maxStep(env.st.ticks) < 0.01);
-  }
-
-  console.log('=== 7) worklet + 定时器双源同时叫，不会重复推进 ===');
-  {
-    const env = makeEnv({ playing: true });
-    env.win.__moleEnterBackground();
-    await flush();
-    env.advance(FRAME_MS);
-    env.fireWorklet();
-    const n1 = env.st.ticks.length;
-    env.fireTimer();                   // 同一时刻兜底也来一次
-    ok('第二次叫不再补帧（幂等）', env.st.ticks.length === n1,
-       'before=' + n1 + ' after=' + env.st.ticks.length);
-  }
-
-  console.log('=== 8) 音频上下文被挂起后自动拉回 ===');
-  {
-    const env = makeEnv({ playing: true });
-    env.win.__moleEnterBackground();
-    const before = env.st.resumes;
-    env.audioCtx.state = 'suspended';
-    const l = env.audioStateListener();
-    ok('已注册 statechange 监听', typeof l === 'function');
-    if (l) l();
-    ok('被挂起后再次 resume', env.st.resumes > before,
-       'before=' + before + ' after=' + env.st.resumes);
-  }
-
-  console.log('=== 9) 回前台：恢复 rAF、把合成轴交回第 0 段 ===');
-  {
-    const env = makeEnv({ playing: true });
-    env.win.__moleEnterBackground();
-    env.advance(1500);
-    env.fireTimer();
-    const lastTs = env.st.ticks[env.st.ticks.length - 1];
-
-    const r = env.win.__moleLeaveBackground();
-    ok('ran=true', r.ran === true);
-    ok('报告帧数', r.ticks === env.st.ticks.length);
-    ok('restart_animation_loop 调了 1 次', env.st.restarts === 1);
-    ok('要求接续时间轴', env.st.aligns === 1 && r.aligned === true);
-    ok('交给第 0 段的是合成轴最后一帧', Math.abs(env.st.alignTs - lastTs) < 0.01,
-       'alignTs=' + env.st.alignTs + ' lastTs=' + lastTs);
-    ok('后台状态已清空', env.win.__moleBg().on === false);
-  }
-  {
-    /* 后台期间被系统挂起过 → 回前台必须立刻拉回来，否则第一帧音频要等好几秒 */
-    const env = makeEnv({ playing: true });
-    env.win.__moleEnterBackground();
-    env.advance(800);
-    env.fireTimer();
-    env.audioCtx.state = 'suspended';      // 模拟被系统挂起
-    const before = env.st.resumes;
-    env.win.__moleLeaveBackground();
-    ok('回前台把挂起的 AudioContext 拉回来', env.st.resumes > before,
-       'before=' + before + ' after=' + env.st.resumes);
-  }
-
-  console.log('=== 10) 游戏本身是暂停态：不为它维持时间轴 ===');
-  {
-    const env = makeEnv({ playing: false });
-    const r = env.win.__moleEnterBackground();
-    ok('enter 返回 false', r === false);
-    ok('没有 enable_background_tick_mode', env.st.bgMode === 0);
-    ok('没有 tick', env.st.ticks.length === 0);
-    env.advance(3000);
-    env.fireTimer();
-    ok('之后也不会偷偷推进', env.st.ticks.length === 0);
-  }
-
-  console.log('=== 11) 没有播放器 / 没有音频上下文时不抛 ===');
-  {
-    const env = makeEnv({ noPlayer: true });
-    let threw = false, r1, r2;
-    try { r1 = env.win.__moleEnterBackground(); r2 = env.win.__moleLeaveBackground(); }
-    catch (e) { threw = true; }
-    ok('enter/leave 都不抛', threw === false);
-    ok('enter 返回 false', r1 === false);
-    ok('leave 返回结构完整', r2 && r2.ran === false && r2.aligned === false);
-  }
-  {
-    const env = makeEnv({ playing: true, noAudio: true });
-    let threw = false;
-    try { env.win.__moleEnterBackground(); env.advance(100); env.fireTimer(); }
-    catch (e) { threw = true; }
-    ok('audio_context() 返回 null 时降级到定时器', threw === false && env.st.ticks.length > 0);
-  }
-
-  console.log('=== 12) 重复 enter 幂等 ===');
-  {
-    const env = makeEnv({ playing: true });
-    env.win.__moleEnterBackground();
-    env.advance(100);
-    env.fireTimer();
-    const n1 = env.st.ticks.length;
-    const r = env.win.__moleEnterBackground();
-    ok('第二次 enter 返回 true', r === true);
-    ok('没有再调 enable_background_tick_mode', env.st.bgMode === 1);
-    env.advance(0);
-    env.fireTimer();
-    ok('时间轴没有被打乱', maxStep(env.st.ticks) < 0.01 && env.st.ticks.length >= n1);
-  }
-
-  console.log('\n' + (fail === 0 ? 'ALL PASS' : 'FAILED') + '  pass=' + pass + ' fail=' + fail);
-  process.exit(fail === 0 ? 0 : 1);
-
-})();
+console.log('\n' + (fail === 0 ? 'ALL PASS' : 'FAILED') + '  pass=' + pass + ' fail=' + fail);
+process.exit(fail === 0 ? 0 : 1);

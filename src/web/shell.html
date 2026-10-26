@@ -121,18 +121,7 @@
   var acc = 0;
   var lastTs = 0;
 
-  /* 1.1.1：同一回调重复登记时去重。
-     ---------------------------------------------------------------
-     Ruffle 的 setupTabVisibilityHandling 会在页面回到可见时自己调一次
-     restart_animation_loop()（内部就是 requestAnimationFrame(handler)），
-     壳层第 6 段从 Java onResume 进来时也要调一次 —— 两边都调，队列里
-     就有两个一模一样的 handler，一帧 dispatch 两次，Ruffle 一帧被推进
-     两个 dt，逻辑直接双倍速。这里在入口做幂等：同一个函数引用只保留
-     一份。正常代码不会重复登记同一回调，所以对 Ruffle 之外没有任何影响。 */
   window.requestAnimationFrame = function (cb) {
-    queue.forEach(function (existing, oldId) {
-      if (existing === cb) queue.delete(oldId);
-    });
     var id = ++seq;
     queue.set(id, cb);
     return id;
@@ -174,9 +163,7 @@
   var stallMs = 0;          // 累计被切掉的时间（诊断用）
   var resumeN = 0;
   var lastNoteAt = 0;
-  var pendingAlign = false; // 后台跑过一程 → 回来时从后台合成轴接续
-  var alignCont = 0;        // 后台合成轴最后一帧的时间戳（接续用）
-  var alignN = 0;
+  var frozenN = 0;          // 后台冻结期间被跳过的帧数（诊断用）
 
   function dispatch(v) {
     var cbs = [];
@@ -191,44 +178,19 @@
     nativeRaf(pump);
     if (!lastTs) { lastTs = ts; lastReal = ts; vTs = ts; return; }
 
-    /* 后台跑过一程再回来：从后台合成轴**接续**，不对齐真实时间。
+    /* 后台冻结期：只记真实时间，不推进 vTs，也不 dispatch。
        ---------------------------------------------------------------
-       1.1.1 起后台由壳层自己的节拍器驱动（见第 6 段），喂给 core 的
-       是我们维护的合成轴 bg.ts —— 严格每帧 +41.67ms，与真实时间同源
-       但不做补偿。core 的 last_tick（lib.rs 里的 instance.timestamp）
-       就停在 bg.ts 上。
-
-       此时若把 vTs 直接设成真实 rAF 戳：
-         · 后台时钟跟得上（正常情况）→ 差值 < 一帧，勉强没事；
-         · 后台有欠账（页面冻结 / AudioContext 被挂起）→ 差值几秒，
-           dt 一次跳几秒 → 又回到补帧风暴。
-       所以正确做法是让 vTs 落在 bg.ts + 一帧，而不是真实 ts。
-       vTs 之后仍按真实差值推进，两者偏移恒定，core 看到的 dt 恒为
-       ~41ms，一帧都不多给。 */
-    if (pendingAlign) {
-      pendingAlign = false;
-      if (alignCont > 0) {
-        vTs = alignCont + FRAME_MS;      // 从后台合成轴接续
-      } else {
-        vTs = ts;                        // 没拿到合成轴，退回真实时间
-      }
-      lastReal = ts; lastTs = ts;
-      stallMs = 0;                       // 后台期间没有"被切断"的时间
-      acc = FRAME_MS;                    // 这一帧立即放行
-      resumeN++;
-      alignN++;
-      acc -= FRAME_MS;
-      if (ts - lastNoteAt > 8000) {
-        lastNoteAt = ts;
-        try {
-          console.warn('[MoleShell] 回到前台：时间轴已从后台合成轴接续'
-            + '（第 ' + alignN + ' 次，偏移 '
-            + Math.round(vTs - ts) + 'ms，无补帧、无跳变）');
-        } catch (e) {}
-        try { if (window.__moleAfterResume) window.__moleAfterResume(0); } catch (e) {}
-      }
-      alignCont = 0;
-      dispatch(vTs);
+       1.1.2 起后台是「逻辑 + 音频一起冻结」（第 6 段 inst.pause()），
+       此时 core 的 tick 直接 return，喂进去的时间戳没人消费。
+       若这里还按 24fps 推 vTs，回前台第一帧的 dt 就会等于整个后台
+       时长（几分钟）→ frame_accumulator 暴涨 → 连跑 5 帧逻辑 +
+       补跑 10 个定时器 + 重渲染 = 卡顿，以及「数据包突发」。
+       把 vTs 冻住之后，恢复时 dt 恒为一个帧长（41.67ms），与 core
+       内部 last_tick 停在哪一帧无关 —— 这是唯一与实现细节无关的写法。 */
+    if (window.__moleBgFrozen && window.__moleBgFrozen()) {
+      lastReal = ts;
+      lastTs = ts;
+      frozenN++;
       return;
     }
 
@@ -271,16 +233,7 @@
   /* 诊断口子：Java 侧 / HUD 可直接读，用来确认钳制是否真的在生效 */
   window.__moleClock = function () {
     return { stallMs: Math.round(stallMs), resumes: resumeN, vTs: vTs,
-             align: alignN, pending: pendingAlign };
-  };
-
-  /* 由第 6 段在「后台确实跑过一程」之后调用：
-     传入后台合成轴最后一帧的时间戳，下一帧 rAF 落地时从这里接续。
-     不传参（或传非数字）则退回「对齐真实时间」的老行为。 */
-  window.__moleAlignClock = function (contTs) {
-    alignCont = (typeof contTs === 'number' && isFinite(contTs) && contTs > 0) ? contTs : 0;
-    pendingAlign = true;
-    return true;
+             frozen: frozenN };
   };
 
   window.__moleSetFps = function (n) {
@@ -629,28 +582,19 @@
       wmode: 'opaque',
       /* 切后台时**继续跑**，不是停掉。
          ---------------------------------------------------------------
-         原值 'none'（1.0.2 及以前）：页面 hidden → Ruffle 走 else 分支
-         → instance.pause() → 逻辑冻结但会话挂着；回来时一次性补帧 +
-         update_timers 补跑 → 一串时间戳跳变的数据包 → 被踢。
+         这一项是 1.0.6 的关键改动，原值是 'none'，后果是：
+           页面 hidden → Ruffle 的 setupTabVisibilityHandling 走 else 分支
+           → instance.pause() → 整个游戏逻辑冻结，但客户端与服务器的
+           会话还挂着。返回时 Ruffle 一次性补帧 + update_timers 补跑，
+           游戏把积压逻辑全做一遍 → 一串时间戳跳变的数据包发出去
+           → 服务器判定「时间顺序对不上」直接踢下线。
 
-         1.0.6 起改成 'mainThread'，让 Ruffle 走它自己那条后台分支：
+         改成 'mainThread' 后走的是 Ruffle 官方的另一条分支：
            hidden → enable_background_tick_mode() + startBackgroundTick()
-
-         1.1.1 起要看清这条分支**到底做了什么**：startBackgroundTick()
-         现场拼一个 Worker，里面是 `setTimeout(41.67) → postMessage`
-         的递归节拍，主线程收到就 tick_for_background(performance.now())。
-         它假定 Worker 的定时器不受页面可见性节流 —— 这个假定是错的，
-         hidden 之后 Chromium 对 Dedicated Worker 的 timer 一样节流到
-         1 秒起步。dt 一跳就是一秒，音频一次生成 44100 个样本（爆破音），
-         frame_accumulator 只跑 5 帧就归零（逻辑时间落后 79%），
-         update_timers 一次补 10 个回调（包顺序错乱被踢）。
-
-         所以现在保留 'mainThread' 只是为了让它走
-         enable_background_tick_mode()（取消 rAF、置后台标志），
-         **节拍器改由壳层自己的接管**：第 6 段把
-         startBackgroundTick 摘成空函数（Worker 不会建），改用
-         AudioWorklet + 定时器双源驱动，每次只推一帧 41.67ms。
-         配置值本身不用动，帧率 / 画幅 / 画质都不受影响。
+           → 用一个 Web Worker 里的 setTimeout 按影片帧率（24fps）
+             持续调 instance.tick_for_background(performance.now())
+           Worker 的定时器不受页面可见性节流，所以后台真的在跑，
+           客户端时间轴与真实时间始终连续 —— 返回时没有补帧、没有跳变。
 
          取值来自 Ruffle 源码枚举 BackgroundExecutionMode：
            'none' | 'mainThread'（没有第三个值，写错会回落到 none）。 */
@@ -982,24 +926,18 @@ exports.BaseEntity=N;exports.Button=Ri;exports.ButtonBaseView=L;exports.ButtonCo
   }
 
   /* ------------------------------------------------------------------
-   * 5.3 后台恢复钩子（由第 0 段的时间轴钳制在判定「后台恢复」后调用）
-   *     Java 侧 onPause 会调 element.pause()，而 Ruffle 自己的
-   *     visibilitychange 回调用的是「挂起前的播放状态」，两者存在竞态：
-   *     若 pause() 先跑，挂起前记录的状态就是 false，回来后不会自动 play，
-   *     于是停在暂停态（还会多出个播放按钮）。
-   *     这里在恢复时兜一次底：确实是暂停态就 play()，不重复开循环。
+   * 5.3 后台恢复钩子（由第 1 段的时间轴钳制在判定「后台恢复」后调用）
+   *     只做「重新测量画幅 + 重新贴边」这两件事。
+   *
+   *     1.1.2 起**不再在这里 play()**：后台是「逻辑 + 音频原子冻结」，
+   *     恢复由第 6 段的 __moleLeaveBackground 统一负责（set_volume(0)
+   *     → play() → 淡入）。两边都去 play() 会变成对同一条音频流
+   *     连续 resume 两次，接缝上就是一声「啪」。
    * ------------------------------------------------------------------ */
   window.__moleAfterResume = function (gapMs) {
     try { if (window.__moleFit) window.__moleFit(); } catch (e) {}
     applyLayout();
-    var p = playerEl();
-    if (!p) return;
-    try {
-      if (p.instance && p.isPlaying === false) {
-        p.play();
-        log('后台恢复：播放器停在暂停态，已重新 play（挂起 ' + Math.round(gapMs) + 'ms）');
-      }
-    } catch (e) {}
+    log('后台恢复：画幅与触控板已重新校正（挂起 ' + Math.round(gapMs) + 'ms）');
   };
 
   /* 退路 / 诊断口子：无论 OmniPad 在不在都要有，
@@ -1084,101 +1022,107 @@ exports.BaseEntity=N;exports.Button=Ri;exports.ButtonBaseView=L;exports.ButtonCo
 })();
 
 /* ==================================================================
- * 6) 后台保活 —— 音频时钟驱动，dt 恒定，不爆音、不掉线
+ * 6) 后台：逻辑与音频「原子冻结」，进程由前台服务保活
  * ==================================================================
- * 现象（1.1.1 用户实测）：
- *   · 后台挂机时游戏内置音乐出现严重爆破音
- *   · 仍然会因为「数据包对不上」被服务器踢出
+ * 1.1.2 要解决三个现象（真机反馈）：
+ *   a) 切后台再回来，声音有严重的爆破音
+ *   b) 回来的瞬间画面卡顿
+ *   c) 后台挂久了应用自己崩溃
  *
- * 根因：两个现象同源 —— Ruffle 自己的后台节拍器建立在 setTimeout 上。
+ * 根因一：爆破音 = Ruffle 把「流音」硬停后重启
  * ------------------------------------------------------------------
- * ruffle.js 里 startBackgroundTick() 现场拼出这段 Worker 源码：
+ * core/src/backend/audio.rs 的 audio_skew_time()（每个 tick 都跑）：
  *
- *   const intervalMs = 1000 / (metadata.frameRate || 24);   // 41.67
- *   self.onmessage = () => setTimeout(() => self.postMessage("tick"), intervalMs);
+ *     let stream_pos   = audio.get_sound_position(instance) / 1000.0;
+ *     let timeline_pos = (clip.current_frame() - start_frame) / frame_rate
+ *                        + offset_ms / 1000.0;
+ *     let skew = stream_pos - timeline_pos;
+ *     if skew.abs() >= STREAM_RESTART_THRESHOLD {     // 1.0 秒
+ *         audio.stop_sound(instance);                 // ← 硬切，波形中断
+ *         self.sounds.swap_remove(i);                 // ← 实例直接丢掉
+ *     }
  *
- * 它假定「Worker 里的定时器不受页面可见性节流」，这个假定是错的：
- * 页面 hidden 之后，Chromium 对 Dedicated Worker 的 timer 同样施加
- * 1 秒下限的节流（intensive throttling 之后更慢）。主线程这段是
+ * 影片下一帧发现流没了，会自己 start_stream 重新拉起来 —— 一停一起，
+ * 接缝处就是那声「啪」。
  *
- *   c.onmessage = () => instance.tick_for_background(performance.now())
+ * 而 stream_pos 在后台必然掉队，因为它的推进方式：
+ *   web/src/audio.rs  Buffer::play() 里才调 mixer_proxy.mix()，
+ *   一次只推进 buffer_size 帧（2048 起，最坏 16384 = 371ms）；
+ *   而 play() 只由上一块 AudioBufferSourceNode 的 onended 触发。
+ *   **onended 是主线程事件**。页面 hidden 后主线程被系统压到 1Hz，
+ *   一秒内只跑得到 2~3 次 onended，stream_pos 每秒只走 92~743ms，
+ *   而 timeline_pos 走 1000ms → 每秒欠 0.3~0.9 秒 → 1~4 秒必破
+ *   1.0 秒阈值 → stop_sound → 爆音 → 循环。
  *
- * 于是真正喂进 core 的 dt 是「一秒起步」，甚至几十秒。接着看
- * core/src/player.rs 的 Player::tick 怎么消化这个 dt：
+ * 这是 pull 模型对主线程节流的硬依赖，换喂法救不回来：
+ *   · 1.0.6 用 Ruffle 自己的 Worker(setTimeout) → Worker 定时器同样
+ *     被节流，dt 一秒起步
+ *   · 1.1.0 让 Ruffle 补帧 → frame_accumulator 被清零，逻辑倒退 79%
+ *   · 1.1.1 固定步长喂 tick → timeline 准了，stream_pos 还是掉队
+ *   三种喂法撞的是同一堵墙。
  *
- *   ① frame_accumulator += dt;                      // +1000ms
- *      while (frame < max_frames_per_tick(≤5) && frame_accumulator >= frame_duration)
- *          run_frame();
- *      if (frame_accumulator >= frame_duration)
- *          frame_accumulator = ZERO;                 // 剩余 792ms 直接扔
- *      → 每秒只跑 5 帧（208ms），逻辑时间落后真实时间约 79%。
- *        getTimer() 跟着变慢，游戏打出去的包时间戳越来越滞后，
- *        服务器的时间校验过不去 —— 这是一半的「对不上」。
- *
- *   ② update_timers(dt);                            // dt = 1000
- *      → Timers::update_timers 一次把 MAX_TICKS(10) 个到期定时器
- *        全部补跑。心跳、动作、同步包在同一个毫秒里连发十个，
- *        服务器收到的就是「顺序错乱 / 时间倒挂」—— 这是另一半。
- *
- *   ③ self.audio.tick();                            // 方法末尾，按 dt 生成样本
- *      → 一次生成 44100 个样本（整整 1 秒）压进 WebAudio 队列，
- *        而音频线程这一秒只消费了真实经过的那一点，队列立刻错位、
- *        环形缓冲互相覆盖，接缝处就是听感上的爆破音。dt 每抖一次
- *        响一次，所以是「比较严重」而不是偶发。
- *
- * 解法：时机不再交给 setTimeout，壳层自己当节拍器，一拍只推一帧。
+ * 根因二：卡顿 = 回前台第一帧的 dt 是「挂起时长」
  * ------------------------------------------------------------------
- *   · 时间轴：自己维护单调合成轴 bg.ts，严格每帧 +41.67ms。
- *     相邻两次喂给 core 的时间戳差永远是 FRAME_MS，dt 不再抖。
- *   · 节拍源 A：AudioWorklet。跑在音频线程上，页面 hidden 时
- *     完全不受 timer 节流 —— 这正是「B 站式后台听歌」能持续的原因。
- *   · 节拍源 B：setInterval 兜底。两个源都只是「叫一下 pump()」，
- *     pump 内部按 performance.now() 自己算欠几帧，天然幂等：
- *     worklet 在跑时它算出来是 0，什么也不做。
- *   · 被节流成 1 秒一次也没关系：pump 会连着推 24 次「+41.67ms」，
- *     绝不会把 1 秒的 dt 一次性灌给 core。
+ *   web/src/lib.rs     dt = 本次时间戳 − 上次时间戳（无负值保护）
+ *   core/src/player.rs tick(): frame_accumulator += dt
+ *                     while frame < max_frames_per_tick(≤5) run_frame()
+ *                     if frame_accumulator >= frame_duration { = 0 }
+ *                     update_timers(dt)   // MAX_TICKS=10 个定时器补跑
+ *   一帧里连跑 5 帧逻辑 + 补跑 10 个定时器 + 重渲染 = 肉眼可见的卡。
  *
- * 于是三件事同时成立：
- *   · 音频每帧固定 1837 个样本，首尾相接 → 没有撕裂，没有爆破音；
- *   · update_timers 每帧最多出 1 个回调 → 包节奏正常 → 不掉线；
- *   · 逻辑时间按真实墙钟推进 → getTimer() 不漂移 → 时间戳对得上。
+ * 根因三：挂久崩溃 = 后台一直想跑，但主线程跑不动
+ * ------------------------------------------------------------------
+ *   后台每个 tick 都在补帧，audio.tick() 按 dt 生成样本，而 mixer 只能
+ *   靠 onended 拉取；供大于求 → 样本被丢、buffer_size 一路翻倍到
+ *   MAX(16384)；再加解码器/闭包/事件队列在 1Hz 下堆积 → 长时间必然
+ *   吃 OOM 或被系统判死。1.1.1 还有个隐患：每次进后台都
+ *   audioWorklet.addModule() 注册同名 processor，第二次直接抛错降级。
  *
- * 附带修掉 1.0.6 留下的两个隐患：
- *   · Ruffle 的 hidden 分支会 startBackgroundTick()，我们自己也在推，
- *     两个节拍器交替喂时间戳（一个 performance.now，一个合成轴），
- *     dt 会正负横跳。这里把 startBackgroundTick 摘成空函数。
- *   · 回前台时 Ruffle 的 visible 分支和自己各调一次
- *     restart_animation_loop()，rAF 队列里出现两个同样的 handler，
- *     一帧推两帧逻辑 = 双倍速。第 0 段已对重复回调去重。
+ * 结论：在 WebView 里「后台真跑游戏」这件事，只要主线程被节流，
+ *   要么时间轴漂移（服务器判时间戳不对），要么批量补帧（服务器判
+ *   包突发），要么周期性硬停音频流（爆音）。三条路都走不通，
+ *   这是架构约束，不是参数能调出来的。
  *
- * 音频上下文保活：Android WebView 在页面 hidden / 失去音频焦点时会把
- * AudioContext 挂起。挂起后音频线程停摆，既没声音，worklet 节拍器也
- * 跟着停。所以进后台立刻 resume，并监听 statechange 反复拉回来 ——
- * 这是「后台继续放歌」的硬前提。
+ * 所以 1.1.2 换成唯一自洽的做法：整条链路原子冻结。
+ * ------------------------------------------------------------------
+ *   · inst.pause() 在 web 后端本身就是一对原子操作：
+ *       Player::set_run_state(Suspended)  → core 的 tick 直接 return
+ *       AudioBackend::pause()             → AudioContext.suspend()
+ *     逻辑与音频停在同一时刻，两条时间轴一起冻结 —— skew 不再增长，
+ *     onended 不再堆积，mixer 不再被拉，全部归零。
+ *   · 冻结前先把音量 70ms 淡到 0：suspend() 会在波形中途切断输出，
+ *     不淡出就是那声「切后台的爆音」。
+ *   · 回前台：先 set_volume(0) 盖住恢复瞬间 → inst.play() 原子恢复
+ *     （Suspended → Playing，AudioContext resume）→ 120ms 内淡回原音量。
+ *   · AudioContext 挂起时 currentTime 不走，Buffer.time 与它一起停，
+ *     恢复时两者仍然对齐 —— 这就是「不需要重建调度」的原因。
+ *   · 时钟由第 1 段冻结：后台不推进 vTs、不 dispatch（见第 1 段
+ *     __moleBgFrozen 判断）。恢复时 dt 恒为 41.67ms，与 core 的
+ *     last_tick 停在哪一帧无关。**这里不再调 __moleAlignClock()** ——
+ *     那是 1.1.0 的写法，它把 vTs 对齐到真实时间，等于给 core 一个
+ *     几分钟的 dt，正是卡顿的来源。
+ *   · 进程由前台服务保活（Java 侧 MoleKeepAlive，mediaPlayback 类型），
+ *     后台不会被系统回收 / 冻结，回前台是热恢复，不重新加载页面。
  *
- * 不碰的东西：帧率 24、画幅 960x560、quality、节流器、服务器地址、
- * Ruffle 二进制。改动只在「后台怎么喂时间戳」这一件事上。
+ * 不碰：帧率 24、画幅 960x560、quality、节流器、服务器地址、
+ *       Ruffle 二进制与 classes.dex。
  * ================================================================== */
 (function () {
   var TAG = '[MoleShell]';
   function log(m) { try { console.log(TAG + ' ' + m); } catch (e) {} }
   function warn(m) { try { console.warn(TAG + ' ' + m); } catch (e) {} }
 
-  var FPS = 24;                  // = 影片真实帧率，与第 0 段一致
-  var FRAME_MS = 1000 / FPS;     // 41.666…
-  var CATCHUP_MAX = 120;         // 单轮最多补 5 秒，防长冻结时死循环
-  var POLL_MS = 50;              // 兜底轮询间隔
+  var FADE_OUT_STEPS = 5, FADE_OUT_GAP = 14;   // ≈70ms
+  var FADE_IN_STEPS = 8, FADE_IN_GAP = 15;     // ≈120ms
 
-  var bg = {
-    on: false,
-    ts: 0,           // 后台合成时间轴：严格每帧 +FRAME_MS
-    ticks: 0,
-    catchup: 0,      // 单轮最大补帧数（诊断用）
-    mode: 'idle',    // 'worklet' | 'timer'
-    ctx: null,
-    node: null,
-    timer: null,
-    since: 0
+  var st = {
+    on: false,          // 是否处于冻结态
+    wasPlaying: false,  // 冻结前游戏是否在播
+    vol: -1,            // 冻结前的音量（-1 = 没有挂起的恢复）
+    since: 0,
+    enters: 0,
+    leaves: 0,
+    lastGapMs: 0
   };
 
   function nowMs() {
@@ -1187,17 +1131,17 @@ exports.BaseEntity=N;exports.Button=Ri;exports.ButtonBaseView=L;exports.ButtonCo
   function playerEl() {
     return document.querySelector('ruffle-player,ruffle-embed,ruffle-object');
   }
-  function core() {
-    var p = playerEl();
-    return p && p.instance;
-  }
 
   /* ------------------------------------------------------------------
-   * ① 拆掉 Ruffle 自己的后台节拍器
+   * ① 摘掉 Ruffle 自己的后台 Worker（保险）
    * ------------------------------------------------------------------
-   * startBackgroundTick 定义在原型上，实例属性可以遮蔽它。做成空函数后，
-   * Ruffle 的 hidden 分支只会走 enable_background_tick_mode()（取消 rAF、
-   * 置 background_tick_mode），不会再去 new Worker 抢时间轴。
+   * 第 2 段仍是 backgroundExecutionMode:'mainThread'，Ruffle 的 hidden
+   * 分支会 enable_background_tick_mode() + startBackgroundTick()。前者
+   * 无害（只是停 rAF 自调度），后者会在后台按 24fps 往 core 灌时间戳，
+   * 与「冻结」直接冲突。startBackgroundTick 定义在原型上，实例属性
+   * 可以遮蔽，摘成空函数即可。
+   * 正常情况下这条根本用不上 —— 第 ③ 步拦掉了 Ruffle 的
+   * visibilitychange，它的 hidden 分支压根不会执行。
    * ------------------------------------------------------------------ */
   function disarm(p) {
     if (!p || p.__moleDisarmed) return;
@@ -1205,273 +1149,180 @@ exports.BaseEntity=N;exports.Button=Ri;exports.ButtonBaseView=L;exports.ButtonCo
       p.startBackgroundTick = function () { return false; };
       p.stopBackgroundTick = function () {};
       p.__moleDisarmed = 1;
-      log('已接管后台调度：Ruffle 的 setTimeout Worker 不再启用');
+      log('已摘掉 Ruffle 的后台 Worker（后台由壳层接管）');
     } catch (e) {}
   }
 
+  function volOf(inst) {
+    var v = 1;
+    try { v = inst.volume(); } catch (e) {}
+    if (typeof v !== 'number' || !(v >= 0)) v = 1;
+    return v;
+  }
+
   /* ------------------------------------------------------------------
-   * ② 单拍推进 —— 无论被节流成多慢，每次只喂 +FRAME_MS
+   * ② 音量渐变 —— 只在「冻结 / 恢复」两个瞬间用
    * ------------------------------------------------------------------
-   * 幂等：算出来没到一帧就直接返回。worklet 和 timer 可以同时叫它。
+   * 不常驻静音：它只负责把波形平滑地降/升到目标值，避免 suspend()
+   * 在非零振幅处硬切。被打断（又来一次冻结/恢复）时靠 token 作废。
    * ------------------------------------------------------------------ */
-  function pump() {
-    if (!bg.on) return;
-    var inst = core();
-    if (!inst) return;
-
-    var n = Math.floor((nowMs() - bg.ts) / FRAME_MS);
-    if (!(n > 0)) return;
-
-    if (n > CATCHUP_MAX) n = CATCHUP_MAX;
-    if (n > bg.catchup) bg.catchup = n;
-
-    for (var i = 0; i < n; i++) {
-      bg.ts += FRAME_MS;
-      try {
-        inst.tick_for_background(bg.ts);
-      } catch (e) {
-        warn('后台 tick 抛异常，停止后台时间轴：' + e);
-        stopAll();
-        return;
-      }
+  var fadeToken = 0;
+  function fade(inst, from, to, steps, gap, done) {
+    var t = ++fadeToken;
+    var i = 0;
+    function step() {
+      if (t !== fadeToken) return;
+      i++;
+      var v = from + (to - from) * (i / steps);
+      if (!(v >= 0)) v = 0;
+      if (v > 1) v = 1;
+      try { inst.set_volume(v); } catch (e) {}
+      if (i < steps) setTimeout(step, gap);
+      else if (done) done();
     }
-    bg.ticks += n;
-  }
-
-  /* ------------------------------------------------------------------
-   * ③ 节拍源 A：AudioWorklet（音频线程，不受页面节流）
-   * ------------------------------------------------------------------
-   * 每攒够一个影片帧的采样数就 postMessage 一次。输出全零、只接
-   * destination 当「心跳负载」，不产生任何声音，也不影响 Ruffle
-   * 自己那条音频链。
-   * ------------------------------------------------------------------ */
-  var WORKLET_SRC =
-    'class MoleTicker extends AudioWorkletProcessor {' +
-    '  constructor(o) { super();' +
-    '    this.acc = 0;' +
-    '    this.step = sampleRate / ((o && o.processorOptions && o.processorOptions.fps) || 24);' +
-    '    this.n = 0; }' +
-    '  process() {' +
-    '    this.acc += 128;' +
-    '    while (this.acc >= this.step) { this.acc -= this.step; this.n++; }' +
-    '    if (this.n > 0) { this.port.postMessage(this.n); this.n = 0; }' +
-    '    return true; }' +
-    '}' +
-    'registerProcessor("mole-ticker", MoleTicker);';
-
-  function startWorklet(ctx) {
-    if (!ctx || !ctx.audioWorklet || typeof AudioWorkletNode !== 'function') return;
-    var url = null;
-    try {
-      url = URL.createObjectURL(new Blob([WORKLET_SRC], { type: 'application/javascript' }));
-      ctx.audioWorklet.addModule(url).then(function () {
-        if (url) { try { URL.revokeObjectURL(url); } catch (e) {} }
-        if (!bg.on || bg.node) return;
-        try {
-          var node = new AudioWorkletNode(ctx, 'mole-ticker', {
-            processorOptions: { fps: FPS }
-          });
-          node.port.onmessage = function () { pump(); };
-          node.connect(ctx.destination);   // 只为被音频线程持续 pull
-          bg.node = node;
-          bg.mode = 'worklet';
-          log('后台节拍器：AudioWorklet（音频线程 ' + FPS + 'Hz，不受页面节流）');
-        } catch (e) {
-          warn('AudioWorkletNode 创建失败，降级到定时器：' + e);
-        }
-      }).catch(function (e) {
-        if (url) { try { URL.revokeObjectURL(url); } catch (e2) {} }
-        warn('AudioWorklet 加载失败，降级到定时器：' + e);
-      });
-    } catch (e) {
-      warn('AudioWorklet 不可用，降级到定时器：' + e);
+    if (!(steps > 0)) {
+      try { inst.set_volume(to); } catch (e) {}
+      if (done) done();
+      return;
     }
+    step();
   }
 
-  function stopWorklet() {
-    if (bg.node) {
-      try { bg.node.port.onmessage = null; } catch (e) {}
-      try { bg.node.disconnect(); } catch (e) {}
-      bg.node = null;
-    }
-  }
-
-  /* ------------------------------------------------------------------
-   * ④ 节拍源 B：定时器兜底
-   * ------------------------------------------------------------------
-   * 被节流到 1 秒一次也只是「一次补 24 帧」，每帧仍是 +FRAME_MS，
-   * 时间戳序列不会有任何跳变 —— 这正是它比 Ruffle 原方案安全的地方。
-   * ------------------------------------------------------------------ */
-  function startTimer() {
-    stopTimer();
-    bg.timer = setInterval(pump, POLL_MS);
-  }
-  function stopTimer() {
-    if (bg.timer) { clearInterval(bg.timer); bg.timer = null; }
-  }
-
-  /* ------------------------------------------------------------------
-   * ⑤ AudioContext 保活 —— 「后台继续放歌」的硬前提
-   * ------------------------------------------------------------------ */
-  function keepAudio(ctx, why) {
-    if (!ctx) return;
-    bg.ctx = ctx;
-    try {
-      if (ctx.state !== 'running' && typeof ctx.resume === 'function') {
-        var pr = ctx.resume();
-        if (pr && pr.catch) pr.catch(function () {});
-        log('AudioContext ' + ctx.state + ' → 已请求 resume（' + why + '）');
-      }
-    } catch (e) {}
-    if (!ctx.__moleAudioGuarded) {
-      ctx.__moleAudioGuarded = 1;
-      try {
-        ctx.addEventListener('statechange', function () {
-          if (!bg.on) return;
-          if (ctx.state !== 'running') {
-            try {
-              var q = ctx.resume();
-              if (q && q.catch) q.catch(function () {});
-            } catch (e) {}
-          }
-        });
-      } catch (e) {}
-    }
-  }
-
-  function stopAll() {
-    bg.on = false;
-    stopTimer();
-    stopWorklet();
-  }
-
-  /* ------------------------------------------------------------------
-   * 入口：Java onPause → 这里。幂等。
-   * ------------------------------------------------------------------ */
+  /* ==================================================================
+   * 进后台：淡出 → 原子冻结
+   * ================================================================== */
   window.__moleEnterBackground = function () {
     var p = playerEl();
     if (!p || !p.instance) return false;
     disarm(p);
-    if (bg.on) return true;
+    if (st.on) return true;              // 幂等：Java onPause 与 visibilitychange 各叫一次
 
     var inst = p.instance;
     var playing = false;
     try { playing = !!inst.is_playing(); } catch (e) {}
 
-    /* 游戏本来就是暂停态就不要维持时间轴了 ——
-       硬跑只会让「暂停中的游戏」在后台空转，纯耗电，还容易把
-       「暂停」这个状态在服务器侧搞脏。 */
-    if (!playing) {
-      log('进入后台：游戏本身处于暂停态，不启动后台时间轴');
-      return false;
-    }
+    st.on = true;                        // 第 1 段据此立刻冻结时钟
+    st.wasPlaying = playing;
+    st.since = nowMs();
+    st.vol = volOf(inst);
+    st.enters++;
 
-    bg.on = true;
-    bg.ts = nowMs();
-    bg.since = bg.ts;
-    bg.ticks = 0;
-    bg.catchup = 0;
-    bg.mode = 'timer';
-
-    /* 让 core 进后台模式：取消 rAF、tick 不再自调度。 */
-    try { inst.enable_background_tick_mode(); } catch (e) {}
-
-    /* 先救音频，再起节拍器：worklet 要挂在 running 的 context 上，
-       挂起的 context 不会 pull 音频线程，节拍器等于没装。 */
-    var ctx = null;
-    try { ctx = inst.audio_context(); } catch (e) {}
-    keepAudio(ctx, 'enterBackground');
-
-    startTimer();
-    if (ctx) startWorklet(ctx);
-
-    log('进入后台：固定步长 ' + FRAME_MS.toFixed(2) + 'ms 推进'
-      + '（音频上下文=' + (ctx ? ctx.state : 'none') + '）');
+    var v0 = st.vol;
+    fade(inst, v0, 0, FADE_OUT_STEPS, FADE_OUT_GAP, function () {
+      if (!st.on) return;                // 已经回到前台了，别冻
+      try { inst.pause(); } catch (e) { warn('pause() 失败：' + e); }
+      var ctx = null;
+      try { ctx = inst.audio_context(); } catch (e) {}
+      log('进入后台：逻辑与音频原子冻结'
+        + '（冻结时' + (playing ? '正在播放' : '本就是暂停态')
+        + '，音量 ' + Math.round(v0 * 100) + '% → 0'
+        + '，音频上下文=' + (ctx ? ctx.state : 'none') + '）');
+    });
     return true;
   };
 
-  /* ------------------------------------------------------------------
-   * 出口：Java onResume → 这里。
-   * ------------------------------------------------------------------ */
+  /* ==================================================================
+   * 回前台：静音 → 原子恢复 → 淡入
+   * ================================================================== */
   window.__moleLeaveBackground = function () {
     var p = playerEl();
-    var wasOn = bg.on;
-    var spent = wasOn ? Math.round(nowMs() - bg.since) : 0;
-    var out = {
-      ran: wasOn, ticks: bg.ticks, catchup: bg.catchup,
-      mode: bg.mode, aligned: false, ts: bg.ts, wallMs: spent
-    };
+    var inst = p && p.instance;
+    if (!st.on) return { ran: false };
 
-    stopAll();
+    var spent = Math.round(nowMs() - st.since);
+    var wasPlaying = st.wasPlaying;
+    var v = st.vol >= 0 ? st.vol : 1;
 
-    if (p && p.instance) {
-      /* 退后台模式并重新挂 rAF。Ruffle 的 visible 分支可能也调了一次
-         （WebView 派发了 visibilitychange 时）—— 第 0 段对同一回调
-         做了去重，多调一次不会变成双倍速。 */
-      try { p.instance.restart_animation_loop(); } catch (e) {}
-      try {
-        if (p.lastActivePlayingState && !p.instance.is_playing()) p.instance.play();
-      } catch (e) {}
+    st.on = false;
+    st.vol = -1;
+    st.wasPlaying = false;
+    st.lastGapMs = spent;
+    st.leaves++;
+
+    if (!inst) return { ran: true, wallMs: spent, resumed: false };
+
+    /* 先把音量压到 0：resume 之后第一块缓冲可能还带着挂起前的尾巴，
+       直接以原音量出声，接缝就是一声「啪」。 */
+    try { inst.set_volume(0); } catch (e) {}
+
+    var resumed = false;
+    if (wasPlaying) {
+      try { inst.play(); resumed = true; } catch (e) { warn('play() 失败：' + e); }
     }
 
-    /* 回前台再拉一次音频：后台若被系统挂起过，这里要立刻恢复，
-       否则第一帧音频得等好几秒才出声。 */
-    try {
-      var ctx = bg.ctx || (p && p.instance && p.instance.audio_context()) || null;
-      keepAudio(ctx, 'leaveBackground');
-    } catch (e) {}
+    /* 不调 restart_animation_loop()：
+       rAF 循环从头到尾没被 enable_background_tick_mode() 摘掉
+       （我们只摘了 Worker，且 Ruffle 的 visibilitychange 被拦掉），
+       页面前台后原生 rAF 自然继续。再调一次反而会多登记一条循环，
+       一帧推两帧逻辑 = 双倍速。 */
 
-    if (wasOn) {
-      /* 关键：把合成轴最后一帧交给第 0 段，让它从这里「接续」，
-         而不是对齐到真实时间。后台有欠账时，对齐 = 一次大 dt。 */
-      try { out.aligned = window.__moleAlignClock(bg.ts) === true; } catch (e) {}
-      warn('回到前台：后台推进 ' + out.ticks + ' 帧 / 墙钟 ' + spent + 'ms'
-        + '（单轮最多 ' + out.catchup + ' 帧，节拍器=' + out.mode + '）'
-        + (out.aligned ? '，时间轴已从合成轴接续，dt 仍为 '
-            + FRAME_MS.toFixed(2) + 'ms' : ''));
-    }
+    fade(inst, 0, v, FADE_IN_STEPS, FADE_IN_GAP, function () {
+      try { inst.set_volume(v); } catch (e) {}
+    });
 
-    bg.ticks = 0;
-    bg.catchup = 0;
-    return out;
+    var ctx = null;
+    try { ctx = inst.audio_context(); } catch (e) {}
+    warn('回到前台：后台冻结 ' + spent + 'ms（'
+      + (resumed ? '已原子恢复播放' : '保持暂停态')
+      + '，音量 0 → ' + Math.round(v * 100) + '%'
+      + '，音频上下文=' + (ctx ? ctx.state : 'none')
+      + '，时钟由第 1 段接续为 1 帧 dt）');
+    return { ran: true, wallMs: spent, resumed: resumed, vol: v };
   };
 
   /* ------------------------------------------------------------------
-   * 可见性兜底：WebView 自己派发 hidden（锁屏、分屏、下拉通知栏等
-   * 不走 Activity.onPause 的路径）时同样由壳层接管，别让 Ruffle
-   * 的默认分支把它静悄悄停住。
+   * ③ 拦掉 Ruffle 自己的 visibilitychange
+   * ------------------------------------------------------------------
+   * 它的 visible 分支是**无条件**的：
+   *     A === MainThread && (stopBackgroundTick(), restart_animation_loop())
+   *     lastActivePlayingState && instance.play()
+   *     instance.audio_context()?.resume()
+   * 也就是只要挂起前是 playing，回前台它就会自己 play() + resume()。
+   * 我们已经在 onResume 里做过一次原子恢复，它再来一次就是对正在
+   * 播放的流重复 resume —— 突发噪声的来源之一。
+   *
+   * 在 window 的捕获阶段先拿到事件并 stopImmediatePropagation()，
+   * document 上的监听器（Ruffle 的）就不会被调用。
    * ------------------------------------------------------------------ */
-  document.addEventListener('visibilitychange', function () {
-    var p = playerEl();
-    if (!p) return;
-    disarm(p);
-    if (document.hidden) {
-      /* 排到 Ruffle 自己的 handler 之后：它会调 enable_background_tick_mode，
-         我们需要那一步先落地。 */
-      setTimeout(function () { try { window.__moleEnterBackground(); } catch (e) {} }, 0);
-    } else if (bg.on) {
-      try { window.__moleLeaveBackground(); } catch (e) {}
-    }
-  }, true);
+  try {
+    window.addEventListener('visibilitychange', function (e) {
+      try { e.stopImmediatePropagation(); } catch (x) {}
+      if (document.hidden) {
+        /* 排一个 0ms 任务：让 Java 的 onPause 先落地，
+           两条路径只是幂等地进同一个状态。 */
+        setTimeout(function () {
+          try { window.__moleEnterBackground(); } catch (x) {}
+        }, 0);
+      } else {
+        try { window.__moleLeaveBackground(); } catch (x) {}
+      }
+    }, true);
+  } catch (e) {}
 
-  /* player 是本段之后异步创建的（wasm 加载完才有 instance），
-     所以这里持续盯一眼：成本可忽略，但能保证任何时候切后台都是我们接管。 */
+  /* 第 1 段在每帧 rAF 里问这一句：冻结期不推进虚拟时钟。
+     函数名保持无参、无副作用，随便问。 */
+  window.__moleBgFrozen = function () { return st.on; };
+
+  /* player 是异步创建的（wasm 加载完才有 instance），
+     持续盯一眼，保证任何时刻切后台都是我们接管。成本可忽略。 */
   setInterval(function () { disarm(playerEl()); }, 2000);
 
-  /* 诊断口子：__moleBg() 一次看全 */
+  /* 诊断口子：Java 侧 / 控制台一句 __moleBg() 看全 */
   window.__moleBg = function () {
     var p = playerEl();
-    var st = 'none';
-    try {
-      var c = bg.ctx || (p && p.instance && p.instance.audio_context());
-      if (c) st = c.state;
-    } catch (e) {}
+    var c = null;
+    try { c = (p && p.instance) ? p.instance.audio_context() : null; } catch (e) {}
     return {
-      on: bg.on, hidden: !!document.hidden,
-      mode: bg.mode, ticks: bg.ticks, catchup: bg.catchup,
-      ts: Math.round(bg.ts), audio: st,
+      frozen: st.on,
+      hidden: !!document.hidden,
+      wasPlaying: st.wasPlaying,
+      vol: st.vol,
+      enters: st.enters,
+      leaves: st.leaves,
+      lastGapMs: st.lastGapMs,
       disarmed: !!(p && p.__moleDisarmed),
       worker: !!(p && p.backgroundWorker),
+      audio: c ? c.state : 'none',
       playing: !!(p && p.instance && p.instance.is_playing())
     };
   };

@@ -167,92 +167,100 @@ console.log('=== 5) fps 仍然可调（节流器未被破坏） ===');
   ok('__moleSetFps(999) 被拒绝', env.window.__moleSetFps(999) === false);
 }
 
-console.log('=== 6) 后台真跑过 → 回前台对齐真实时间（不钳制） ===');
+console.log('=== 6) 后台冻结期：不推进虚拟时钟、不派发 ===');
 {
   const env = makeEnv();
   const seen = attachProbe(env.window);
-  let t = 0; env.frame(t);
+  let t = 0;
+  env.frame(t);
   for (let i = 1; i <= 10; i++) { t = i * 16.67; env.frame(t); }
-  ok('默认 pending=false', env.window.__moleClock().pending === false);
+  const before = seen.length;
+  const vBefore = env.window.__moleClock().vTs;
 
-  const bg = 300000;                          // 后台 5 分钟
-  env.window.__moleAlignClock();              // 第 6 段确认「后台真跑过」后调用
-  ok('调用后 pending=true', env.window.__moleClock().pending === true);
+  env.window.__moleBgFrozen = () => true;          // 第 6 段进入冻结
+  for (let i = 1; i <= 120; i++) { t += 16.67; env.frame(t); }   // 冻结 2 秒
 
-  env.frame(t + bg);
   const c = env.window.__moleClock();
-  ok('vTs 直接对齐到真实时间戳', near(c.vTs, t + bg, 0.01),
-     'vTs=' + c.vTs + ' ts=' + (t + bg));
-  ok('没有把后台时长记成「被切断」', c.stallMs === 0, 'stallMs=' + c.stallMs);
-  ok('探针收到的就是这个时间戳', near(seen[seen.length - 1], t + bg, 0.01),
-     'got=' + seen[seen.length - 1]);
-  ok('align 计数 +1', c.align === 1, 'align=' + c.align);
-  ok('pending 已复位', c.pending === false);
-
-  const v0 = seen[seen.length - 1];
-  for (let k = 1; k <= 3; k++) env.frame(t + bg + k * 16.67);
-  ok('随后 3 个真实帧推进约 50ms（恢复正常 24fps 节奏，无跳变）',
-     near(seen[seen.length - 1] - v0, 50.01, 0.05),
-     'advance=' + (seen[seen.length - 1] - v0).toFixed(2));
+  ok('冻结期一帧都不派发给 Ruffle', seen.length === before, 'got ' + (seen.length - before));
+  ok('虚拟时钟冻在原地', near(c.vTs, vBefore, 0.001), 'vTs=' + c.vTs + ' want=' + vBefore);
+  ok('frozen 计数 = 120', c.frozen === 120, 'frozen=' + c.frozen);
+  ok('不产生「被切断时间」（一帧都没漏）', c.stallMs === 0, 'stall=' + c.stallMs);
+  ok('冻结不触发后台恢复分支', c.resumes === 0, 'resumes=' + c.resumes);
 }
 
-console.log('=== 7) 后台跑过 → 回前台从合成轴接续（1.1.1 新行为） ===');
+console.log('=== 7) 解冻：dt 恒为 1 个帧长，绝不补帧 ===');
 {
+  /* 情形 A：WebView 在后台照样派 rAF（我们每帧都跳过了） */
   const env = makeEnv();
   const seen = attachProbe(env.window);
-  let t = 0; env.frame(t);
+  let t = 0;
+  env.frame(t);
   for (let i = 1; i <= 10; i++) { t = i * 16.67; env.frame(t); }
-  const vFront = env.window.__moleClock().vTs;
 
-  /* 后台合成轴：从上一帧起严格每帧 +41.666，跑了 720 帧（30 秒）。
-     注意它比真实时间略快/略慢都无所谓，重要的是「与真实时间脱钩」。 */
-  const FR = 1000 / 24;
-  const bgTs = vFront + 720 * FR;
-  env.window.__moleAlignClock(bgTs);
-  ok('调用后 pending=true', env.window.__moleClock().pending === true);
-
-  env.frame(t + 30000);                    // 真实时间过了 30 秒
-  const c = env.window.__moleClock();
-  ok('vTs 落在合成轴下一帧（不是真实时间）',
-     near(c.vTs, bgTs + FR, 0.01), 'vTs=' + c.vTs.toFixed(2) + ' want=' + (bgTs + FR).toFixed(2));
-  ok('core 侧看到的 dt 恒为 41.67（不跳变）',
-     near(c.vTs - bgTs, FR, 0.01), 'dt=' + (c.vTs - bgTs).toFixed(3));
-  ok('探针收到的就是这个值', near(seen[seen.length - 1], bgTs + FR, 0.01));
-
-  /* 之后前台恢复：真实 rAF 每 16.67ms 一次，vTs 按节流泵 24fps 推进 */
+  env.window.__moleBgFrozen = () => true;
+  for (let i = 1; i <= 3600; i++) { t += 16.67; env.frame(t); }   // 冻结 60 秒
+  const n0 = seen.length;
   const v0 = seen[seen.length - 1];
-  for (let k = 1; k <= 10; k++) env.frame(t + 30000 + k * 16.67);
-  const adv = seen[seen.length - 1] - v0;
-  ok('随后 10 个真实帧推进约 166.7ms（24fps，无加速）',
-     adv > 160 && adv < 175, 'advance=' + adv.toFixed(2));
-  ok('偏移保持不变（vTs 与真实时间同步走）',
-     near(env.window.__moleClock().vTs - (t + 30000 + 10 * 16.67), bgTs + FR - (t + 30000), 1.0),
-     'offset drift=' + (env.window.__moleClock().vTs - (t + 30000 + 166.7)
-       - (bgTs + FR - (t + 30000))).toFixed(2));
+
+  env.window.__moleBgFrozen = () => false;                        // 回前台
+  for (let i = 1; i <= 60; i++) env.frame(t + i * 16.67);         // 恢复后 1 秒
+
+  const got = seen.length - n0;
+  ok('恢复后 1 秒 ≈ 24 帧（不补那 60 秒）', got >= 22 && got <= 26, 'got=' + got);
+
+  let maxDt = 0;
+  for (let i = n0; i < seen.length; i++) maxDt = Math.max(maxDt, seen[i] - seen[i - 1]);
+  ok('恢复过程最大 dt < 60ms（不是 60 秒）', maxDt < 60, 'maxDt=' + maxDt.toFixed(2));
+  ok('恢复后 1 秒推进 ≈ 1000ms',
+     near(seen[seen.length - 1] - v0, 1000, 70),
+     'span=' + (seen[seen.length - 1] - v0).toFixed(1));
+  ok('没有产生「被切断时间」', env.window.__moleClock().stallMs === 0);
 }
 
-console.log('=== 8) 同一回调重复登记只保留一份（防双倍速） ===');
 {
-  /* Ruffle 的 visible 分支和壳层回前台都会调 restart_animation_loop()，
-     两次 requestAnimationFrame(同一个闭包)。不去重的话一帧 dispatch 两次，
-     Ruffle 一帧被推两帧逻辑 = 双倍速。 */
+  /* 情形 B：WebView 干脆不派 rAF（真 hidden），一帧跨掉整段后台 */
   const env = makeEnv();
-  const calls = [];
-  function cb(v) { calls.push(v); }
-  const id1 = env.window.requestAnimationFrame(cb);
-  const id2 = env.window.requestAnimationFrame(cb);
-  ok('两次登记返回不同 id', id1 !== id2, id1 + ' vs ' + id2);
+  const seen = attachProbe(env.window);
+  let t = 0;
+  env.frame(t);
+  for (let i = 1; i <= 10; i++) { t = i * 16.67; env.frame(t); }
 
-  env.frame(1000);       // 首帧只做初始化
-  env.frame(1041.67);    // 这一帧才 dispatch
-  ok('一帧只派发一次（不是两次）', calls.length === 1, 'calls=' + calls.length);
+  env.window.__moleBgFrozen = () => true;
+  env.window.__moleBgFrozen = () => false;        // 中间一帧都没来
+  const n0 = seen.length;
+  const v0 = seen[seen.length - 1];
 
-  /* 不同回调不受影响 */
-  const other = [];
-  env.window.requestAnimationFrame(function a(v) { other.push('a'); });
-  env.window.requestAnimationFrame(function b(v) { other.push('b'); });
-  env.frame(1083.34);
-  ok('两个不同回调都能派发', other.length === 2, 'got=' + other.join(','));
+  env.frame(t + 300000);                          // 5 分钟后第一帧
+  ok('只派发 1 帧', seen.length - n0 === 1, 'got=' + (seen.length - n0));
+  /* 注意：dt 不是数学上的 41.67，而是「上一帧剩下的累加量 + 这一帧的
+     41.67」。60Hz 真实帧重采样到 24fps，dt 本来就落在 33.3~58.4 之间
+     （1.0.5 起一直如此，与本次改动无关）。关键是它有上界 ——
+     绝不会等于挂起时长。 */
+  const dt = seen[seen.length - 1] - v0;
+  ok('dt 只有 1~1.5 个帧长（不是 300000）', dt >= 33 && dt < 60, 'dt=' + dt.toFixed(2));
+  ok('__moleClock 记了 1 次恢复', env.window.__moleClock().resumes === 1,
+     JSON.stringify(env.window.__moleClock()));
+  ok('切断时间 ≈ 300000 - 41.7',
+     near(env.window.__moleClock().stallMs, 300000 - 41.67, 60),
+     'stall=' + env.window.__moleClock().stallMs);
+}
+
+console.log('=== 8) 冻结标志本身是安全的 ===');
+{
+  const env = makeEnv();
+  attachProbe(env.window);
+  env.frame(0);
+  ok('未定义 __moleBgFrozen 时不影响出帧', (() => {
+    const n0 = env.window.__moleClock().vTs;
+    for (let i = 1; i <= 10; i++) env.frame(i * 16.67);
+    return env.window.__moleClock().vTs > n0;
+  })());
+  ok('__moleBgFrozen 返回 false 时正常出帧', (() => {
+    env.window.__moleBgFrozen = () => false;
+    const n0 = env.window.__moleClock().vTs;
+    for (let i = 11; i <= 20; i++) env.frame(i * 16.67);
+    return env.window.__moleClock().vTs > n0;
+  })());
 }
 
 console.log('\n' + (fail === 0 ? 'ALL PASS' : 'FAILED') + '  pass=' + pass + ' fail=' + fail);

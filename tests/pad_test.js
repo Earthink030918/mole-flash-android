@@ -303,8 +303,14 @@ console.log('=== 9) 后台恢复钩子 ===');
   const env = makeEnv({ vw: 2400, vh: 1080, stage: stageRectOf(2400, 1080) });
   env.tick(1);
   ok('__moleAfterResume 已定义', typeof env.win.__moleAfterResume === 'function');
+  const before = env.made.played;
   env.win.__moleAfterResume(120000);
-  ok('暂停态会被重新 play', env.made.played === 1, 'played=' + env.made.played);
+  /* 1.1.2 起 __moleAfterResume 只做「重新测量 + 重新贴边」。
+     播放状态由第 6 段的 __moleLeaveBackground 统一管（set_volume(0)
+     → play() → 淡入），这里再 play() 一次就是对同一条流重复 resume，
+     接缝上就是一声「啪」。 */
+  ok('恢复钩子不再擅自 play()', env.made.played === before,
+     'before=' + before + ' after=' + env.made.played);
 }
 
 console.log('=== 10) 退路：__molePad.off() 拆图层 ===');
