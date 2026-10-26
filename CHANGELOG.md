@@ -2,6 +2,40 @@
 
 格式参照 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## [1.1.5] - 2026-10-26（未发布，待真机验证）
+
+**修 1.1.4 自己引入的字节码错误：`MoleKeepAlive` 类根本加载不起来，服务从未被创建。**
+
+### 根因
+
+1.1.4 在 `onStartCommand` 里给 `ensureChannel()` 套了一层不需要的
+`try { } catch (Throwable) { }`。handler 里不用异常对象，因此没有
+`move-exception` 指令 —— **dex 规范要求 catch handler 入口必须是
+`move-exception`**，ART 的类验证直接拒绝这个类。结果：
+
+- 服务实例化失败；
+- Activity 侧 `startForegroundService()` 抛的异常又被 `catch (Throwable) {}` 吞掉；
+- 表现就是「通知永远不出现、切后台照样被杀」。
+
+1.1.4 的方向（`startForegroundService` + 申请通知权限）是对的，只是被这个
+形式错误整个废掉了。
+
+### Fixed
+
+- `onStartCommand` 删掉多余的外层 `try/catch`，只保留 `startForeground` 段，
+  handler 以 `move-exception` 开头
+- API 29+ 用三参 `startForeground(id, notification, FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)`
+- 渠道 `mole_bg` → `mole_bg_v2`，`IMPORTANCE_LOW` → `IMPORTANCE_DEFAULT`
+  （渠道建好后代码改不了重要性，只能换新 ID）
+- `onCreate` 增加「保活服务已创建」日志
+- 服务启动抽成 `startKeepAlive()`，新增 `onUserLeaveHint()` 与 `onPause()` 各调一次
+  （`onUserLeaveHint` 严格早于 `onPause`，避开 Android 12+ 的前台状态判定边界）
+
+### Unchanged
+
+`shell.html`、画幅 / 画质预算 / 帧率 / 节流器 / 服务器地址、`START_NOT_STICKY`
+保活策略、GPU 看门狗、OmniPad 触控层 —— 全部未动。
+
 ## [1.1.4] - 2026-10-26（未发布，待真机验证）
 
 **只修一件事：前台服务从来没真正成为前台服务，所以切后台照样被回收、通知也一直没出现。**
