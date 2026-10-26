@@ -2,6 +2,43 @@
 
 格式参照 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## [1.1.4] - 2026-10-26（未发布，待真机验证）
+
+**只修一件事：前台服务从来没真正成为前台服务，所以切后台照样被回收、通知也一直没出现。**
+
+### 根因
+
+`onPause()` 用 `startService()` 拉起 `MoleKeepAlive`，那只是「普通后台服务」：
+
+1. 应用一旦不可见，系统只给约 1 分钟宽限，随后
+   `Stopping service due to app idle` 直接把服务收掉；
+2. 没有「5 秒内 startForeground」的豁免窗口，服务里那句 `startForeground()`
+   在 Android 12+ 会抛 `ForegroundServiceStartNotAllowedException`，而 1.1.2 的
+   实现用 `catch (Throwable) {}` 把它静默吞掉了。
+
+结果：服务始终是普通后台服务，进程 `oom_adj` 停在 cached 档，切后台即被
+LMK 回收。1.1.3 的 `setRendererPriorityPolicy` / `onRenderProcessGone` 只是让
+「渲染进程被回收」不再直接 `killProcess`，没有改变「进程本身是 cached 优先级」。
+
+同时 `POST_NOTIFICATIONS` 从未申请（`targetSdk = 35`，Android 13 起通知是运行时
+权限），所以系统设置里「允许通知」一直是关的。
+
+### Fixed
+
+- `onPause()` 改用 `startForegroundService()`（API 26+），< 26 保留 `startService`
+- `onCreate()` 末尾调用新增的 `requestNotifyPermission()`：API 33+ 检查并申请
+  `POST_NOTIFICATIONS`
+- `MoleKeepAlive`：`ensureChannel` / `buildNotification` / `startForeground` 各自
+  兜底，保证 `startForeground` 一定被执行；失败时用 `Log.e(tag, msg, throwable)`
+  打全堆栈，不再无声无息
+- 通知小图标 `@mipmap/ic_launcher` → `android.R.drawable.stat_notify_sync`
+  （单色，且不会因 APK 资源 ID 解析失败而连累 `startForeground`）
+
+### Unchanged
+
+`shell.html`、画幅 / 画质预算 / 帧率 / 节流器 / 服务器地址、`START_NOT_STICKY`
+保活策略、GPU 看门狗、OmniPad 触控层 —— 全部未动。
+
 ## [1.1.3] - 2026-10-26（未发布，待真机验证）
 
 **只修一件事：切到后台之后 App 自己没了，切回来是从头启动的。**
