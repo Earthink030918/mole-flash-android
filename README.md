@@ -400,12 +400,14 @@ OmniPad 解析失败（WebView 内核过旧）时只打一条日志，游戏照�
 
 ## 版本与更新日志
 
-当前 **v1.1.0**（2026-10-25，线上版本）。`1.1.1`（2026-10-26）已出包，
-正在等待真机验证，暂未发布。完整记录见 [CHANGELOG.md](CHANGELOG.md)，
+当前 **v1.1.0**（2026-10-25，线上版本）。`1.1.1`～`1.1.4-beta`
+（2026-10-26 ～ 11-03，versionCode 18）都已出包，正在等待真机验证，
+暂未发布。完整记录见 [CHANGELOG.md](CHANGELOG.md)，
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
 | 版本 | 要点 |
 | --- | --- |
+| **1.1.4-beta** | 修「打开好友列表 / 进入好友聊天框卡顿」：根因在 Ruffle 的 canvas 设备字体渲染器 —— 它声明 `has_kerning_info() = true`，于是 core 在每行文本布局时对**每一对相邻字符**调 `calculate_kerning()`，而该方法内部是 **3 次 `measure_text`**（wasm→JS 边界 + 浏览器 shaping 栈）。好友列表一屏 30 个昵称、聊天框一屏 20×20 字 ≈ 1800 次，且每来一条消息/滚一格都重排 → 持续卡。本版把 `measureText` 做成**纯记忆化**（key 含 `ctx.font`，只缓存 ≤8 字短串，上限 4096 条，返回值逐字段一致 → 排版不变），把 3N 次压到 O(不同字符数)；另修 `devicePixelRatio` getter 每帧两次强制布局（并消除 DPR 抖动触发 canvas 重建的风险）、console 丢弃路径、触控板每秒强制布局、软键盘每 800ms 重写样式；新增默认关闭的长帧探针 `__molePerf`。画幅/画质/帧率/节流器/输入法配置全未动（待群友验证，未发布） |
 | **1.1.3-beta** | 把屏幕键盘还原成普通文本框：① **撤掉「暂时关闭英文字母」**——拼音本来就以字母进来，屏蔽字母等于把中文输入法一起废掉，现在只过滤控制字符；② `type="text"` 保留，移除 `autocapitalize`/`inputmode`，不指定键盘形态与语言倾向，组合期零派发、`compositionend` 后再提交汉字；③ 修「点输入框键盘闪退」——Ruffle 的 `#virtual-keyboard` 原本在视口外（`top:-100px`），聚焦时滚不动就被系统收回，改为视口内 1px `opacity:.01` 元素，并包装 `openVirtualKeyboard` 把 `focus()` 拉回用户手势同步栈；④ 防抖从「延迟 80ms 清空」改为「同步清空 + 回声/前缀 diff/`inputType=delete` 去重」；⑤ 键盘占屏期间跳过 `visualViewport` 的等比适配，画幅不跳。画幅/帧率/节流器/quality 全未动（待群友验证，未发布） |
 | **1.1.2-beta** | ① 画质：修 1.1.1-beta 的**欠采样**——目标像素改为 `min(屏幕原生像素, max(显示面积×1.44, BUDGET), BUDGET×1.6, MAXPIX)`，手机横屏 canvas 786×458 → **1242×725**（放大率 2.75× → 1.74×）、竖屏几乎 1:1，平板像素数不变；显存只多一块 1242×725 RGBA 缓冲 ≈ +2.06MB。**没有**动 `quality`（Ruffle 里它只映射 MSAA 采样数，High 会让渲染目标显存 ×4）。② 软键盘防抖：Ruffle 的 `virtualKeyboardInput()` 逐字符重发 `#virtual-keyboard` 的 value，Android 输入法组合期 value 是整段拼音且清空不生效 → `wwwoooooaaaannn` 长串；改为捕获阶段拦截、前缀 diff 只发增量、组合期零派发、`compositionend` 再提交，并**暂时屏蔽英文字母**（`__moleKb.latin(true)` 恢复）。画幅/帧率/节流器全未动（待群友验证，未发布） |
 | **1.1.1-beta** | ① `targetSdkVersion` 35 → **31**（只动这一项，`minSdk`/`compileSdk` 不变，32/33/34/35+ 设备仍兼容），修鸿蒙 4.2 兼容；② 修 16:10 平板「没有触控板」——`MIN_BAR 44→30`、`EDGE_GUARD 20→12`，四边都不合格时改用右侧中部 60x72 半透明窄板兜底，并新增「右上角三连击拆除 OmniPad」自救手势；③ 渲染预算从固定 90 万像素改为**按实际显示面积自适应**（小屏 −40% 像素省显存，大屏 +53% 提密度）。画幅/帧率/节流器/quality 全未动（待群友验证，未发布） |

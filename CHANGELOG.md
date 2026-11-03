@@ -2,6 +2,77 @@
 
 格式参照 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## [1.1.4-beta] - 2026-11-03（未发布，待群友验证）
+
+基线 1.1.3-beta（versionCode 17）→ 本版 `1.1.4-beta`（versionCode 18）。
+只改 `assets/ruffle/shell.html`。画幅、画质、帧率、节流器、输入法配置**一律未动**。
+
+修「打开好友列表 / 进入好友聊天框卡顿」，并顺手拆掉壳层自己每秒/每帧的几处浪费。
+
+### 1) 根因：canvas 设备字体渲染器的字距计算（引擎侧，已对着源码核对）
+
+为了显示中文，从 1.1.0 起 `deviceFontRenderer: 'canvas'`
+（`embedded` 只有 Noto Sans，无 CJK 字形）。这条路径的
+`web/src/ui/canvas_font_renderer.rs` 里有
+`fn has_kerning_info(&self) -> bool { true }`，于是 core 在**每行文本布局**时
+对**每一对相邻字符**调 `calculate_kerning()`，而它内部是
+
+```rust
+let left_width  = self.calculate_width(&left.to_string())?;         // measure_text
+let right_width = self.calculate_width(&right.to_string())?;        // measure_text
+let both_width  = self.calculate_width(&format!("{left}{right}"))?; // measure_text
+```
+
+即 **1 个字符对 = 3 次 `measure_text`**，每次都要过 wasm → JS 边界并走浏览器
+整条字体 shaping 栈。好友列表一屏 30 个昵称、聊天框一屏 20 行 × 20 字
+≈ 600 个字符对 ≈ **1800 次**；而聊天框每来一条消息、光标闪一次、滚一格都重排整行
+→ 这个量级**持续**发生。地图里没有成片动态文本，所以只有这两个界面卡。
+
+第二条成本是 `render_glyph_internal()`：每个新字形的
+`clear_rect + fill_text + get_image_data`（**同步 GPU 回读**）+ 图集上传，
+打开好友列表＝一次冒出几百个新汉字。这一条要拿像素就绕不开，壳层无法消除。
+
+### 2) 修：`measureText` 记忆化（本版主修）
+
+包装 `OffscreenCanvasRenderingContext2D.prototype.measureText`
+（顺带包 `CanvasRenderingContext2D`），同样 `(font, text)` 只真算一次，
+之后返回第一次的 `TextMetrics` 对象。key 含 `ctx.font`；只缓存 ≤ 8 字符的短串；
+上限 4096 条，满了整批丢弃；`document.fonts.ready` 后清一次兜底；
+`__moleText.stats()` 暴露命中率。**返回值与原来逐字段一致**，排版不会变。
+
+### 3) `devicePixelRatio` 记忆化
+
+`RuffleHandle::tick()` 每帧读一次 `window.devicePixelRatio`（源码注释
+`// Changes via user zooming.`），而我们的 getter 每次
+`getElementById('wrap') + offsetWidth/offsetHeight` = 两次强制同步布局；
+且两次 tick 之间只要值差一个 ulp，Ruffle 就走
+`canvas.set_width/set_height + set_viewport_dimensions`，把渲染目标和全部
+位图纹理重建一遍。缓存后返回值恒定，正常游玩期间该分支永不触发。
+失效点：resize（`__moleFit` → `refreshShownArea`）、预算变更、`__moleDprRefresh()`。
+
+### 4) 另外三处壳层浪费
+
+- console 管道：旧实现无论哪一级都先 `String()` 全部参数拼 `rawAll` 再判级别；
+  改为先判级别，丢弃路径零字符串工作；`[MoleShell]` 白名单改判首字符。
+- 触控板轮询：`setInterval(applyLayout, 1000)` 每秒一次
+  `getBoundingClientRect()`（强制布局）+ 无条件重写 `#pad` 的 className，
+  改为先比 `innerWidth/innerHeight/visualViewport.scale` 签名，没变直接返回。
+- 软键盘补挂：不再每 800ms 把 20 条 `!important` 样式重写一遍，
+  已挂好且元素存活时立刻返回；样式只在换元素时写一次。
+
+### 5) 诊断：长帧探针（默认关闭）
+
+`__molePerf.on()` 用**原生** rAF 采样（帧率泵把 `requestAnimationFrame` 限到了
+24fps，用被限过的那个量不到长帧），>120ms 记一行 logcat，带文本缓存命中率、
+时间轴钳制状态、DPR、canvas 尺寸。不开则一个 rAF 都不注册，零成本。
+
+### 6) 验证
+
+新增 `tests/text_test.js`（24 项）钉死缓存语义：同一 (font,text) 只算一次、
+font 进 key、长串/空串透传、上限、双原型、异常不缓存。`1.1.4-beta` 全绿；
+`clock_test` 34/34、`bg_test` 54/54 不受影响；`pad_test` 的 79/17 是
+1.1.1-beta 改几何后未同步更新的既有红，与本次无关。
+
 ## [1.1.3-beta] - 2026-11-03（未发布，待群友验证）
 
 基线 1.1.2-beta（versionCode 16）→ 本版 `1.1.3-beta`（versionCode 17）。
