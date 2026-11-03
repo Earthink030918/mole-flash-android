@@ -1329,7 +1329,7 @@
  * ================================================================== */
 window.__molePerf = (function () {
   var raf = window.__moleNativeRaf || window.requestAnimationFrame;
-  var on = false, running = false;
+  var on = false, running = false, pending = false;
   var last = 0, frames = 0, longN = 0, longMax = 0;
   var win = [];                 // 最近 240 帧的间隔，用来算 p50 / p95
   var startedAt = 0, lastLog = 0;
@@ -1354,7 +1354,9 @@ window.__molePerf = (function () {
   }
 
   function tick(ts) {
+    pending = false;
     if (!on) { running = false; return; }
+    pending = true;
     raf(tick);
     if (!last) { last = ts; startedAt = ts; return; }
     var dt = ts - last;
@@ -1378,7 +1380,9 @@ window.__molePerf = (function () {
   return {
     on: function () {
       on = true; last = 0;
-      if (!running) { running = true; raf(tick); }
+      /* pending 判断避免 on/off 快速切换时叠出第二条 rAF 循环 */
+      if (!running) { running = true; }
+      if (!pending) { pending = true; raf(tick); }
       console.log('[MoleShell] 长帧探针已开启（__molePerf.off() 关闭）');
       return true;
     },
