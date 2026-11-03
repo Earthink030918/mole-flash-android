@@ -2,6 +2,46 @@
 
 格式参照 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## [1.1.1-beta] - 2026-11-03（未发布，待群友验证）
+
+基线为已发布的 V1.1.0 谱系；本版号 `1.1.1-beta`（versionCode 15）。
+
+### 1) targetSdk 35 → 31（只动这一项 SDK）
+
+- 唯一位置：`apktool.yml` 的 `sdkInfo.targetSdkVersion`
+- `minSdkVersion: 21`、`compileSdkVersion: 35` 均未动
+- `targetSdkVersion` 只决定运行时行为档位，不决定安装门槛，因此 32/33/34/35+
+  设备仍可正常安装运行，并会回退到 API 31 的兼容行为集
+- 通知权限 / 前台服务 / PendingIntent / `android:exported` 四处受降档影响的行为
+  现有代码已全部覆盖
+
+### 2) 平板触控
+
+- **根因**：16:10 平板（1280x800 CSS）上舞台 960x560 铺满后上下黑边仅约 27px，
+  而 `MIN_BAR = 44` 且先扣 `EDGE_GUARD 20 + STAGE_GAP 6` → 四条边全不合格 →
+  `computeLayout()` 返回 null → **整块触控板不挂**
+- `EDGE_GUARD` 20→12、`STAGE_GAP` 6→4、`MIN_BAR` 44→30
+- 四边都不合格时不再放弃：`edgeFallback()` 在**屏幕右侧中部**挂 60x72 半透明
+  窄板（刻意避开右下操作区，`opacity: .45`，可 `__molePad.off()` 拆除）
+- 新增自救手势：右上角 120x120 内快速点三下 → 立即拆除 OmniPad 回原生触控
+- 新增几何诊断日志（viewport / 舞台显示尺寸 / DPR / 四边黑边 / 落点）
+
+### 3) 降内存 + 提像素密度
+
+- **根因**：`BUDGET` 是固定 90 万像素，而 `#wrap` 布局尺寸恒为 960x560，
+  DPR 被钉死在 1.294 → canvas 恒定 1242x725，与实际显示面积脱钩：
+  小屏过采样浪费显存、大屏欠采样发糊
+- 改为按实际显示面积自适应（目标 ×1.44 面积超采样），并受
+  `Java档位×1.6`、`160万` 硬上限、`Java档位×0.4` 下限三重约束
+- 实测：小屏 0.90M→0.54M px（−40%），大屏平板 0.90M→1.38M px（+53%）
+- `getBoundingClientRect` 只在 fit / resize / 预算变更时测一次并缓存，
+  避免 getter 高频触发布局抖动
+
+### Unchanged
+
+`#wrap` 尺寸与 `transform: scale(f)`、帧率 24、节流器、`quality`、服务器地址、
+画幅 —— 全部未动。
+
 ## [1.1.5] - 2026-10-26（未发布，待真机验证）
 
 **修 1.1.4 自己引入的字节码错误：`MoleKeepAlive` 类根本加载不起来，服务从未被创建。**
