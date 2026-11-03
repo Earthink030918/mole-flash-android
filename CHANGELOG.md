@@ -2,6 +2,63 @@
 
 格式参照 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## [1.1.3-beta] - 2026-11-03（未发布，待群友验证）
+
+基线 1.1.2-beta（versionCode 16）→ 本版 `1.1.3-beta`（versionCode 17）。
+只改 `assets/ruffle/shell.html`，Java 壳层与画幅/帧率/节流器全部未动。
+
+### 1) 撤掉「暂时关闭英文字母」
+
+拼音就是以字母进来的。1.1.2-beta 把 `a-zA-Z` 全丢，等于把中文输入法一起废掉；
+不走 `composition` 事件、只靠 `input` 逐字上报的输入法（部分 ROM 自带输入法、
+五笔/双拼）更是直接打不出字。用户侧感受就是「输入框被锁成英文模式」。
+
+现在 `sanitize()` 只过滤控制字符，字母/数字/符号/汉字全部放行；
+`__moleKb.latin()` 保留为空壳（恒 `true`），旧调用不报错。
+
+### 2) 输入框还原成普通文本
+
+保留 `type="text"`，**移除** `autocapitalize="none"` 与任何 `inputmode`，
+不指定键盘形态与语言倾向；`autocomplete`/`autocorrect`/`spellcheck` 仍关闭
+（避免联想替换游戏文本）。中文完全交给系统输入法：组合期零派发、不清空 value，
+`compositionend` 之后才提交汉字。
+
+### 3) 键盘「闪退」的两个成因
+
+- **隐藏输入框在视口外**：Ruffle 的 `#virtual-keyboard` 是
+  `position:absolute; top:-100px`。Android WebView 聚焦视口外的可编辑元素会先
+  尝试滚过去，而 `#wrap` 是 `overflow:hidden`、舞台又是 `transform: scale()`，
+  滚不动 → 键盘弹起后立刻被系统收回。改为视口内 1px 元素，
+  `opacity:0.01`（不能 0，部分 ROM 用可见性判定能否弹键盘）、`pointer-events:none`。
+- **`openVirtualKeyboard()` 的 `setTimeout(0)`**：点 Flash 输入框瞬间
+  `has_focus()` 为假，永远走 `setTimeout` 分支，已跳出用户手势的同步栈，
+  WebView 放行弹键盘的窗口很窄。包装该方法，在手势栈里先同步 `focus()`，
+  成功就不再走延时分支。
+
+### 4) 防抖从「延迟清空」改为「同步清空 + 状态去重」
+
+1.1.2-beta 的 80ms 延迟清空本身就是新问题源：输入法通过 `InputConnection`
+同步该 value，延迟窗口里会把旧内容写回来（重复），还会和下一次按键抢缓冲。
+
+现在：回声 60ms 去重、前缀 diff 只发增量、`inputType` 以 `delete` 开头只清空
+不重发、同字符 35ms 抖动丢弃、100ms 内 >12 字符突发丢弃。
+`prevText` 在清空输入框后保留，供退格与前缀判断使用。
+
+### 5) 键盘弹出时不再重做等比适配
+
+4.4 段的 120ms `visualViewport.resize` 防抖正好落在键盘弹起动画中间，重算
+`#wrap` + 改 `transform` 等于在键盘刚出现时重排画面：闪一下，还会让 WebView
+重新判定焦点。新增 `kbOpen()`（覆盖式/挤压式两种系统行为），键盘占屏期间
+直接跳过 refit，画幅保持不变。
+
+### 未改动
+
+画幅 / 帧率 24 / rAF 节流器 / `quality` / 渲染分辨率预算 / OmniPad /
+服务器地址 / Java 壳层（`startForegroundService`、`MoleKeepAlive`、
+`onRenderProcessGone`、`setRendererPriorityPolicy`）。
+
+---
+
 ## [1.1.2-beta] - 2026-11-03（未发布，待群友验证）
 
 基线为 1.1.1-beta 的工作区；本版号 `1.1.2-beta`（versionCode 16）。只改
