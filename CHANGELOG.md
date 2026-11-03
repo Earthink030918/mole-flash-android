@@ -2,6 +2,39 @@
 
 格式参照 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## [1.1.2-beta] - 2026-11-03（未发布，待群友验证）
+
+基线为 1.1.1-beta 的工作区；本版号 `1.1.2-beta`（versionCode 16）。只改
+`assets/ruffle/shell.html`，Java 壳层未动。
+
+### 1) 画质：修 1.1.1-beta 的欠采样
+
+- **根因**：1.1.1-beta 的目标像素 = 显示面积 × 1.44，再被
+  `Math.max(eff, BUDGET*0.4)` 兜底。这条兜底在手机上把 DPR 打到 0.818
+  （canvas 786×458），却要铺满 2160×1260 个物理像素 —— 放大 2.75 倍，
+  画面自然糊。**问题不是 `quality`，是渲染分辨率不够。**
+- **修法**：目标像素 = min(屏幕原生像素, max(显示面积×1.44, BUDGET), BUDGET×1.6, MAXPIX)。
+  原生像素封顶（超采样纯浪费显存），基准档兜底（不低于 v1.1.0 的观感）。
+- 手机横屏 canvas 786×458 → **1242×725**（放大率 2.75× → 1.74×），
+  竖屏 1.60× → **1.01×**（几乎 1:1）；16:10 平板像素数**一个没变**。
+- 显存：手机 +一块 1242×725 RGBA 后备缓冲 ≈ **+2.06MB**，其余缓冲与预算档位不变。
+- **没有**动 `quality`：Ruffle 的 `StageQuality::sample_count()` 是
+  Low=1 / Medium=2 / High=4，提高它会让渲染目标显存 ×2~4，与「内存不变」冲突，
+  且只影响边缘抗锯齿，对「糊」无改善。
+- 画幅 / 帧率 / rAF 节流器 / 服务器地址，全部未动。
+
+### 2) 软键盘输入防抖 + 暂时关闭英文字母
+
+- **根因**：Ruffle 的 `virtualKeyboardInput()` 把 `#virtual-keyboard` 的 value
+  **逐字符**拆成 keydown+keyup 派发再清空。Android 输入法组合未结束时 value 里是
+  整段拼音，且置空不会重置组合缓冲（InputConnection 会同步回来）—— 每敲一键就重发
+  全部内容，逐层叠加成 `wwwwoooooaaaannnniiii`。
+- **修法**：在 `ruffle-player` 捕获阶段拦下 input 事件（早于 Ruffle 的监听），
+  `stopImmediatePropagation()` 后自己做：前缀 diff 只发增量、组合期间零派发、
+  `compositionend` 再提交、屏蔽 a-zA-Z、同字符 35ms 去重、100ms 内超 8 字符丢弃、
+  退格不重发、元素重建自动重挂。
+- 开关：`__moleKb.latin(true)` 恢复英文字母，`__moleKb.state()` 看状态。
+
 ## [1.1.1-beta] - 2026-11-03（未发布，待群友验证）
 
 基线为已发布的 V1.1.0 谱系；本版号 `1.1.1-beta`（versionCode 15）。
