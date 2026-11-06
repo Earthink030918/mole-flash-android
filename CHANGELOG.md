@@ -2,6 +2,74 @@
 
 格式参照 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## [1.1.5-beta] - 2026-11-06（未发布，待群友验证）
+
+基线 1.1.4-beta（versionCode 18）→ 本版 `1.1.5-beta`（versionCode 19）。
+只改 `assets/ruffle/shell.html` 与 `assets/ruffle/mole_boot.js`。
+画幅、画质、帧率、节流器、像素预算、输入法配置、Java 壳层**一律未动**。
+
+修「华为 MatePad 11 / 鸿蒙 4.2 运行中红屏 + Ruffle 崩掉 + 登录后卡死」。
+
+### 1) 红屏是 Ruffle 的 panic 面板
+
+`ruffle.js` 里 `#panic{background:linear-gradient(180deg,#fd3a40,#fda138)}` ——
+用户看到的红橙渐变就是它。`player.panic(err)` 渲染完面板立刻 `this.destroy()`，
+所以"整个 ruffle 崩溃"是准确的：wasm 已 panic，播放器对象被销毁。
+`panic()` 的调用点只有 6 处：core js/wasm 下载失败、`instance.build()`（渲染后端创建）
+失败、SWF 下载失败、SWF 解析失败、配置非法、reload 重入保护。
+
+### 2) 原来的 panic 兜底是死代码
+
+```js
+var types = ['loadedmetadata', 'loadeddata', 'progress', 'error', 'panic', ...];
+p.addEventListener('panic', function () { MoleBridge.onPanic(); });
+```
+
+Ruffle 全程只派发 `loadedmetadata` / `loadeddata` 两个 CustomEvent，
+`"panic"` 在 bundle 里只有 1 处、是 `rt()` 里的 DOM id。
+→ `MoleBridge.onPanic()` **一次都没被调用过**，Java 那套"空白页 2s → 重载"
+入口是空的，红屏之后既无动作也无日志。
+
+### 3) 面板在 shadowRoot 里
+
+`panic()` 把面板 append 到 `this.container`，而
+`this.container = this.shadow.getElementById("container")`（`attachShadow` 内）。
+`player.querySelector('#panic')` 永远查不到 → 侦测必须走 `player.shadowRoot`
+且要 `childList + subtree`。
+
+### 4) 就算触发了也修不好：后端写死，引擎自己的退路走不到
+
+`web/src/builder.rs`：`renderer_list = ["wgpu-webgl","webgpu","webgl","canvas"]`，
+只在**创建失败**时往下 `for` 继续。而 wgpu 在华为 / Adreno 驱动上是在**绘制阶段**
+炸的（`create_render_pipeline` 着色器校验、device lost），创建那一步是成功的 →
+webgl / canvas 两级永远试不到，重载多少次都同一后端，必然复现。
+壳层 `MainActivity.preferredRenderer()` 是常量 `"wgpu-webgl"`，
+注释里承诺的"崩过一次就降一档"从未实现。
+
+### 改动
+
+- `mole_boot.js`：新增 `watchPanic`/`onPanicDom`/`panicText`/`hasPanic`——
+  shadowRoot `MutationObserver(childList+subtree)` + 5s 巡视兜底；抽出
+  `#panic-title`/`#panic-body`/详情 `textarea` 压成一行写 logcat；每个播放器
+  只处理一次；删掉死的 `'panic'` 监听。
+- `shell.html` 第 0.3 段：后端降级阶梯 `wgpu-webgl → webgl → canvas`，
+  存 `localStorage['mole_renderer_tier']`，**只在本机真的 panic 过之后**生效；
+  按 panic 文本判定（命中 wgpu/webgl/context/pipeline/shader/texture… 才降级，
+  内容类 panic 不降级）。
+- 恢复策略：`sessionStorage` 计会话内 panic 次数，上限 4 次，到顶停手留红屏；
+  先走 `MoleBridge.onPanic()`（Java 空白页 2s → 重载，给 GPU 释放显存），
+  若被 Java 侧 15s 防抖挡掉（等于没做），6s 后面板仍在 → 页面自行 `reload()`。
+- 诊断：启动/挂载时打 `player.rendererDebugInfo`（实际选中的后端与 Adapter）；
+  新增主线程冻结看门狗（1s 打点，断流 >8s 且页面可见就记一行，只记不重载）。
+
+### 验证
+
+`node tests/panic_test.js` → ALL PASS 34/34（新增）；`clock_test` 34/34、
+`bg_test` 54/54、`text_test` 24/24 全绿；`pad_test` 79/17 为 1.1.1-beta 改几何后的
+既有红。包内 shell.html 189,886 B / mole_boot.js 19,614 B 与工作副本逐字节一致。
+产物 `mole-1.1.5-beta.apk`，10,331,524 B，SHA-256
+`3b859f78ac35649630d4781cb637e53c5358f81826ef64f7c9b7ed9f1cc9bee9`。
+
 ## [1.1.4-beta] - 2026-11-03（未发布，待群友验证）
 
 基线 1.1.3-beta（versionCode 17）→ 本版 `1.1.4-beta`（versionCode 18）。

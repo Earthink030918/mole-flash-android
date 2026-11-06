@@ -1,6 +1,6 @@
 # 离线断言测试
 
-这三个脚本**不 mock 逻辑**，而是从 `src/web/shell.html` 里按标记切出真实代码块，
+这些脚本**不 mock 逻辑**，而是从 `src/web/shell.html` 里按标记切出真实代码块，
 塞进 `vm` 沙箱里跑。所以测的就是打进安装包的那一份，不是另外抄的一份。
 
 ```bash
@@ -9,6 +9,7 @@ node tests/bg_test.js       # 54 项：后台保活状态机
 node tests/pad_test.js      # 96 项：触控板落点与生命周期（1.1.1-beta 改几何后
                             #        未同步更新，现为 79/17 的既有红）
 node tests/text_test.js     # 24 项：文本度量记忆化（1.1.4-beta）
+node tests/panic_test.js    # 34 项：panic 面板侦测 + 后端降级（1.1.5-beta）
 ```
 
 全部通过时输出 `ALL PASS`，退出码 0；有失败项退出码 1。

@@ -395,6 +395,54 @@
   window.__moleRenderer = RENDERER;
   /* raw 已在 0.2 段开头提前捕获（此处不能再读 devicePixelRatio） */
 
+  /* ------------------------------------------------------------------
+   * 0.3) 渲染后端「panic 降级」档位（1.1.5-beta）
+   * ---------------------------------------------------------------
+   * 现象（华为 MatePad 11 / 鸿蒙 4.2 反馈）：
+   *   运行中整屏变成红橙渐变 + 一句 "Something went wrong :("，
+   *   随后 Ruffle 彻底停摆；有时已经登录进游戏了才出现卡死。
+   *
+   * 那块红屏不是我们的页面，是 **Ruffle 自己的 panic 面板** ——
+   * ruffle.js 里 `#panic` 的样式就是
+   *   background: linear-gradient(180deg,#fd3a40,#fda138)
+   * 也就是说 wasm 侧真的 panic 了，player 已经 destroy()。
+   *
+   * 为什么必须在这一层做档位：
+   *   Ruffle 的 create_renderer() 只在「后端**创建**失败」时才会按
+   *   wgpu-webgl → webgpu → webgl → canvas 往下退（web/src/builder.rs）。
+   *   而 wgpu 在部分华为 / Adreno 驱动上是在**绘制阶段**才炸的
+   *   （create_render_pipeline 的着色器校验、device lost），
+   *   创建那一刻是成功的 —— 它自己的退路根本走不到。
+   *   所以只能由壳层记住「这台机器在这个后端上炸过」，下次换下一个。
+   *
+   * 档位：0 wgpu-webgl（默认，功能最全）
+   *       1 webgl      （原生 WebGL1 后端，完全绕开 wgpu 管线，观感基本一致）
+   *       2 canvas     （纯软件，最后兜底；慢，但一定出画面）
+   * 只有本机真的 panic 过才会往下走，正常设备一个字节都不会变；
+   * 画幅 / 帧率 / 节流器 / 像素预算 / 输入法配置都不动。
+   * ------------------------------------------------------------------ */
+  var RENDERER_LADDER = ['wgpu-webgl', 'webgl', 'canvas'];
+  var rendererTier = 0;
+  try {
+    rendererTier = parseInt(localStorage.getItem('mole_renderer_tier') || '0', 10);
+    if (!isFinite(rendererTier) || rendererTier < 0) rendererTier = 0;
+  } catch (e) { rendererTier = 0; }
+  if (rendererTier > RENDERER_LADDER.length - 1) rendererTier = RENDERER_LADDER.length - 1;
+  if (rendererTier > 0) {
+    RENDERER = RENDERER_LADDER[rendererTier];
+    window.__moleRenderer = RENDERER;
+  }
+  window.__moleRendererTier = rendererTier;
+  window.__moleBootAt = Date.now();
+  /* 由 panic 侦测器调用：档位 +1 并落盘，下一次（重载之后）生效。
+     返回新的后端名；已经到底 / 落盘失败则返回 null。 */
+  window.__moleRendererBump = function () {
+    var next = Math.min(rendererTier + 1, RENDERER_LADDER.length - 1);
+    if (next === rendererTier) return null;
+    try { localStorage.setItem('mole_renderer_tier', String(next)); } catch (e) { return null; }
+    return RENDERER_LADDER[next];
+  };
+
   function computeNow() {
     var w = document.getElementById('wrap');
     var lw = (w && w.offsetWidth) || window.__moleMovieW || 960;
@@ -881,6 +929,7 @@
     try { MoleBridge.log('[cfg] socketProxy 条目=' + proxy.length
         + ' | 字体渲染=canvas(跟随手机)'
         + ' | 后端=' + (window.__moleRenderer || '?')
+        + '（降级档位=' + (window.__moleRendererTier || 0) + '）'
         + ' | 预算=' + BUDGET + 'px'
         + ' | DPR raw=' + window.__moleDprRaw + ' 钳制后=' + window.__moleDprCap.toFixed(2)
         + ' | 缩放=' + (window.__moleFitScale || 1).toFixed(3)
