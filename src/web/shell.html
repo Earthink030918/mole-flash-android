@@ -1804,6 +1804,31 @@ exports.BaseEntity=N;exports.Button=Ri;exports.ButtonBaseView=L;exports.ButtonCo
       layout: { stickySelector: '#wrap' }
     });
 
+    /* 输入法守卫：正在输入时不让焦点被抢回画布；被浏览器默认行为清掉就下一拍抢回。
+       不加这段的话，点一下输入框键盘弹出会立刻缩回（要双击才停住）。
+       三段分别对应：A 拦 OmniPad 的 ensureFocus（它最终就是调 canvas.focus）；
+       B 记住「这一下是手指点的」；C 兜住靶区 div 被点导致 activeElement 被清空（不经过 JS）。
+       `_fixed` 是防循环：同一次点击最多抢一次。没有它的话，打字时手指移动会让
+       OmniPad 反复触发 ensureFocus，叠加 400ms/16ms = 最多 25 轮抢焦点，表现为打字卡顿。
+       if 是防御：tests/pad_test.js 的桩里 shadowRoot 只有 querySelector，
+       真机上才有 addEventListener —— 缺少方法时静默跳过，不打断 mount 后续逻辑。 */
+    var _sh = playerEl() && playerEl().shadowRoot, _cv = canvasEl();
+    if (_sh && _cv && _sh.addEventListener) {
+      var _box = _sh.querySelector('#container'), _tapAt = 0, _fixed = false, _of = _cv.focus;
+      _cv.focus = function () {                                       // A
+        if (_sh.activeElement && _sh.activeElement.id === 'virtual-keyboard') return;
+        return _of.apply(this, arguments);
+      };
+      document.addEventListener('pointerdown', function () { _tapAt = Date.now(); _fixed = false; }, true);   // B
+      _sh.addEventListener('focusout', function (e) {                  // C
+        if (!e.target || e.target.id !== 'virtual-keyboard' || e.relatedTarget === _box) return;
+        if (_fixed || Date.now() - _tapAt > 400) return;   // 一次点击只抢一次；非手指触发不抢
+        _fixed = true;
+        var v = e.target;
+        setTimeout(function () { if (_sh.activeElement !== v) v.focus({ preventScroll: true }); }, 16);
+      }, true);
+    }
+
     log('OmniPad 已挂载：舞台靶区');
 
     /* 1.1.1-beta：把几何一次性打进日志 —— 平板/分屏出问题时，

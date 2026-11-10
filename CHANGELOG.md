@@ -2,6 +2,60 @@
 
 格式参照 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## [1.1.7-beta] - 2026-11-10（未发布，待群友验证）
+
+基线 1.1.6-beta（versionCode 20）→ 本版 `1.1.7-beta`（versionCode 21）。
+只改 `assets/ruffle/shell.html`，**纯插入 24 行**，其余逐字节未动。
+
+修「点输入框键盘弹出后立刻缩回，要双击才停住」。
+
+群友提供的文件经 diff 确认是 **1.0.7 基线 + 24 行输入法守卫**
+（`diff -u patches/1.0.7/shell.html` 只有一处 `+24`）。若整体覆盖会退回
+1.1.1~1.1.5 五批修复，包括像素预算（画面发糊）、平板触控兜底、
+键盘闪退修复、好友列表文本缓存、华为红屏后端降级。因此只取那 24 行，
+原样并入 1.1.6 的 OmniPad 挂载点，群友代码一个字符未改。
+
+插入位置：第 5.4 段 `mount()` 内，`new OP.TargetZone(...)` 之后、
+`log('OmniPad 已挂载：舞台靶区')` 之前。
+
+三段守卫：
+
+- **A** 包一层 `canvas.focus` —— `shadow.activeElement` 已是 `#virtual-keyboard`
+  就直接返回。OmniPad 的 `ensureFocus()` 最终调 `canvas.focus`，拦这里即堵死抢焦点。
+- **B** `pointerdown` 记时间戳 —— 区分"手指点的"与"浏览器自己触发的 focusout"。
+- **C** 监听 shadow `focusout` —— `#virtual-keyboard` 失焦且未转给 `#container`
+  时，16ms 后抢回；`_fixed` 保证一次点击最多抢一次，否则打字时手指微动会被
+  OmniPad 反复 `ensureFocus`，最多 25 轮抢焦点、表现为打字卡。
+
+`if (_sh && _cv && _sh.addEventListener)` 是给测试桩留的防御
+（`tests/pad_test.js` 的 shadow 桩只有 `querySelector`）。
+
+未动：像素预算（`budgetNow` / `MAXPIX` / `DENSITY` / `__moleDprCap`）、画幅、
+画质、帧率、节流器、时间轴钳制、Ruffle 配置、文本度量缓存、后端降级阶梯、
+`mole_boot.js`、任何 smali。逐段哈希核对四项全相同；把 24 行摘掉后文件与改动前逐行相同。
+
+验证：内联脚本 3 块 0 错误；clock 34 / bg 54 / text 24 / panic 34 全绿；
+pad_test 79/17（改动前、改动后、1.1.5-beta 三者一致，既有红）。
+产物 10,384,772 B，SHA-256 `ae3f372c…fff7`。
+
+## [1.1.6-beta] - 2026-11-10（未发布，待群友验证）
+
+基线 1.1.5-beta（versionCode 19）→ 本版 `1.1.6-beta`（versionCode 20）。
+**只换 ruffle 引擎三份文件，壳层与 smali 一个字节未改。**
+
+群友新编的三份文件替换进 `assets/ruffle/`：`ruffle.js`（685,811 → 692,938 B）、
+`ruffle_web_bg.FQNOL64Y.wasm.gz`、`ruffle_web-wasm_mvp_bg.VMZCVK47.wasm.gz`。
+注意两个 wasm 是**新哈希名**（旧 `K7CA3GNA` / `JBAFOQXG`），不是同名覆盖；
+新版 `ruffle.js` 里写死的就是新名，旧文件从此无人引用。
+
+Java 侧 `wasmResponse()` 是通配实现（`assets/ruffle/<请求名>.gz` + `GZIPInputStream`），
+所以新哈希名自动命中，smali 未改一行。
+
+`apktool.yml` 改两处：版本号顺延；`doNotCompress` 补两条新 wasm 路径以保持 Stored。
+
+随后清掉两个死重量（`JBAFOQXG` 4,961,250 B + `K7CA3GNA` 4,943,838 B）并去掉
+对应两条 `doNotCompress`，重打同版本号：20,289,089 → 10,384,772 B（−48.8%）。
+
 ## [1.1.5-beta] - 2026-11-06（未发布，待群友验证）
 
 基线 1.1.4-beta（versionCode 18）→ 本版 `1.1.5-beta`（versionCode 19）。
