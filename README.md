@@ -23,6 +23,7 @@
 
 - [这是什么](#这是什么)
 - [功能特性](#功能特性)
+- [1.2.0 更新摘要](#120-更新摘要)
 - [实机截图](#实机截图)
 - [下载与安装](#下载与安装)
   - [Android](#android)
@@ -71,21 +72,43 @@
 
 - 网页版整套流程走通：登录 → 选服 → 家园 → 地图 → 小游戏
 - 画面与官方电脑微端窗口的呈现一致：`960x560` 原生画幅、`contain` 等比缩放、多余部分留黑边（不是裁切）
+- **画质按屏幕补足**（1.2.0）：渲染分辨率取「显示面积 × 1.7」与屏幕原生像素的较小值，另设 121 万像素地板。
+  平板 `1669×974`、手机 `1440×840`，物理放大 1.29×~1.53×；
+  1.2.0 之前的最坏档位只有 `759×443`、放大 3.37×，就是那屏马赛克
 
 **稳**
 
 - **切后台不掉线**：Ruffle 走 `backgroundExecutionMode: 'mainThread'`，Worker 里按 41.67ms 持续推进，
   回到前台时间轴连续，不会一次性补帧、补定时器，也不会因此触发服务器的时序校验
 - **双层时间轴保护**：即使 Worker 起不来，壳层的虚拟时间轴仍会把 `>800ms` 的间隔钳制为「只推进 1 帧」
+- **后台不丢进程**（1.2.0）：`MoleKeepAlive` 前台服务 + `RENDERER_PRIORITY_IMPORTANT` +
+  `onRenderProcessGone` 接管善后；切后台时逻辑与音频**原子冻结**（冻结前 70ms 淡出、回前台 120ms 淡入），
+  既不爆音也不会被系统顺手回收
 - **断线重连**：`SocketBridge` 上下行对称关闭 + 有界线程池，避免线程泄漏导致的假死
 - **无损纹理回收**：长跑显存吃紧时，用跨帧抖动让 Ruffle 重建渲染目标，**只归还纹理、不降画质**
-- **崩溃自动降档**：连续异常启动时逐级下调像素预算（6 档，121 万 → 21 万），不再无限重载
+- **崩溃自动降档**：连续异常启动时逐级下调像素预算（6 档，121 万 → 21 万），不再无限重载；
+  1.2.0 起给参与算 DPR 的预算加了地板，降档照常生效但不会再被拖进马赛克档
+- **红屏自愈**（1.2.0）：华为 / Adreno 上 wgpu 是在**绘制阶段** panic，Ruffle 自己的后端退路走不到。
+  侦测 `shadowRoot` 里的 `#panic` 面板（Ruffle 只派发 `loadedmetadata` / `loadeddata`，
+  监听 `'panic'` 事件是死代码），按 panic 文本判定渲染类 / 内容类，渲染类才降后端
+  `wgpu-webgl → webgl → canvas`，结果存 `localStorage`、只在本机真崩过之后才往下走，会话内上限 4 次
 
 **好操作**
 
 - **虚拟触控板**（[OmniPad](https://github.com/omnipad-js/omnipad)）：黑边里的摇杆式光标控制，专治「悬停才展开」的 PC 交互
 - **靶区（TargetZone）**：单指直接点舞台，命中位置精确到像素，穿透 Ruffle 的 Shadow DOM
 - **触控板不压画面**：只挂在黑边里，四边都没有余量时自动不显示
+- **16:10 平板也有板子**（1.2.0）：黑边判定放宽到 `MIN_BAR 30` / `EDGE_GUARD 12`；
+  四边仍不合格时在屏幕右侧中部挂 60×72 半透明窄板兜底，右上角 120×120 内连点三下可拆除 OmniPad 回原生触控
+- **打字正常**（1.2.0）：点输入框**一次**即弹键盘（24 行焦点守卫，`_fixed` 保证一次点击只抢一次）、
+  拼音不再重复成 `wwwoooooaaaannnn`、中文可正常上屏；键盘占屏期间不重做等比适配，画幅不跳
+
+**快**
+
+- **好友列表 / 聊天框不卡**（1.2.0）：Ruffle 的 canvas 字体渲染器声明 `has_kerning_info() = true`，
+  每行文本要对**每对相邻字符**调 `calculate_kerning()`，内部是 3 次 `measure_text`。
+  把 `measureText` 做成纯记忆化（key 含 `ctx.font`，只缓存 ≤8 字短串，上限 4096 条，返回值逐字段一致 → 排版不变），
+  3N 次压到 O(不同字符数)
 
 **省**
 
@@ -95,7 +118,66 @@
 **可诊断**
 
 - 页面 `console` 全量转发到 `logcat` / `hilog`，HUD 可开关
-- 三个调试口：`__moleClock()`、`__molePad.state()`、`__molePurgeTex()`
+- **渲染实况**（1.2.0）：启动 3 秒后打一行
+  `[MoleShell] 渲染实况 budget=… DPR=… canvas=宽x高 元素=宽x高 显示=宽x高`。
+  `canvas/元素` 大于 1.6 说明画面发虚、大于 2.5 就是马赛克，画质问题不用再猜
+- 调试口：`__moleClock()`、`__molePad.state()`、`__molePurgeTex()`，
+  以及默认关闭的长帧探针 `__molePerf.on()`（用原生 rAF，不叠循环）
+
+---
+
+## 1.2.0 更新摘要
+
+1.2.0 不是「加功能」的版本，是把 v1.1.0 之后 `versionCode 9 → 24` 的 15 轮迭代收成一个正式版。
+按「新增了什么」和「修了什么」分开列，细节与证据见 [docs/release-1.2.0.md](docs/release-1.2.0.md)。
+
+### 新增
+
+| 能力 | 说明 |
+| --- | --- |
+| 渲染分辨率地板 | `BUDGET_MIN = 1210000`（= 档位 0），`DENSITY 1.44 → 1.7`、`MAXPIX 160万 → 220万`、`FLOOR 0.5 → 0.7`。崩溃史与显存看护照常降档，但不会再降到马赛克档 |
+| 渲染实况诊断 | 启动 3 秒后一行日志，给出预算 / 生效 DPR / canvas 尺寸 / 元素尺寸 / 显示尺寸，可当场判断是分辨率不够还是别的原因 |
+| 红屏 panic 侦测 | `shadowRoot` 的 `MutationObserver(childList + subtree)` + 5s 巡视兜底；把 `#panic-title` / `#panic-body` / 详情压成一行写 logcat |
+| 渲染后端降级阶梯 | `wgpu-webgl → webgl → canvas`，存 `localStorage`，只在本机真 panic 过后才向下走；按 panic 文本区分渲染类 / 内容类，会话内上限 4 次防无限闪烁 |
+| 输入法焦点守卫 | 24 行：包 `canvas.focus`、`pointerdown` 记时间戳、shadow `focusout` 时 16ms 抢回；`_fixed` 保证一次点击只抢一次焦点 |
+| 文本度量缓存 | `measureText` 纯记忆化，含 `ctx.font` 的 key，只缓存 ≤8 字短串，返回值逐字段一致 |
+| 前台服务保活 | `MoleKeepAlive` + 通知（`mediaPlayback` 类型）+ `POST_NOTIFICATIONS`；`onRenderProcessGone` 接管 WebView 渲染进程崩溃 |
+| 平板兜底触控板 | 黑边常量放宽 + 右侧中部 60×72 窄板兜底 + 右上角三连击拆除 OmniPad |
+| 长帧探针 | `__molePerf`，默认关闭，用原生 rAF 并加 pending 守卫，避免叠出两条循环 |
+| 第三代引擎 | `ruffle.js` 692,223 B + `I56A2W5M` / `EFKRKUVC` 两个 wasm（两端哈希一致） |
+
+### 修复
+
+| 症状 | 根因 | 位置 |
+| --- | --- | --- |
+| 一进游戏整屏马赛克 | `evaluateLoadLevel()` 把**连崩次数**当降载档位，`PIXEL_BUDGETS` 最低档 210,000 → DPR 0.79 → canvas `759×443` 铺 `2304×1344`，放大 3.37× | `shell.html` |
+| 点输入框键盘弹出即缩回 | `#virtual-keyboard` 在视口外（`top:-100px`），`#wrap` 是 `overflow:hidden` 且舞台带 `transform: scale()`，滚不过去 | `shell.html` |
+| 拼音重复成 `wwwoooooaaaannnn` | `virtualKeyboardInput()` 逐字符重发 value，组合期 value 是整段拼音 | `shell.html` |
+| 中文打不出来 | 1.1.2-beta 曾「暂时屏蔽 a-zA-Z」，等于把拼音入口堵死 | `shell.html` |
+| 点一次停不住，要双击 | OmniPad 的 `ensureFocus()` 反复把焦点抢回 canvas | `shell.html` |
+| 好友列表 / 聊天框卡顿 | 字体渲染器每对相邻字符 3 次 `measure_text`，一屏 ≈1800 次，每来消息/滚一格都重排 | `shell.html` |
+| 华为 / Adreno 红屏后死循环 | 监听的 `'panic'` 事件是死代码 + 面板在 shadowRoot 内 + 后端常量无绘制阶段退路 | `shell.html` / `mole_boot.js` |
+| 切后台被回收 / 回前台自动重启 | 后台服务未 `startForeground`、渲染进程优先级默认、WebView 崩溃默认 `killProcess` | Java 壳层 |
+| 16:10 平板整块触控板消失 | `MIN_BAR 44` 且先扣 `EDGE_GUARD 20 + STAGE_GAP 6`，四条边全不合格 → `computeLayout()` 返回 null | `shell.html` |
+
+### 没有动的
+
+画幅（`960×560` + letterbox、`#wrap` 尺寸与 `transform`）、帧率 24、rAF 节流器、
+`quality`（已核实与分辨率无关，`stage.rs::set_quality()` 只存值 + 请求重绘）、
+`PIXEL_BUDGETS` 档位数组、无损纹理回收策略、输入法的 `type` / `inputmode` 语义、
+服务器地址与端口池、OmniPad 逻辑。
+
+### 两端差异
+
+| 项 | Android 1.2.0 | HarmonyOS 1.2.0 |
+| --- | --- | --- |
+| 画质地板 | 有 | **有**（本次新合入，MatePad `1242×724 → 1669×974`） |
+| 引擎 | 第三代 | 第三代（同步） |
+| 文本度量记忆化 | 有 | 无 |
+| 渲染后端降级 | 有 | 无（依赖安卓侧 `__moleRendererBump` 桥） |
+| panic 面板侦测 | 有 | 无（`mole_boot.js` 仍是 10-21 版） |
+
+这三项没合入鸿蒙，是因为鸿蒙壳层是 1.1.1 的分叉，硬塞要重测整条输入法 / 节流通道——正好是红线所在。
 
 ---
 
@@ -178,7 +260,7 @@ c8b99da639c9f9598898ac2c1822127c7e89024c107d7ff0465442c61e113af5  mole-harmony-1
 | 项 | Android | HarmonyOS |
 | --- | --- | --- |
 | 最低系统 | Android 5.0（API 21） | HarmonyOS 5.0.0（API 12） |
-| targetSdk | 35 | 12 |
+| targetSdk | 31（`compileSdk` 仍是 35） | 12 |
 | 架构 | arm64-v8a（WebView 需 64 位） | arm64-v8a |
 | 设备类型 | 手机、平板 | 手机、平板、2in1（`phone` / `tablet` / `2in1`） |
 | 屏幕方向 | 手机锁横屏，平板跟传感器 | 横屏（`orientation: landscape`） |
@@ -319,6 +401,8 @@ hap-sign-tool verify-app ...     # 期望 Digest verify result: true
 | 切后台回来被踢下线 | `onPause` 里 `pause()` + `pauseTimers()` 让 rAF 停摆，返回时首个 `dt` = 挂起时长，一次 tick 连跑 5 帧 + 定时器全补 | 后台真跑（`mainThread` tick）+ 虚拟时间轴钳制双保险 |
 | 悬停菜单点不到 | 触摸 down/up 同帧完成，`rollOver` 算出来时手已抬起 | 触控板拖动只移光标，轻点才按下；PC 式交互还原 |
 
+1.2.0 再补四类——画质地板、输入法、文本卡顿、红屏降级，汇总见 [1.2.0 更新摘要](#120-更新摘要)。
+
 每章的源码依据、实测数据、失败过的尝试都写在 [docs/architecture.md](docs/architecture.md)。
 
 ---
@@ -350,16 +434,20 @@ Flash 时代的 AS3 游戏大量依赖「鼠标悬停」：光标停在按钮上
 **落点策略**（1.0.7 重写，不再压画面）：
 
 ```
-优先 右 → 左 → 下 → 上 → 不挂
-EDGE_GUARD=20  STAGE_GAP=6  MIN_BAR=44  MAX_BAR=220  PAD_RATIO=0.93
-竖条：avail = 黑边宽 - 26；w = min(avail, 220)；h = clamp(w / 0.93, 96, 屏高 * 0.5)
+优先 右 → 左 → 下 → 上 → 右侧窄板兜底 → 不挂
+EDGE_GUARD=12  STAGE_GAP=4  MIN_BAR=30  MAX_BAR=220  PAD_RATIO=0.93
+竖条：avail = 黑边宽 - EDGE_GUARD - STAGE_GAP(=16)；w = min(avail, 220)；h = clamp(w / 0.93, 96, 屏高 * 0.5)
 ```
 
 板子做成接近正方（高/宽 ≈ 0.93）而不是细长条，是因为 OmniPad 的 `TrackpadCore.processInput`
 以**板子自身尺寸**换算位移（`dx / rect.width`）——窄长板会让竖直方向的速度只有水平的 1/5。
 
-四边都没有可用黑边时（例如 16:9 满幅），**不挂板子**，只保留 `TargetZone`，绝不覆盖游戏画面。
+四边都没有可用黑边时（例如 16:10 平板、16:9 满幅），1.2.0 起不再直接放弃：
+先挂一块 **60×72、`opacity:.45` 的窄板**在屏幕右侧中部（垂直居中，避开右下操作区），
+仍然过不了才彻底不挂，只保留 `TargetZone`，绝不覆盖游戏画面。
 转屏时每秒重算一次，自动拆 / 重建。
+
+觉得窄板碍事：右上角 120×120 内连点三下即可拆除回原生触控，或控制台 `__molePad.off()`。
 
 调试口子：
 
@@ -380,7 +468,13 @@ OmniPad 解析失败（WebView 内核过旧）时只打一条日志，游戏照�
 - **服务器地址是「种子 + 学习」两段式**，种子失效后依赖运行时补录，不保证长期有效
 - **后台仍耗电**：`tick_for_background` 内部就是完整 `tick()`（含 `core.render()`），
   切后台后 GPU 与电量照常消耗。这是「不被踢」的代价，不做后台降帧
-- **Adreno 驱动**在 wgpu 下过不了某些着色器校验会 panic，只能靠清空重载兜底——引擎 + 驱动层问题，改代码无解
+- **Adreno 驱动**在 wgpu 下过不了某些着色器校验会 panic，只能靠清空重载兜底——引擎 + 驱动层问题，改代码无解。
+  1.2.0 起会侦测到 panic 面板并按文本自动降后端（`wgpu-webgl → webgl → canvas`），但降级只在本机真崩过之后才生效，
+  首次崩溃仍需重开一次
+- **鸿蒙壳层缺三项修复**：文本度量记忆化、渲染后端降级、panic 面板侦测。鸿蒙侧本次只合入了画质地板，
+  差异见 [1.2.0 更新摘要](#两端差异)
+- **HAP 的 `targetAPIVersion` 仍是 API 12**，抬到 6.0 / 7.0 必须重新编译 ArkTS；新系统上以兼容模式运行
+- **1.1.4 ~ 1.1.9 未做长跑验证**：画质、输入法、红屏降级三条都只在离线断言与短时真机上验过
 - **鸿蒙零售机可能拒绝侧载**：见 [HarmonyOS 安装](#harmonyos) 说明
 - `resources.arsc` 未解析成明文，清单里资源 ID 仍是 `@7F020000` 形式
 - Ruffle 二进制、游戏资源都不在仓库内
@@ -394,6 +488,8 @@ OmniPad 解析失败（WebView 内核过旧）时只打一条日志，游戏照�
 | 症状 | 关键日志 | 处理 |
 | --- | --- | --- |
 | 切后台回来被踢 | `长间隔 …ms → 只推进 1 帧` | Worker 没起来，抓 `Unable to create background Worker` |
+| 画面发虚 / 整屏马赛克 | `[MoleShell] 渲染实况 budget=… DPR=… canvas=… 元素=…` | 看 `canvas/元素`：大于 1.6 发虚、大于 2.5 就是马赛克。1.2.0 起预算有地板，若这行仍显示 `canvas` 远小于元素尺寸，把日志发出来 |
+| 整屏橙红渐变 | `!! panic 文本:` | 那是 Ruffle 的 panic 面板，不是渲染错误。1.2.0 起会按文本自动降后端，重开一次即可 |
 | 板子不见了 | `本机四边都没有可用黑边` | 该机型黑边过窄，属预期行为；`__molePad.corner(true)` 可强制显示 |
 | 舞台点不动 | — | 控制台执行 `__molePad.off()`，立即恢复原生触控并反馈问题 |
 
@@ -408,7 +504,7 @@ OmniPad 解析失败（WebView 内核过旧）时只打一条日志，游戏照�
 
 | 版本 | 要点 |
 | --- | --- |
-| **1.2.0** | 正式版。Android 内容 = 1.1.9-beta，只去掉 `-beta`（10,356,100 B，SHA-256 `b776302b…1714`）；HarmonyOS 首次同步新引擎（`EFKRKUVC` / `I56A2W5M`）并合入画质地板（11,465,574 B，SHA-256 `c8b99da6…3af5`）。相对 v1.1.0 的累积变化：画质、输入法、卡顿、红屏、后台存活、平板触控、引擎换代七组，画幅/帧率/节流器/`quality`/预算档位/回收策略/服务器地址一律未动 |
+| **1.2.0** | 正式版。新增 / 修复清单见上方 [1.2.0 更新摘要](#120-更新摘要)。Android 内容 = 1.1.9-beta，只去掉 `-beta`（10,356,100 B，SHA-256 `b776302b…1714`）；HarmonyOS 首次同步新引擎（`EFKRKUVC` / `I56A2W5M`）并合入画质地板（11,465,574 B，SHA-256 `c8b99da6…3af5`）。相对 v1.1.0 的累积变化：画质、输入法、卡顿、红屏、后台存活、平板触控、引擎换代七组，画幅/帧率/节流器/`quality`/预算档位/回收策略/服务器地址一律未动 |
 | **1.1.9-beta** | 修「一进游戏整屏马赛克」。根因不是新引擎，是 `evaluateLoadLevel()` 把**连崩次数**当降载档位（`PIXEL_BUDGETS` 最低档 210,000 → DPR 0.79 → canvas 759×443 铺 2304×1344，放大 3.37×）。给参与算 DPR 的预算加地板 `BUDGET_MIN = 1210000`（= 档位 0），并把 `DENSITY 1.44→1.7`、`MAXPIX 160万→220万`、`FLOOR 0.5→0.7`：平板 759×443 → **1669×974**（放大 1.53×，优于 1.1.7 基线的 1.67×）。档位数组/显存看护/降载接口/无损纹理回收/画幅/帧率/节流器/输入法全未动；加一行 `[MoleShell] 渲染实况` 诊断（3s 打一次，`canvas/元素 > 1.6` 即发虚、`> 2.5` 即马赛克）。顺带核实 `quality: 'low'` 与分辨率无关（`stage.rs::set_quality()` 只存值 + 请求重绘） |
 | **1.1.8-beta** | 第二次换引擎（`MK7STBFJ` / `JTCYPQ5T`），`ruffle.js` 692,938 → 691,942 B；鸿蒙 `rawfile` 侧顺带删掉 10-21 遗留的两个死 wasm（20 MB → 10 MB） |
 | **1.1.7-beta** | 修「点输入框键盘弹出后立刻缩回，要双击才停住」。群友给的文件经 diff 确认是 **1.0.7 基线 + 24 行输入法守卫**（`diff -u patches/1.0.7/shell.html` 只有一处 `+24`），若整体覆盖会退回 1.1.1~1.1.5 五批修复（像素预算→画面发糊、平板触控兜底、键盘闪退、好友列表文本缓存、华为红屏后端降级）。因此只取那 24 行原样并入 1.1.6 的 OmniPad 挂载点：**A** 包 `canvas.focus`，`shadow.activeElement` 已是 `#virtual-keyboard` 就返回（OmniPad `ensureFocus()` 最终就是调它）；**B** `pointerdown` 记时间戳区分手指触发；**C** shadow `focusout` 时 16ms 抢回，`_fixed` 保证一次点击只抢一次（否则打字时手指微动会被反复触发，最多 25 轮抢焦点→打字卡）。纯插入，其余 2152 行逐字节未动；像素预算/DPR/画幅/画质/帧率/节流器/Ruffle 配置逐段哈希相同（待群友验证，未发布） |
