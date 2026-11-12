@@ -35,10 +35,12 @@
 - [目录结构](#目录结构)
 - [四个核心问题的解法](#四个核心问题的解法)
 - [触控方案：为什么是 OmniPad](#触控方案为什么是-omnipad)
+- [输入法：键盘为什么弹不出来](#输入法键盘为什么弹不出来)
 - [已知限制](#已知限制)
 - [排障](#排障)
 - [版本与更新日志](#版本与更新日志)
 - [参与贡献](#参与贡献)
+- [贡献者](#贡献者)
 - [许可证](#许可证)
 - [第三方组件](#第三方组件)
 - [免责声明](#免责声明)
@@ -101,7 +103,8 @@
 - **16:10 平板也有板子**（1.2.0）：黑边判定放宽到 `MIN_BAR 30` / `EDGE_GUARD 12`；
   四边仍不合格时在屏幕右侧中部挂 60×72 半透明窄板兜底，右上角 120×120 内连点三下可拆除 OmniPad 回原生触控
 - **打字正常**（1.2.0）：点输入框**一次**即弹键盘（24 行焦点守卫，`_fixed` 保证一次点击只抢一次）、
-  拼音不再重复成 `wwwoooooaaaannnn`、中文可正常上屏；键盘占屏期间不重做等比适配，画幅不跳
+  拼音不再重复成 `wwwoooooaaaannnn`、中文可正常上屏；键盘占屏期间不重做等比适配，画幅不跳。
+  五层断点与修法见 [输入法：键盘为什么弹不出来](#输入法键盘为什么弹不出来)
 
 **快**
 
@@ -462,6 +465,108 @@ OmniPad 解析失败（WebView 内核过旧）时只打一条日志，游戏照�
 
 ---
 
+## 输入法：键盘为什么弹不出来
+
+这是本仓库里坑最深的一块。表现有四种，看起来像四个 bug，其实是**同一套输入链路上的四层断点**：
+
+| 症状 | 根因所在层 |
+| --- | --- |
+| 点输入框，键盘闪一下立刻缩回 | 元素位置（视口外） |
+| 点了要等一秒才弹，或者弹出即收 | 用户手势栈（`setTimeout` 丢了授权） |
+| 拼音打出来是 `wwwoooooaaaannnn` | 事件层（Ruffle 逐字符重发 value） |
+| 点一次停不住，要双击才稳 | 焦点层（OmniPad 抢回 canvas） |
+| 中文根本打不出来 | 过滤层（曾误屏蔽 a-zA-Z） |
+
+### 第一层：元素必须在视口内
+
+Ruffle 的 `#virtual-keyboard` 原本是 `position:absolute; top:-100px` —— 在视口之外。
+Android WebView 聚焦视口外的可编辑元素时，会先尝试把它滚进可视区；而 `#wrap` 是
+`overflow:hidden`、舞台又带 `transform: scale()`，**滚不动** → 系统判定聚焦失败，键盘弹起即收回。
+
+改成视口内的 1px 元素：
+
+```css
+position: fixed; left: 0; top: 0; width: 1px; height: 1px;
+opacity: .01; z-index: -1; pointer-events: none;
+color: transparent; -webkit-text-fill-color: transparent; caret-color: transparent;
+```
+
+三个不能省的细节：
+
+- **`opacity` 不能用 `0`**。部分 ROM 的 WebView 用可见性判定「是否允许弹软键盘」，`0` 会被当成不可见、
+  直接不弹；`0.01` 肉眼一样看不见，但判定通过。
+- **不能 `display:none` / `visibility:hidden`**，同理——元素不可见就不可聚焦。
+- **`pointer-events:none`**：它是 1px 的 fixed 元素，压在左上角，不设这条会抢走触摸。
+
+### 第二层：把 `focus()` 放回用户手势的同步栈
+
+Ruffle 的 `openVirtualKeyboard()` 在 `instance.has_focus()` 为 false 时用 `setTimeout(0)` 再聚焦。
+点 Flash 输入框的那一瞬间焦点还在别处，所以走的永远是延时那条路 —— 多一帧，并且**丢掉了这次点击的
+弹键盘授权**（WebView 只认用户手势同步栈里的聚焦调用），表现就是「点了要等一下、弹出来又缩回去」。
+
+壳层包了一层 `openVirtualKeyboard`：先同步 `focus({ preventScroll: true })`，
+若 `shadow.activeElement` 已经是它就直接返回，不再走原来的延时分支。
+
+顺带修掉一处每秒一次的浪费：样式只在元素第一次被接管时写一遍（`__moleKbStyled`）。
+旧实现每次聚焦都重写 20 条 `!important`，而「点一下输入框」正是聊天框里最高频的操作。
+
+### 第三层：拦掉逐字符重发
+
+Ruffle 的 `virtualKeyboardInput()` 把 `#virtual-keyboard` 的 value **逐字符**读出来重发。
+Android 输入法在组合期 value 是整段拼音，而且**清空不生效**，于是每个字符都被当成新输入重放一遍
+→ `wwwoooooaaaannnn`。
+
+现在在捕获阶段 `stopImmediatePropagation()` 拦掉原生 `input`，改由壳层决定发什么：
+
+| 情况 | 处理 |
+| --- | --- |
+| 组合期（`isComposing` 或 `inputType === 'insertCompositionText'`） | **一个字符都不发，也不清空 value**。清空会打断输入法的组合，表现就是「拼音打一半键盘自己没了」 |
+| `compositionend` | 记下 commit，60ms 内补一次取值兜底（少数输入法只发 `compositionend` 不发 `input`，否则会吞字） |
+| 前缀增长（输入法把旧内容又带上来） | 只发增量 `v.slice(prevText.length)` |
+| 退格 / 删除（`inputType` 以 `delete` 开头） | 只清缓冲，绝不重发剩余字符——否则退一格会把字原样重打回去 |
+| 回声（同一段文本 60ms 内原样再来一次） | 丢弃 |
+| 输入法抖动（同一字符 35ms 内重复） | 丢弃；人手连打同字的间隔远大于 35ms |
+| 突发洪水（100ms 窗口内超过 12 个字符） | 截断 |
+
+发的时候走 `keydown` / `keyup` 事件（`KeyboardEvent` 带 `key`），不改 value、不碰 Ruffle 的内部状态；
+退格、回车、方向键本来就走键盘事件通道，不受这套影响。
+
+### 第四层：焦点守卫（24 行，来自 [@806064218](https://github.com/806064218)）
+
+OmniPad 的 `ensureFocus()` 会在每次交互后把焦点抢回 canvas；靶区 div 被点、`activeElement` 被清空
+也会让刚聚焦的输入框失焦。于是点一下输入框，键盘弹出又缩回，非得双击、第二次在 16ms 内抢赢才停住。
+
+三段配合（`shell.html` 第 5 段，OmniPad 挂载之后）：
+
+| 段 | 作用 |
+| --- | --- |
+| A | 包 `canvas.focus`：`shadow.activeElement` 已是 `#virtual-keyboard` 就直接 return，不再抢 |
+| B | `pointerdown` 记时间戳，用来区分「这一下是手指点的」还是脚本触发的 |
+| C | shadow `focusout` 时 16ms 后抢回；`_fixed` 标记 + 400ms 窗口保证**一次点击最多抢一次** |
+
+`_fixed` 是防循环的关键：没有它，打字时手指在屏幕上微动会让 OmniPad 反复触发 `ensureFocus`，
+叠加 400ms / 16ms 的节奏最多能抢 25 轮焦点，表现就是**打字越打越卡**。
+
+### 第五层：中文这件事，不要自作聪明
+
+1.1.2-beta 为了压住重复字符，曾「暂时屏蔽 a-zA-Z」——但拼音本来就是以字母进来的，
+屏蔽字母等于把中文输入法整个废掉。现在的做法：
+
+- 只过滤控制字符（`NUL` 与 `< 0x20`），字母一个不动；
+- `type` 保持 `text`，`autocomplete` / `autocorrect` / `spellcheck` 关掉，
+  **移除** `autocapitalize` 与 `inputmode`——不指定键盘形态、不指定语言倾向，交给系统输入法判断；
+- 键盘占屏期间跳过 `visualViewport` 的等比适配（原本 120ms 的防抖正好落在键盘动画中间，会闪一下），
+  **画幅保持不变**。
+
+调试口：
+
+```js
+__moleKb.state()   // { composing, hooked, value, echo, kbPos }
+__moleKb.focus()   // 手动聚焦那个 1px 输入框
+```
+
+---
+
 ## 已知限制
 
 - **只处理 `Client.swf` 主链路**，子 SWF 走代理直通；部分子游戏帧率不是 24，会被节流器拖慢
@@ -539,6 +644,18 @@ OmniPad 解析失败（WebView 内核过旧）时只打一条日志，游戏照�
 - **改壳层请说明验证方式**：`shell.html` 的改动请跑 `tests/` 下的离线断言
   （`node tests/clock_test.js` / `bg_test.js` / `pad_test.js`，共 157 项），
   不要只写「应该可以」。测试说明见 [tests/README.md](tests/README.md)
+
+## 贡献者
+
+| 账号 | 贡献 |
+| --- | --- |
+| [@Earthink030918](https://github.com/Earthink030918) | 维护者：Web 壳层、Java / ArkTS 壳层、文档与发布 |
+| [@806064218](https://github.com/806064218) | Ruffle 引擎构建、补丁文件与真机验证反馈 |
+
+引擎三件套（`ruffle.js` + 两个 `*.wasm.gz`）由 [@806064218](https://github.com/806064218) 编译提供，
+1.1.6 / 1.1.8 / 1.2.0 三轮换代与 1.1.7 的输入法守卫补丁均来自他；真机日志与机型适配反馈同样计入贡献。
+
+完整提交记录见 [Contributors 图表](https://github.com/Earthink030918/mole-flash-android/graphs/contributors)。
 
 ---
 
