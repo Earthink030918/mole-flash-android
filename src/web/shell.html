@@ -304,8 +304,36 @@
   // 占位符未注入时 __PIXEL_BUDGET__ 是未声明标识符 → 直接求值会 ReferenceError，
   // 用 try 兜住：注入成功则赋值，失败则保持上面的默认值，页面脚本不会整段挂掉。
   try { BUDGET = __PIXEL_BUDGET__; } catch (e) { /* 用默认值 */ }
+
+  /* ------------------------------------------------------------------
+   * 1.1.9-beta：像素预算地板 —— 全屏马赛克的根因（本轮新增）
+   * ---------------------------------------------------------------
+   * 现象（1.1.8-beta 换上新城引擎后）：一进游戏整屏就是马赛克，
+   *   花屏级别的块状，不是「略糊」。
+   *
+   * 根因不在引擎，在这条分档链上：
+   *   Java 的 evaluateLoadLevel() 把「连崩次数」（CrashProbe
+   *   .recentCrashStreak）直接当成档位 loadLevel = min(streak, MAX_LEVEL)，
+   *   而 PIXEL_BUDGETS 六档是
+   *       1,210,000 / 900,000 / 660,000 / 460,000 / 320,000 / 210,000
+   *   换引擎前后那几次红屏 panic + 手动杀进程，会把 streak 顶到 4~5 档：
+   *       BUDGET = 210,000
+   *     -> byBudget = sqrt(210000 / (960x560)) = 0.62~0.79
+   *     -> canvas 后备缓冲只剩 ~760x440
+   *     -> 却要铺满 2304x1344 的显示区（3 倍放大）
+   *     -> 就是「全屏马赛克」。
+   *   注意它和「引擎换了」在时间上完全吻合，但因果是崩溃史，不是渲染器。
+   *
+   * 做法：给「算 DPR 用的预算」加一条地板 = 第一档（1,210,000）。
+   *   · 崩溃史再长、GPU 看护再狠，渲染分辨率也不低于 v1.1.0 的基线；
+   *   · 只看不改别的：档位数组、看护轮询、降载接口、画幅、帧率、
+   *     节流器、输入法守卫一行没动（Java 侧一个字节没改）；
+   *   · 地板只作用于 DPR 计算，__moleSetBudget 的「重建渲染目标」
+   *     （无损纹理回收）照旧走，回收能力不受影响。
+   * ------------------------------------------------------------------ */
+  var BUDGET_MIN = 1210000;   // = PIXEL_BUDGETS[0]，v1.1.0 起的默认档
   var MAXCAP = 3;         // 再高对观感已无意义
-  var FLOOR  = 0.5;       // 下限，避免超大窗口下过度降采样发虚
+  var FLOOR  = 0.7;       // 下限，避免超大窗口下过度降采样发虚
   /* 1.1.2-beta：提前抓取「真实」devicePixelRatio。
      下面 0.2 段末尾会给 window.devicePixelRatio 装 getter（返回被钳制后的值），
      装完之后再读就是自己算自己 —— 必须在装之前把原始值存下来。 */
@@ -331,8 +359,8 @@
    *     · 不低于注入档位的 40% —— 防止分屏/小窗时糊成一片。
    * 画幅（#wrap 的 CSS 尺寸与 transform 缩放）、帧率、节流器全程不动。
    * ------------------------------------------------------------------ */
-  var DENSITY = 1.44;
-  var MAXPIX  = 1600000;
+  var DENSITY = 1.7;      // 1.1.9-beta：1.44 -> 1.7（大屏上真正多给一点像素）
+  var MAXPIX  = 2200000;  // 1.1.9-beta：160 万 -> 220 万（平板原生约 310 万，仍留余量）
   var shownArea = 0;
 
   /* getBoundingClientRect 会强制同步 layout，而 compute() 挂在
@@ -381,12 +409,16 @@
    * 显存总量基本不动，清晰度涨在真正看得见的地方。
    * ------------------------------------------------------------------ */
   function budgetNow() {
-    if (!shownArea) return BUDGET;
+    /* 1.1.9-beta：实际参与算 DPR 的预算永远不低于地板档。
+       BUDGET 本身（Java 档位 / 运行时看护推送）不变，只是不能把
+       渲染分辨率拖到「马赛克档」去。 */
+    var base = Math.max(BUDGET, BUDGET_MIN);
+    if (!shownArea) return base;
     var nativePx = shownArea * raw * raw;              // 屏幕原生像素
-    var want = Math.max(shownArea * DENSITY, BUDGET);  // 不低于基准档
-    var eff = Math.min(nativePx, want, BUDGET * 1.6, MAXPIX);
+    var want = Math.max(shownArea * DENSITY, base);    // 不低于基准档
+    var eff = Math.min(nativePx, want, base * 1.6, MAXPIX);
     /* 分屏 / 小窗兜底：别糊成一片，但也不许超过原生像素 */
-    return Math.max(eff, Math.min(nativePx, BUDGET * 0.4));
+    return Math.max(eff, Math.min(nativePx, base * 0.4));
   }
 
   /* 渲染后端，同样由 Java 侧注入（见 Ruffle 配置段的说明） */
@@ -495,6 +527,24 @@
       get: function () { return compute(); }
     });
   } catch (e) { /* 定义失败则分辨率不受约束，功能不受影响 */ }
+
+  /* 1.1.9-beta：一次性把「渲染分辨率实况」写进日志。
+     画质问题（马赛克）只看两个数就能定性：
+       canvas=后备缓冲尺寸 / 元素=CSS 尺寸，两者比值 > 1.6 就是肉眼可见的发虚或马赛克。
+     不轮询、不改任何行为，只在启动 3s 后打一行。 */
+  setTimeout(function () {
+    try {
+      var p = document.querySelector('ruffle-player,ruffle-embed,ruffle-object');
+      var sh = p && p.shadowRoot;
+      var c = sh ? sh.querySelector('canvas') : null;
+      console.log('[MoleShell] 渲染实况 budget=' + BUDGET
+          + '（生效 ' + Math.max(BUDGET, BUDGET_MIN) + '）'
+          + ' DPR=' + compute().toFixed(2)
+          + ' canvas=' + (c ? (c.width + 'x' + c.height) : '?')
+          + ' 元素=' + (c ? (c.clientWidth + 'x' + c.clientHeight) : '?')
+          + ' 显示=' + window.innerWidth + 'x' + window.innerHeight);
+    } catch (e) {}
+  }, 3000);
 
   /* ==================================================================
    * 0.5) 文本度量记忆化 —— 好友列表 / 聊天框卡顿的真正元凶（1.1.4-beta）
@@ -930,7 +980,7 @@
         + ' | 字体渲染=canvas(跟随手机)'
         + ' | 后端=' + (window.__moleRenderer || '?')
         + '（降级档位=' + (window.__moleRendererTier || 0) + '）'
-        + ' | 预算=' + BUDGET + 'px'
+        + ' | 预算=' + BUDGET + 'px（生效 ' + Math.max(BUDGET, BUDGET_MIN) + 'px）'
         + ' | DPR raw=' + window.__moleDprRaw + ' 钳制后=' + window.__moleDprCap.toFixed(2)
         + ' | 缩放=' + (window.__moleFitScale || 1).toFixed(3)
         + ' | 视口=' + window.innerWidth + 'x' + window.innerHeight); } catch (e) {}

@@ -121,17 +121,17 @@
 
 ## 下载与安装
 
-全部产物见 [Releases](https://github.com/Earthink030918/mole-flash-android/releases/latest)。当前版本 **v1.1.0**。
+全部产物见 [Releases](https://github.com/Earthink030918/mole-flash-android/releases/latest)。当前版本 **v1.2.0**。
 
 | 平台 | 文件 | 大小 | 系统要求 |
 | --- | --- | --- | --- |
-| Android | `mole-flash-android-1.1.0.apk` | 9.83 MiB | Android 5.0（API 21）以上，建议 8+ |
-| HarmonyOS | `mole-harmony-1.1.0.hap` | 10.90 MiB | HarmonyOS 5.0.0（API 12）以上 |
+| Android | `mole-1.2.0.apk` | 9.88 MiB | Android 5.0（API 21）以上，建议 8+ |
+| HarmonyOS | `mole-harmony-1.2.0-signed.hap` | 10.93 MiB | HarmonyOS 5.0.0（API 12）以上 |
 
 ### Android
 
 ```bash
-adb install -r mole-flash-android-1.1.0.apk
+adb install -r mole-1.2.0.apk
 ```
 
 或在手机上下载 APK 后直接点开安装（需允许「安装未知来源应用」）。
@@ -143,7 +143,7 @@ adb install -r mole-flash-android-1.1.0.apk
 ### HarmonyOS
 
 ```bash
-hdc install mole-harmony-1.1.0.hap
+hdc install mole-harmony-1.2.0-signed.hap
 ```
 
 或在「文件管理」中打开 HAP 安装。**注意：**
@@ -161,14 +161,14 @@ hdc install mole-harmony-1.1.0.hap
 sha256sum -c SHA256SUMS.txt
 
 # Windows PowerShell
-Get-FileHash .\mole-flash-android-1.1.0.apk -Algorithm SHA256
+Get-FileHash .\mole-1.2.0.apk -Algorithm SHA256
 ```
 
-v1.1.0 校验值：
+v1.2.0 校验值：
 
 ```
-4ee73963e3a09ec407051aa5cafc1667c564ba193e445b38fb1162b4f7af9e61  mole-flash-android-1.1.0.apk
-512347f66a826a23c05f3261e4e952cd02af90a40f905b64a342c78b67e8e095  mole-harmony-1.1.0.hap
+b776302bbc5ce46c71e773d4425edc2f2bee5fa99d0a13101571e59c57331714  mole-1.2.0.apk
+c8b99da639c9f9598898ac2c1822127c7e89024c107d7ff0465442c61e113af5  mole-harmony-1.2.0-signed.hap
 ```
 
 ---
@@ -281,10 +281,11 @@ hap-sign-tool verify-app ...     # 期望 Digest verify result: true
 │   ├── architecture.md        启动时序 / 请求路由表 / Socket 桥 / 降载状态机
 │   ├── build.md               重建 APK：补 Ruffle、清反编译代码、Gradle 骨架
 │   ├── decompile-report.md    工具链、失真清单、未覆盖部分
+│   ├── release-1.2.0.md       正式版发布说明：逐版对照、两端差异、HAP 重建
 │   ├── troubleshooting.md     按 logcat 原文的症状对照表
 │   ├── classes_inventory.txt  dex 全部类
 │   └── strings_urls.txt       dex 中的域名与 URL 字面量
-├── patches/                   逐版本壳层补丁存档（1.0.2 / 1.0.3 / 1.0.5 / 1.0.6 / 1.0.7）
+├── patches/                   逐版本壳层补丁存档（1.0.2 ~ 1.0.7、1.1.1 ~ 1.1.5、1.1.1-beta ~ 1.1.9-beta）
 │   ├── 1.0.5/vendor/          OmniPad 0.7.3 的 UMD、CSS 与 MIT 许可证原文
 │   └── .gitattributes         * -text，防止 smali 行尾被转换
 ├── src/
@@ -400,13 +401,16 @@ OmniPad 解析失败（WebView 内核过旧）时只打一条日志，游戏照�
 
 ## 版本与更新日志
 
-当前 **v1.1.0**（2026-10-25，线上版本）。`1.1.1`～`1.1.4-beta`
-（2026-10-26 ～ 11-03，versionCode 18）都已出包，正在等待真机验证，
-暂未发布。完整记录见 [CHANGELOG.md](CHANGELOG.md)，
+当前 **v1.2.0**（2026-11-12，正式版；Android `versionCode 24` / HarmonyOS `versionCode 7`）。
+自 v1.1.0 起共 15 个 versionCode 的迭代收束于此，逐版对照、两端差异与 HAP 重建过程见
+[docs/release-1.2.0.md](docs/release-1.2.0.md)。完整记录见 [CHANGELOG.md](CHANGELOG.md)，
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
 | 版本 | 要点 |
 | --- | --- |
+| **1.2.0** | 正式版。Android 内容 = 1.1.9-beta，只去掉 `-beta`（10,356,100 B，SHA-256 `b776302b…1714`）；HarmonyOS 首次同步新引擎（`EFKRKUVC` / `I56A2W5M`）并合入画质地板（11,465,574 B，SHA-256 `c8b99da6…3af5`）。相对 v1.1.0 的累积变化：画质、输入法、卡顿、红屏、后台存活、平板触控、引擎换代七组，画幅/帧率/节流器/`quality`/预算档位/回收策略/服务器地址一律未动 |
+| **1.1.9-beta** | 修「一进游戏整屏马赛克」。根因不是新引擎，是 `evaluateLoadLevel()` 把**连崩次数**当降载档位（`PIXEL_BUDGETS` 最低档 210,000 → DPR 0.79 → canvas 759×443 铺 2304×1344，放大 3.37×）。给参与算 DPR 的预算加地板 `BUDGET_MIN = 1210000`（= 档位 0），并把 `DENSITY 1.44→1.7`、`MAXPIX 160万→220万`、`FLOOR 0.5→0.7`：平板 759×443 → **1669×974**（放大 1.53×，优于 1.1.7 基线的 1.67×）。档位数组/显存看护/降载接口/无损纹理回收/画幅/帧率/节流器/输入法全未动；加一行 `[MoleShell] 渲染实况` 诊断（3s 打一次，`canvas/元素 > 1.6` 即发虚、`> 2.5` 即马赛克）。顺带核实 `quality: 'low'` 与分辨率无关（`stage.rs::set_quality()` 只存值 + 请求重绘） |
+| **1.1.8-beta** | 第二次换引擎（`MK7STBFJ` / `JTCYPQ5T`），`ruffle.js` 692,938 → 691,942 B；鸿蒙 `rawfile` 侧顺带删掉 10-21 遗留的两个死 wasm（20 MB → 10 MB） |
 | **1.1.7-beta** | 修「点输入框键盘弹出后立刻缩回，要双击才停住」。群友给的文件经 diff 确认是 **1.0.7 基线 + 24 行输入法守卫**（`diff -u patches/1.0.7/shell.html` 只有一处 `+24`），若整体覆盖会退回 1.1.1~1.1.5 五批修复（像素预算→画面发糊、平板触控兜底、键盘闪退、好友列表文本缓存、华为红屏后端降级）。因此只取那 24 行原样并入 1.1.6 的 OmniPad 挂载点：**A** 包 `canvas.focus`，`shadow.activeElement` 已是 `#virtual-keyboard` 就返回（OmniPad `ensureFocus()` 最终就是调它）；**B** `pointerdown` 记时间戳区分手指触发；**C** shadow `focusout` 时 16ms 抢回，`_fixed` 保证一次点击只抢一次（否则打字时手指微动会被反复触发，最多 25 轮抢焦点→打字卡）。纯插入，其余 2152 行逐字节未动；像素预算/DPR/画幅/画质/帧率/节流器/Ruffle 配置逐段哈希相同（待群友验证，未发布） |
 | **1.1.6-beta** | 换群友新编的 ruffle 引擎三份文件，壳层与 smali 一个字节未改。`ruffle.js` 685,811 → 692,938 B；两个 wasm 是**新哈希名**（`FQNOL64Y` / `VMZCVK47`，旧 `K7CA3GNA` / `JBAFOQXG`），不是同名覆盖。Java 的 `wasmResponse()` 是通配实现（`assets/ruffle/<请求名>.gz` + `GZIPInputStream`），新名自动命中，smali 无需改。随后清掉两个已无引用的旧 wasm（9.9 MB）并去掉对应 `doNotCompress`，重打同版本号：20,289,089 → 10,384,772 B（−48.8%） |
 | **1.1.5-beta** | 修「华为 MatePad 11 / 鸿蒙 4.2 运行中红屏 + Ruffle 崩掉 + 登录后卡死」。红屏是 **Ruffle 自己的 panic 面板**（`#panic` 的 `linear-gradient(180deg,#fd3a40,#fda138)`），意味着 wasm 已 panic、player 已 `destroy()`。三处定位：① 我们原来的兜底 `p.addEventListener('panic')` 是**死代码** —— ruffle.js 全程只派发 `loadedmetadata`/`loadeddata`，`MoleBridge.onPanic()` 一次都没被调用过，所以红屏后什么都不发生、日志也没有；② 面板挂在 `shadowRoot` 的 `#container` 里（`this.container = shadow.getElementById("container")`），light DOM 查不到；③ `preferredRenderer` 是常量 `wgpu-webgl`，而 Ruffle 的 `create_renderer()` 只在**创建**失败时才按 wgpu-webgl→webgpu→webgl→canvas 退，wgpu 在华为/Adreno 上是**绘制阶段**炸（`create_render_pipeline` 校检 / device lost），创建是成功的 → 引擎自己的退路走不到，重载多少次都复现。本版：shadowRoot `childList+subtree` 侦测 panic 面板（+5s 巡视兜底），抽出 title/body/详情写进 logcat；按文本判定「渲染后端类 / 内容类」；后端降级阶梯（`wgpu-webgl → webgl → canvas`，存 `localStorage`，只在本机真 panic 过后才往下走）；会话内 `sessionStorage` 计数上限 4 次防无限闪烁，Java 那条 15s 防抖挡掉时 6s 自愈；另加实际渲染器（`rendererDebugInfo`）与主线程冻结看门狗日志。画幅/画质/帧率/节流器/输入法/Java 壳层全未动（待群友验证，未发布） |

@@ -2,6 +2,84 @@
 
 格式参照 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## [1.2.0] - 2026-11-12
+
+正式版。Android `versionCode 24`、HarmonyOS `versionCode 7`，两端首次同步到同一份
+Web 壳层逻辑与同一套 Ruffle 引擎。完整说明见
+[docs/release-1.2.0.md](docs/release-1.2.0.md)。
+
+- **Android**：内容与 1.1.9-beta 逐字节相同，只把 `versionName` 的 `-beta` 去掉。
+  10,356,100 B，SHA-256 `b776302bbc5ce46c71e773d4425edc2f2bee5fa99d0a13101571e59c57331714`。
+- **HarmonyOS**：`rawfile/ruffle/` 换成同一套引擎（`EFKRKUVC` / `I56A2W5M`）+
+  壳层合入 1.1.9 的画质补丁（`BUDGET_MIN` 地板、`DENSITY 1.7`、`MAXPIX 220万`、`FLOOR 0.7`），
+  11,465,574 B，SHA-256 `c8b99da639c9f9598898ac2c1822127c7e89024c107d7ff0465442c61e113af5`。
+  MatePad 上 canvas 1242×724 → **1669×974**（物理放大 2.06× → 1.53×）。
+
+### 相对 v1.1.0 的累积变化
+
+画质（预算地板 / 按显示面积自适应 / 修欠采样）、输入法（键盘缩回、拼音重复、屏蔽字母、
+OmniPad 抢焦点）、卡顿（`measureText` 记忆化）、红屏（panic 侦测 + 后端降级阶梯）、
+后台存活（原子冻结、进程优先级、前台服务、`move-exception`）、平板触控（几何兜底 +
+三连击自救）、引擎三轮换代与死重量清理。
+
+画幅、帧率 24、节流器、`quality`、`PIXEL_BUDGETS`、无损纹理回收、输入法配置、
+服务器地址一律未动。
+
+### 未发布 / 未做
+
+鸿蒙 `mole_boot.js` 仍是 10-21 版，因此 panic 侦测、文本记忆化、后端降级三项
+未随本版进入 HAP；`targetAPIVersion` 仍是 API 12（抬版本需重编 ArkTS，开发机的
+DevEco 与 SDK 已删除）。HAP 是以 10-26 的 `entry-unsigned-111.hap` 为容器替换
+`rawfile` 后重签的，证书链与 profile 未变。
+
+## [1.1.9-beta] - 2026-11-11（未发布，待群友验证）
+
+基线 1.1.8-beta（versionCode 22）→ 本版 `1.1.9-beta`（versionCode 23）。
+只改 `src/web/shell.html`，引擎三件套与 smali 一个字节未动。
+
+修「一进游戏整屏马赛克」。
+
+根因不是新引擎，是**像素预算被连崩次数打到了最低档**：
+`MainActivity.evaluateLoadLevel()` 把 `CrashProbe.recentCrashStreak()` 直接当档位
+（`loadLevel = min(streak, MAX_LEVEL)`），`PIXEL_BUDGETS` 最低档 210,000 →
+`DPR = sqrt(210000/537600) ≈ 0.79` → canvas 759×443 铺满 2304×1344，物理放大 3.37 倍。
+
+改法：`budgetNow()` 里给参与算 DPR 的预算加地板 `BUDGET_MIN = 1210000`
+（= `PIXEL_BUDGETS[0]`，v1.1.0 起的默认档）。档位数组、显存看护、降载接口、
+无损纹理回收、画幅、帧率、节流器、输入法守卫全部未动。
+同时 `DENSITY 1.44→1.7`、`MAXPIX 160万→220万`、`FLOOR 0.5→0.7`。
+
+平板（1280×800 CSS / DPR 2）：759×443 → **1669×974**，物理放大 3.37× → 1.53×
+（1.1.7 基线是 1536×896 / 1.67×，即本版比历史最好一版还清晰一档）。
+手机（915×412 CSS / DPR 2.625）：1242×725 → 1440×840，仍低于原生像素上限。
+
+另加一行启动诊断（3s 后打一次，不轮询）：
+`[MoleShell] 渲染实况 budget=…（生效 …） DPR=… canvas=… 元素=… 显示=…`
+
+顺手否掉一个想当然的结论：`quality: 'low'` **与分辨率无关**
+（`stage.rs::set_quality()` 只存值 + `renderer.set_quality()` 请求重绘，
+`use_bitmap_downsampling` 注释写明 Ruffle 内被忽略），故未改。
+
+`tests/` 全绿：text 24 / panic 34 / clock 34 / bg 54 = 146 项。
+
+## [1.1.8-beta] - 2026-11-11（未发布）
+
+基线 1.1.7-beta（versionCode 21）→ 本版 `1.1.8-beta`（versionCode 22）。
+
+换群友新编译的 ruffle 三件套，其余不动：
+
+| 文件 | 旧 | 新 |
+| --- | --- | --- |
+| `ruffle.js` | 692,938 B | 691,942 B |
+| 主 wasm | `FQNOL64Y` 4,974,695 B | `JTCYPQ5T` 4,956,703 B |
+| mvp wasm | `VMZCVK47` 4,980,529 B | `MK7STBFJ` 4,955,758 B |
+
+哈希名每轮都变，所以"替换同名文件"实际只有 `ruffle.js` 同名，wasm 必须
+「加新 + 删旧」；`apktool.yml` 的 `doNotCompress` 两行同步改名。
+两端资源映射都是通配（Android `MainActivity$6.smali` 判 `endsWith(".wasm")`，
+鸿蒙 `LocalServer.ets:567` 同理），无需改代码。鸿蒙 `rawfile` 侧顺带删掉了
+10-21 遗留的两个死 wasm（20 MB → 10 MB），只换文件、未出 HAP。
+
 ## [1.1.7-beta] - 2026-11-10（未发布，待群友验证）
 
 基线 1.1.6-beta（versionCode 20）→ 本版 `1.1.7-beta`（versionCode 21）。
