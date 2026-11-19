@@ -2311,7 +2311,7 @@ exports.BaseEntity=N;exports.Button=Ri;exports.ButtonBaseView=L;exports.ButtonCo
  * ================================================================== */
 window.__moleCrash = (function () {
   var TAG = '[MoleShell]';
-  var APPV = '1.2.4-beta';
+  var APPV = '1.2.5-beta';
   var RING_MAX = 140;
   var ring = [];
   var errs = [];
@@ -2359,13 +2359,22 @@ window.__moleCrash = (function () {
     return out;
   }
 
+  /* 1.2.5-beta：panic 之后 Ruffle 会把 canvas 从 shadow 里摘掉，
+     于是报告里那一栏只剩「无画布」—— 而这恰恰是最该看的一项。
+     这里记住最后一次实测值，取不到时用它兜底。 */
+  var lastCanvas = '';
   function canvasInfo() {
     try {
       var p = document.querySelector('ruffle-player,ruffle-embed,ruffle-object');
       var sh = p && p.shadowRoot;
       var c = sh ? sh.querySelector('canvas') : null;
-      if (!c) return '无画布';
-      return c.width + 'x' + c.height + '（CSS ' + c.clientWidth + 'x' + c.clientHeight + '）';
+      if (!c) {
+        return lastCanvas
+          ? lastCanvas + '（panic 后 canvas 已被移除，此为最后一次实测）'
+          : '无画布';
+      }
+      lastCanvas = c.width + 'x' + c.height + '（CSS ' + c.clientWidth + 'x' + c.clientHeight + '）';
+      return lastCanvas;
     } catch (e) { return '读取失败：' + e; }
   }
 
@@ -2492,18 +2501,36 @@ window.__moleCrash = (function () {
   }
   on(window, 'error', function (e) {
     try {
-      errs.push(fmtTime() + ' ' + (e.message || 'error')
-        + ' @' + (e.filename || '?') + ':' + (e.lineno || 0) + ':' + (e.colno || 0));
+      var one = fmtTime() + ' ' + (e.message || 'error')
+        + ' @' + (e.filename || '?') + ':' + (e.lineno || 0) + ':' + (e.colno || 0);
+      errs.push(one);
       if (errs.length > 40) errs.shift();
+      /* 1.2.5-beta：给 mole_boot.js 的 panic 分类器留一个口子 ——
+         `Maximum call stack size exceeded` / `RuntimeError: unreachable`
+         这些词只出现在 JS 错误里，panic 面板的正文里没有。
+         panic 判定要据此认出「wasm 栈溢出 → borrow 重入」。 */
+      window.__moleLastErr = one;
+      window.__moleLastErrAt = Date.now();
     } catch (x) {}
   }, true);
   on(window, 'unhandledrejection', function (e) {
     try {
       var r = e && e.reason;
-      errs.push(fmtTime() + ' [unhandledrejection] ' + (r && r.stack ? r.stack : String(r)));
+      var one = fmtTime() + ' [unhandledrejection] ' + (r && r.stack ? r.stack : String(r));
+      errs.push(one);
       if (errs.length > 40) errs.shift();
+      window.__moleLastErr = one;
+      window.__moleLastErrAt = Date.now();
     } catch (x) {}
   });
+
+  /* 5s 采一次画布尺寸 —— 只为在 panic 之后还有数可报。
+     一次 shadowRoot.querySelector，不进主循环，可忽略。 */
+  try {
+    setInterval(function () {
+      try { if (document.visibilityState === 'visible') canvasInfo(); } catch (e) {}
+    }, 5000);
+  } catch (e) {}
 
   return {
     share: share,
@@ -2690,10 +2717,57 @@ window.__moleDpad = (function () {
     }
   }
 
+  /* ------------------------------------------------------------------
+   * 1.2.5-beta：KEYUP 兜底 —— 别把方向键「按死」在游戏里
+   * ---------------------------------------------------------------
+   * 缺陷：面板收起时用的是 opacity + pointer-events:none（这一条不能改，
+   *   改成 display:none 会让 OmniPad 量到 0 矩形）。可 `pointer-events:none`
+   *   意味着**收起之后这个面板再也收不到 pointerup / pointercancel**。
+   *   于是「按着方向键 → 点圆钮收起」这条路径上，KEYUP 永远发不出去，
+   *   游戏里那个方向就一直处于按下状态：角色一直走、列表一直翻、
+   *   Flash 的焦点导航一直触发。
+   *
+   * 现场（PHZ110 的崩溃报告）：日志末尾正好是
+   *   方向键已展开 → 已收起 → 已展开
+   * 紧接着 89s 处 panic，正文 `arena already borrowed`，同一秒还有
+   *   RangeError: Maximum call stack size exceeded（wasm 内）
+   * 这个组合与「残留按下状态让游戏侧反复进同一个回调」是一致的。
+   * 不能断言这就是唯一触发点（重入也可能来自后端回调），但按住状态
+   * 泄漏是**我们自己确凿的**缺陷，先把它彻底关掉。
+   *
+   * 做法：收起 / 拆除 / 切后台 / 失焦 一律补发 4 个 KEYUP。
+   *   对没按下的方向多发一次 KEYUP 在 Flash 里是空操作
+   *   （Ruffle 的 release_key 只是从按下集合里删掉），所以不区分
+   *   「有没有真按过」，全发，简单且不会漏。
+   * ------------------------------------------------------------------ */
+  function releaseAll(why) {
+    /* 先让 OmniPad 把自己的内部按下状态清掉：DPadCore.reset() 会把
+       四个 emitter 全部 release 并把 state 打回初值。不做的后果是它以为
+       还按着，下次同一方向算出的向量没变 → 不会再发 KEYDOWN，
+       表现为「方向键忽然不灵了」。 */
+    try {
+      if (dpad && dpad.core && typeof dpad.core.reset === 'function') dpad.core.reset();
+    } catch (e) {}
+
+    var sent = 0;
+    for (var i = 0; i < DIRS.length; i++) {
+      var d = DIRS[i];
+      downSet[d] = 0;
+      if (fakeBtn[d] && fakeBtn[d].classList) {
+        try { fakeBtn[d].classList.remove('down'); } catch (e) {}
+      }
+      try { fireKey(d, false); sent++; } catch (e) {}
+    }
+    if (why) log('方向键已全部松开（' + why + '，补发 ' + sent + ' 个 KEYUP）');
+    return sent;
+  }
+
   function toggle(force) {
     open = (force === undefined) ? !open : !!force;
     if (panel) panel.className = open ? 'on' : '';
     if (btn) btn.className = open ? 'on' : '';
+    /* 收起前先把按下的键放开 —— 面板一藏就再也收不到 pointerup 了 */
+    if (!open) releaseAll('');
     log('方向键' + (open ? '已展开' : '已收起') + '（' + (usingOmni ? 'OmniPad' : '原生键盘事件') + '）');
     return open;
   }
@@ -2750,9 +2824,19 @@ window.__moleDpad = (function () {
     }
   }, 500);
 
+  /* 切后台 / 窗口失焦也补发 KEYUP：手指按着方向键时被系统手势或通知栏
+     打断，pointerup 一样到不了面板上。 */
+  listen(document, 'visibilitychange', function () {
+    try { if (document.visibilityState === 'hidden') releaseAll('切后台'); } catch (e) {}
+  }, false);
+  listen(window, 'blur', function () {
+    try { releaseAll('窗口失焦'); } catch (e) {}
+  }, false);
+
   return {
     on: function () { return build(); },
     off: function () {
+      try { releaseAll('拆除浮钮'); } catch (e) {}
       try { if (host && host.parentNode) host.parentNode.removeChild(host); } catch (e) {}
       try { if (dpad && dpad.destroy) dpad.destroy(); } catch (e) {}
       host = null; btn = null; panel = null; dpad = null; open = false; fakeBtn = {}; downSet = {};

@@ -82,6 +82,36 @@ wgpu 在特定驱动上过不了 `create_render_pipeline` 的 VERTEX shader 校�
 若报告里 `判定` 一栏一直是「证据驱动·后端不可用」且档位已经到 `canvas` 还在崩，
 说明不是后端问题，往下看 `JS 运行时错误` 段与 `panic 正文`。
 
+### panic 正文是 `arena already borrowed`，同一秒还有 `Maximum call stack size exceeded`
+
+1.2.5-beta 之前这条会被判成「非渲染类」，后端不动，重载之后照撞。现在看报告的 `判定`：
+
+```
+判定: 核心重入类（borrow 重入，wgpu 回调整疑）   ← 下次启动会换 webgl
+判定: 核心重入类（非 wgpu 后端，不动）          ← 已经不在 wgpu 上了，没有可降的
+判定: 内容/内存类（换后端无用）
+```
+
+这是 Ruffle 的 `enter_arena_mut()` 在 arena 已被借用时又被人调了一次 —— **重入**。
+wasm 里的栈溢出会直接从 JS 侧抛出，Rust 的借用守卫来不及析构，紧跟的那次调用就撞上「已借用」；
+所以 `Maximum call stack`（`window.onerror` 里）和这条 panic 通常同秒出现。
+
+判定只认 15 秒内的 JS 错误（`__moleLastErrAt`），80 秒前路过的一条无关 RangeError 不会算到这次头上。
+如果想确认触发源，看报告里 `[最近日志]` 段 panic 前 20 行在做什么：方向键 / 触控板 / 切后台都会留下痕迹。
+
+### 方向键按住时角色一直走，松开也不停 / 某个方向键从此失灵
+
+1.2.5-beta 修的。根因是面板收起后 `pointer-events:none`，收不到 `pointerup`，KEYUP 发不出去，
+OmniPad 的 `isPressed` 卡在 true —— 这个方向在游戏里永久按下，而且 `press()` 会被 `isPressed` 挡掉，
+表现为「这个键没反应」。现在收起 / 拆浮钮 / 切后台 / 失焦都会 `DPadCore.reset()` + 补发 4 个 KEYUP。
+
+如果**升级后仍然复现**，说明还有第三条路径没覆盖（比如别的地方把面板藏了），临时处置：
+
+```js
+__moleDpad.off()        // 拆掉浮钮，彻底回到原生触控
+__moleDpad.state()      // { mounted, open, engine }
+```
+
 ### 从来没弹出过崩溃报告 / 找不到 txt
 
 三处触发都要求 Ruffle 面板或 canvas 已经存在，装完就崩在启动阶段的看不到弹窗。依次查：

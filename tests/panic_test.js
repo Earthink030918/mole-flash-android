@@ -163,6 +163,68 @@ console.log('=== 4) 内容类 panic → 不降级，只重载 ===');
   ok('仍然通知重载', bridge.panic === 1, bridge.panic);
 }
 
+/* ------------------------------------------------------------------
+ * 4b/4c) 1.2.5-beta：核心重入类 panic
+ *   现场（PHZ110 的崩溃报告）：正文 `arena already borrowed`，
+ *   同一秒还有 `Maximum call stack size exceeded`（wasm 内）。
+ *   ruffle core 的 enter_arena_mut() 借不到 arena 就是重入 ——
+ *   既不是驱动也不是内容逻辑。能在这颗 wasm 里回调 JS 的只有
+ *   wgpu 的 web 后端，所以只在 wgpu 上下文中降一档。
+ * ------------------------------------------------------------------ */
+console.log('=== 4b) 核心重入 panic + wgpu 后端 → 降一档 ===');
+{
+  const { sandbox, logs, bridge } = makeEnv({ renderer: 'wgpu-webgl' });
+  let bumped = 0;
+  sandbox.window.__moleRendererBump = () => { bumped++; return 'webgl'; };
+  sandbox.window.__moleLastErr =
+    '2026-11-19 16:31:25 Uncaught RangeError: Maximum call stack size exceeded @wasm://wasm/ruffle_web.wasm-03c96346:1:8606087';
+  sandbox.window.__moleLastErrAt = Date.now();
+  sandbox.onPanicDom(makePlayer({
+    title: '出了些问题 :(',
+    body: 'panicked at core\\src\\player.rs:485:16: arena already borrowed',
+  }));
+  ok('wgpu 后端上降了一档', bumped === 1, bumped);
+  ok('日志判定为「核心重入」',
+    logs.some(l => l.indexOf('核心重入') >= 0), logs.join(' / '));
+  ok('仍然通知 Java 重载', bridge.panic === 1, bridge.panic);
+}
+
+console.log('=== 4b2) 正文没写 borrow，但 15s 内有过 wasm 栈溢出 → 同样认重入 ===');
+{
+  const { sandbox } = makeEnv({ renderer: 'wgpu-webgl' });
+  let bumped = 0;
+  sandbox.window.__moleRendererBump = () => { bumped++; return 'webgl'; };
+  sandbox.window.__moleLastErr = 'Uncaught RangeError: Maximum call stack size exceeded';
+  sandbox.window.__moleLastErrAt = Date.now();
+  sandbox.onPanicDom(makePlayer({ title: '出了些问题 :(', body: 'Something went wrong' }));
+  ok('靠 15s 内的 JS 错误判成重入并降档', bumped === 1, bumped);
+}
+
+console.log('=== 4b3) 那条栈溢出是 80 秒前的旧账 → 不许算到这次头上 ===');
+{
+  const { sandbox } = makeEnv({ renderer: 'wgpu-webgl' });
+  let bumped = 0;
+  sandbox.window.__moleRendererBump = () => { bumped++; return 'webgl'; };
+  sandbox.window.__moleLastErr = 'Uncaught RangeError: Maximum call stack size exceeded';
+  sandbox.window.__moleLastErrAt = Date.now() - 80000;
+  sandbox.onPanicDom(makePlayer({ title: '出了些问题 :(', body: 'Something went wrong' }));
+  ok('陈旧错误不参与判定', bumped === 0, bumped);
+}
+
+console.log('=== 4c) 同样的重入 panic 出现在 webgl 后端 → 不动档位 ===');
+{
+  const { sandbox, logs } = makeEnv({ renderer: 'webgl' });
+  let bumped = 0;
+  sandbox.window.__moleRendererBump = () => { bumped++; return 'canvas'; };
+  sandbox.onPanicDom(makePlayer({
+    title: 'x',
+    body: 'panicked at core\\src\\player.rs:485:16: arena already borrowed',
+  }));
+  ok('非 wgpu 后端不降档', bumped === 0, bumped);
+  ok('日志写明「非 wgpu，后端不动」',
+    logs.some(l => l.indexOf('非 wgpu') >= 0), logs.join(' / '));
+}
+
 console.log('=== 5) 同一个播放器只处理一次 ===');
 {
   const { sandbox, bridge } = makeEnv();

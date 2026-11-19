@@ -2,6 +2,53 @@
 
 格式参照 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## [1.2.5-beta] - 2026-11-19
+
+预发布，仅 Android（`versionCode 26`）。针对群友 PHZ110 那份崩溃报告。
+逐条证据与代码位置见 [patches/1.2.5-beta/README.md](patches/1.2.5-beta/README.md)。
+
+产物 `mole-flash-1.2.5-beta.apk`，10,372,484 B，
+SHA-256 `af041077e53fa4f536c38b6246f6352f0387212549f209708519733d01a12d89`。
+**沿用 1.2.4-beta 的签名**（`b9197126…ae845bee`），装着 1.2.4-beta 的可以直接覆盖升级。
+
+### 修复
+
+- **方向键会「按死」**：面板收起用 `opacity + pointer-events:none`（不能改 `display:none`，
+  OmniPad 会量到 0 矩形），代价是收起后收不到 `pointerup`——按着方向键去点圆钮收起，
+  KEYUP 就永远发不出去。而 OmniPad 的 emitter 是 `press()` 靠 `isPressed` 挡重复、
+  `release()` 只在 `isPressed` 时才发 KEYUP，一旦卡住，这个方向在游戏里永久按下、
+  这个键从此失灵。现在收起 / 拆浮钮 / 切后台 / 失焦一律 `core.reset()` + 补发 4 个 KEYUP。
+- **核心重入类 panic 不让降档**：报告正文 `panicked at core\src\player.rs:485:16: arena already
+  borrowed`，同一秒还有 `RangeError: Maximum call stack size exceeded`（wasm 内）与
+  `RuntimeError: unreachable`。`enter_arena_mut()` 借不到 arena 就 panic——这是**重入**，
+  既不是驱动也不是内容逻辑；而当时的判定是「非渲染类」，后端不动，重载后还是 `wgpu-webgl`，
+  同样再撞一次。新增「核心重入类」判据（`arena already borrowed` / `Maximum call stack` /
+  `unreachable`，JS 错误只认 15 秒内的），**只在当前后端是 wgpu 时**降一档
+  （wgpu 的 web 后端是回调式胶水，是唯一能在 wasm 内部回调 JS 的后端）；
+  `webgl` / `canvas` 上仍然只重载，不白降画质。
+- **报告里「画布」永远是「无画布」**：panic 后 Ruffle 把 canvas 从 shadow 里摘掉了。
+  改为每 5 秒采一次尺寸，panic 时用最后一次实测值并标明来源。
+
+### 新增
+
+- `tests/dpad_test.js`（22 条断言）：按下 → 收起必须补发 4 个 KEYUP、必须调 `core.reset()`、
+  重新展开后同一方向仍能发 KEYDOWN。
+- `tests/panic_test.js` 增加 7 条：重入类 panic 在 wgpu 上降档 / 在 webgl 上不动 /
+  15 秒内的 wasm 栈溢出参与判定 / 80 秒前的旧错误不参与。
+
+### 未动
+
+画质（`quality` / 像素预算 / `MAXPIX` / `DENSITY` / `FLOOR`）、帧率 24 与节流器、
+画幅（`960×560` + letterbox）、五层输入法守卫、无损纹理回收、`PIXEL_BUDGETS`、
+OmniPad 本体、`AndroidManifest.xml`、引擎三件套、全部 smali。
+
+### 试过又撤掉
+
+触控板几何在 `width 51px ↔ 30px` / `top 133 ↔ 132` 之间来回跳（5 次/20 秒），
+试过加「同一新解连续两次才采纳」的粘滞去抖，`pad_test` 立即红了两条几何用例
+（转屏 / 画幅变化要求 1 秒内重新贴边），说明会破坏既有契约；而抖动只是浮层重排、
+不压画面。撤掉，留待下一轮单独处理。
+
 ## [1.2.4-beta] - 2026-11-19
 
 预发布，**仅 Android**（`versionCode 25`）。HAP 本轮未出，原因见文末。

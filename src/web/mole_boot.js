@@ -261,6 +261,61 @@
                 + ' → 按证据判定为后端不可用，强制降档');
         }
 
+        /* ------------------------------------------------------------------
+         * 1.2.5-beta：核心重入类 panic（`arena already borrowed`）
+         * ---------------------------------------------------------------
+         * 现象（PHZ110 / Mali-G720 / Android 16 / Chromium 138 反馈）：
+         *   玩 89s 后红屏，正文是
+         *     panicked at core\src\player.rs:485:16: arena already borrowed
+         *   同一秒还有两条 JS 错误：
+         *     RangeError: Maximum call stack size exceeded（wasm 内）
+         *     RuntimeError: unreachable
+         *
+         * 这两个不是同一个东西，但因果很清楚：
+         *   ruffle core 的 enter_arena_mut() 用 try_borrow 保护 GC arena，
+         *   借不到就 `expect("arena already borrowed")` 直接 panic。
+         *   也就是说 **panic 之前已经有人在借用 arena，我们又进去调了一次
+         *   Player 的 JS 接口** —— 这是重入，不是显卡、不是显存、不是内容逻辑。
+         *   而 wasm 里的栈溢出会直接从 JS 侧抛出，Rust 的借用守卫来不及析构，
+         *   于是紧跟着的那次调用就撞上「已借用」。日志里两条错误同秒出现，
+         *   正是这个顺序。
+         *
+         * 谁会重入？能在这颗 wasm 里回调 JS 的只有后端自己：
+         *   wgpu 的 web 后端是 Promise / 回调式胶水（submit、map、错误作用域
+         *   都会回调进 wasm），webgl / canvas 后端是纯同步调用，没有这层往返。
+         *   所以**只在这个 panic 出现在 wgpu 后端时**降一档，别的一律不动。
+         *
+         * 为什么值得降：这是第一次 panic（档位 0），原来判「非渲染类」→
+         *   后端不动 → 重载 → 还是 wgpu-webgl → 同样再撞一次。降一档的代价
+         *   只是换 GL 抽象层（分辨率/预算/画质档位一个都没改），而
+         *   内容类 panic 的文本里不会有 borrow / 栈溢出这些词，不会误伤。
+         * ------------------------------------------------------------------ */
+        var backend = String(window.__moleRenderer || '');
+        /* 只看 15 秒内的 JS 错误：panic 正文里没有 "Maximum call stack" 这类词，
+           它们只出现在 window.onerror 里（第 8 段记的）。
+           但如果那条错误是 80 秒前路过的一个无关 RangeError，
+           拿它来给 panic 定性就是冤枉 —— 所以带时间戳。 */
+        var recentErr = '';
+        try {
+            if (window.__moleLastErr && (Date.now() - (window.__moleLastErrAt || 0) < 15000)) {
+                recentErr = String(window.__moleLastErr);
+            }
+        } catch (e) {}
+        var looksReentry = /arena already borrowed|already mutably borrowed|Maximum call stack|stack overflow|RuntimeError: unreachable/i
+            .test(flat + ' ' + x.title + ' ' + recentErr);
+        var reentryOnWgpu = looksReentry && /wgpu/i.test(backend);
+        if (looksReentry) {
+            log('!! 判定：核心重入（arena borrow 未释放时又进了一次 Player）'
+                + '｜后端=' + (backend || '?')
+                + (reentryOnWgpu ? ' → wgpu 回调整疑，降一档重试' : ' → 非 wgpu，后端不动'));
+        }
+
+        var verdict = looksGpu ? '渲染后端类（驱动/显存）'
+            : (reentryOnWgpu ? '核心重入类（borrow 重入，wgpu 回调整疑）'
+                : (repeatTier ? '证据驱动·后端不可用'
+                    : (looksReentry ? '核心重入类（非 wgpu 后端，不动）'
+                        : '内容/内存类（换后端无用）')));
+
         var n = panicCount(true);
         log('!! panic 累计 ' + n + ' 次（上限 ' + PANIC_MAX + '）');
 
@@ -271,7 +326,7 @@
                 window.__moleCrash.auto('Ruffle panic', {
                     '渲染后端': (window.__moleRenderer || '?') + '（档位 ' + (window.__moleRendererTier || 0) + '）',
                     '后端档位连续崩溃': tierN,
-                    '判定': (looksGpu ? '渲染后端类' : (repeatTier ? '证据驱动·后端不可用' : '非渲染类')),
+                    '判定': verdict,
                     '已运行': up + 's',
                     'panic 标题': x.title || '(空)',
                     'panic 正文': flat || '(空)'
@@ -284,13 +339,13 @@
             return;
         }
 
-        if (looksGpu || repeatTier) {
+        if (looksGpu || repeatTier || reentryOnWgpu) {
             var next = null;
             try { next = window.__moleRendererBump && window.__moleRendererBump(); } catch (e) {}
-            log(next ? '!! 判定为渲染后端不兼容 → 下次改用 ' + next
-                     : '!! 判定为渲染后端不兼容，但已没有更低档位可用');
+            log(next ? '!! 判定为 ' + verdict + ' → 下次改用 ' + next
+                     : '!! 判定为 ' + verdict + '，但已没有更低档位可用');
         } else {
-            log('!! 判定为非渲染类 panic（内容 / 内存），后端档位不变，只重载');
+            log('!! 判定为 ' + verdict + '，后端档位不变，只重载');
         }
 
         try {
