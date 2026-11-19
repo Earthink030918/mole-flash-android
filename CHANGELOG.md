@@ -2,6 +2,57 @@
 
 格式参照 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## [1.2.4-beta] - 2026-11-19
+
+预发布，**仅 Android**（`versionCode 25`）。HAP 本轮未出，原因见文末。
+逐条根因、改法与验证见 [patches/1.2.4-beta/README.md](patches/1.2.4-beta/README.md)。
+
+产物 `mole-flash-1.2.4-beta.apk`，10,368,388 B，
+SHA-256 `0b00716b9f94ad06a1e04d4a215b243be7dd82061a585837309624a2ec31ad02`。
+
+**换了签名密钥**（新证书 SHA-256 `b9197126…ae845bee`，RSA 4096 / v1+v2+v3），
+安装前需先卸载旧版，`mole_shell` 里缓存的服务器地址会重学一遍。
+
+### 修复
+
+- **平板「越用越卡、最后闪退」**：`budgetNow()` 首行 `Math.max(BUDGET, BUDGET_MIN)` 把
+  `PIXEL_BUDGETS` 的 1~5 档全部拉回 121 万，等于降档机制从 1.1.9 起再没生效过——
+  连崩一次档位 +1，预算不变，同分辨率再崩，循环到底。改成**软地板**：只保护 0~2 档，
+  3 档及以下用 Java 真实押下来的预算（`×1.6` 仍是硬顶）。平板 1280×800 / DPR 2 在档位 5
+  从 174 万像素降到 33.6 万（−81%），手机 915×412 从 121 万降到 33.6 万（−72%）；
+  干净安装走 0~2 档，与 1.2.0 逐像素相同，回升仍由 `boot_good_runs_v4` 负责。
+- **OPPO 红屏更频繁且不自愈**：降后端档位原本依赖 panic 文案命中 `webgl|gpu|wgpu|…` 正则，
+  ColorOS 上 Adreno 的 panic 常常只有一句 `Something went wrong`，判定恒 false → 后端恒不降。
+  改为**证据驱动**：同一后端档位在 `sessionStorage` 里记数，第二次崩即降档，不看文案。
+- **启动诊断「预算=」一栏空白**：该行引用了 IIFE 闭包内的 `BUDGET` / `softFloor` / `budgetLevel`，
+  外层 `try/catch` 吞掉了 `ReferenceError`。新增 `window.__moleBudgetInfo()` 导出后正常显示。
+
+### 新增
+
+- **崩溃报告自动上报**：panic 面板出现、WebGL 上下文 2.5s 未恢复、JS 未捕获异常三处触发，
+  生成中文 `.txt`（版本 / 时间 / UA / 屏幕 / GPU / JS 堆 / 渲染后端与档位 / 画布 / 像素预算 /
+  影片尺寸 / OmniPad 与后台状态 / 现场追加 / 最近 140 行日志，IP 脱敏），
+  写入 `getExternalFilesDir(null)/crash/`（无需存储权限），随后 `Intent.ACTION_SEND` +
+  `createChooser` 弹系统分享面板，选 QQ 即可直发。节流 10s 一次、每会话 2 次。
+  新增 `CrashReport.smali`、`CrashReport$1.smali`、`MainActivity$JsBridge.reportCrash`。
+- **虚拟方向键**：左下角 46×46 悬浮钮，点开 132×132 十字键，发 `ArrowUp/Down/Left/Right`。
+  优先 `OmniPad.VirtualDPad`（0.7.3 键表含 37~40，皮肤 `.omnipad-dpad-*` 现成），
+  OmniPad 缺席或 `#pad` 未就绪时退化为四个自绘键 + 原生 `KeyboardEvent` 直派到播放器
+  （`keyCode`/`which` 用 `defineProperty` 补）。收起用 `opacity+visibility` 而非 `display:none`，
+  避免 OmniPad 量到 0 矩形。调试口 `__moleDpad.on/off/toggle/state`。
+- 调试口 `__moleCrash.info()`、`__moleShareCrash('原因')`、`__moleBudgetInfo()`。
+
+### 未动
+
+画幅（`960×560` + letterbox）、帧率 24 与节流器、`quality`、`PIXEL_BUDGETS` 数组本身、
+无损纹理回收、五层输入法守卫、OmniPad 本体逻辑、引擎三件套、`AndroidManifest.xml`。
+
+### 未做
+
+HAP。鸿蒙侧需要 DevEco + API SDK 重编 ArkTS（`NativeBridge` 没有 `reportCrash` 通道，
+`getExternalFilesDir` / `ACTION_SEND` 都要换 ArkTS API），开发机上的 DevEco 与 SDK 已删除，
+改 `rawfile` 重签容器带不进新逻辑。留待环境就绪后单独一轮。
+
 ## [1.2.0] - 2026-11-12
 
 正式版。Android `versionCode 24`、HarmonyOS `versionCode 7`，两端首次同步到同一份

@@ -67,11 +67,44 @@ Adreno 显存池耗尽。内核直接 SIGTRAP 杀 RenderThread，Java 层拦不�
 2. 缩小预算：把 `PIXEL_BUDGETS` 整体乘 0.7，或把 `GPU_SOFT_MB` 从 400 调到 350
 3. 实在压不住就把 `preferredRenderer()` 从 `wgpu-webgl` 换成 `canvas`（CPU 软渲染，画面糙但不会 OOM）
 
+1.2.4-beta 起这条链上多了两个可用的钩子：上下文丢失 **2.5s** 未恢复时会先落一份崩溃报告
+（`crash/mole-crash-*.txt`，含当时的画布尺寸与预算），再上报 `dead`。报告比对相邻两份的
+`像素预算` 字段，就能判断「是没降档」还是「降了还不够」。
+
 ### `页面报告 Ruffle panic → 强制清空重载`，反复出现
 
 wgpu 在特定驱动上过不了 `create_render_pipeline` 的 VERTEX shader 校验。这是 Ruffle + 驱动的组合问题，
 换 Ruffle 版本或换后端，改代码无解。日志里若出现 `主动释放已达 10 次上限`，说明在死循环重载，
 此时应停手排查而不是继续加自动重载次数。
+
+1.2.4-beta 起多一行判据：`后端档位连续崩溃 N`。同一后端档位第二次崩即自动降档
+（不再依赖 panic 文案命中关键词——ColorOS 上文案常常只有 `Something went wrong`）。
+若报告里 `判定` 一栏一直是「证据驱动·后端不可用」且档位已经到 `canvas` 还在崩，
+说明不是后端问题，往下看 `JS 运行时错误` 段与 `panic 正文`。
+
+### 从来没弹出过崩溃报告 / 找不到 txt
+
+三处触发都要求 Ruffle 面板或 canvas 已经存在，装完就崩在启动阶段的看不到弹窗。依次查：
+
+1. `adb shell ls /sdcard/Android/data/com.taomee.mole/files/crash/` —— 文件在不在。
+   在，说明只是分享面板没弹（`createChooser` 抛了 `ActivityNotFoundException`，
+   日志有 `分享崩溃日志失败`），手动把文件发出去即可；
+2. 节流：自动分享 10s 一次、每会话 2 次，超了只写日志。日志有
+   `本次会话已自动分享 2 次，后续只记录不弹窗` 就是撞上限了；
+3. 手动触发：`chrome://inspect` 连上后在 Console 里 `__moleShareCrash('随手试试')`，
+   能弹说明通道正常，问题在触发点；弹不出说明 `MoleBridge.reportCrash` 没注入（检查 dex 里
+   有没有 `MainActivity$JsBridge;->reportCrash`）。
+
+### 左下角没有方向键按钮 / 点了没反应
+
+- 按钮只在播放器元素出现后 500ms 内挂载，最多等 30s；超时日志有一条
+  `方向键浮钮放弃：60 次（30s）内没等到播放器元素`——那是黑屏问题，先修黑屏；
+- `__moleDpad.state()` 看 `engine`：`omnipad` 正常，`native` 是兜底模式（OmniPad 没挂上，
+  或 `#pad` 还没建起来）。兜底模式功能不减，只是皮肤朴素；
+- 按键无反应但状态正常：游戏内那个小游戏可能不吃 `Arrow*`（有的吃 `WASD` 或直接吃鼠标）。
+  先用 `__moleDpad.off()` 关掉，改用触控板点；
+- 十字键挡住了游戏面板：`__moleDpad.toggle(false)` 收起。位置写死在左下角 `10px`，
+  本版不做拖动。
 
 ### 文字全是方块 / 中文不显示
 

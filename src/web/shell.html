@@ -411,8 +411,34 @@
   function budgetNow() {
     /* 1.1.9-beta：实际参与算 DPR 的预算永远不低于地板档。
        BUDGET 本身（Java 档位 / 运行时看护推送）不变，只是不能把
-       渲染分辨率拖到「马赛克档」去。 */
-    var base = Math.max(BUDGET, BUDGET_MIN);
+       渲染分辨率拖到「马赛克档」去。
+
+       1.2.4-beta：地板改成**软地板** —— 修复「一直崩、却一直降不下来」。
+       ---------------------------------------------------------------
+       现象（平板 / OPPO 反馈）：闪退之后重开还是闪退，一天能崩几十次；
+          日志里 loadLevel 一路 0→6 全升满，渲染实况里 canvas 尺寸
+          却一动不动。
+
+       根因（就是上面这行 Math.max）：
+          Java 的 evaluateLoadLevel() 已经是一台正规状态机 ——
+          连续崩溃升一档、连续 2 次平稳启动降一档，
+          PIXEL_BUDGETS = 121万 / 90万 / 66万 / 46万 / 32万 / 21万。
+          但这里把 BUDGET 钳到 ≥ BUDGET_MIN(121万)，**后 5 档全部失效**。
+          于是：显存吃紧 → native crash → loadLevel+1 → 预算不变
+          → 同样的分辨率再去撞同一堵墙 → 再崩。档位涨到顶也没用。
+
+          1.1.9 加地板的初衷是修「把连崩次数当画质档位、一进游戏就
+          满屏马赛克」；但一刀切到「永远不许低于 121 万」，
+          等于把保命的那条腿也锯了。
+
+       现在的规则：地板只保护「偶发崩溃」的设备。
+          · 档位 0~2（崩过 1~2 次）：仍按 BUDGET_MIN 兜住，观感不变 ——
+            偶发一次 OOM 不该让画质永久变差，1.1.9 的修复照旧成立；
+          · 档位 ≥3（连崩 3 次以上）：说明这台机器**真的**扛不住当前
+            分辨率，放开地板按真实档位降。先活下来，再谈清晰度。
+          降下去之后只要连续 2 次平稳启动，Java 侧会自己把档位降回来
+          （boot_good_runs_v4 那条分支），画质自动回升。 */
+    var base = Math.max(BUDGET, softFloor());
     if (!shownArea) return base;
     var nativePx = shownArea * raw * raw;              // 屏幕原生像素
     var want = Math.max(shownArea * DENSITY, base);    // 不低于基准档
@@ -420,6 +446,40 @@
     /* 分屏 / 小窗兜底：别糊成一片，但也不许超过原生像素 */
     return Math.max(eff, Math.min(nativePx, base * 0.4));
   }
+
+  /* ------------------------------------------------------------------
+   * 1.2.4-beta：软地板 —— Java 注入的档位预算 → 允许的地板
+   * ---------------------------------------------------------------
+   * PIXEL_BUDGETS 六个档位在 Java 侧是常量，JS 只拿到当前档位的数值，
+   * 所以这里按数值反查档位。对不上（比如运行时看护推了个自定义值）
+   * 就按「第 0 档」处理，宁可保画质 —— 那种情况说明不是崩溃降档造成的。
+   * ------------------------------------------------------------------ */
+  var PIXEL_LEVELS = [1210000, 900000, 660000, 460000, 320000, 210000];
+  var SOFT_FLOOR_FROM = 3;      // 档位 ≥ 3 才放开地板（= 连崩 3 次以上）
+  function budgetLevel(b) {
+    for (var i = 0; i < PIXEL_LEVELS.length; i++) {
+      if (Math.abs(b - PIXEL_LEVELS[i]) < 1000) return i;
+    }
+    return 0;
+  }
+  function softFloor() {
+    var lv = budgetLevel(BUDGET);
+    return lv >= SOFT_FLOOR_FROM ? BUDGET : BUDGET_MIN;
+  }
+
+  /* ------------------------------------------------------------------
+   * 1.2.4-beta：把预算/档位/地板导出到 window
+   * ---------------------------------------------------------------
+   * 这一段是个 IIFE，BUDGET / softFloor / budgetLevel 全是闭包变量。
+   * 第 2 段（Ruffle 配置）和后面的崩溃报告都是各自独立的 IIFE，
+   * 直接引用 BUDGET 会 ReferenceError —— 而那里正好包着 try/catch，
+   * 于是「预算=… 生效=…」那半行启动日志一直是静默丢失的。
+   * 导出来，日志和崩溃报告才拿得到真实数字。
+   * ------------------------------------------------------------------ */
+  window.__moleBudgetInfo = function () {
+    var lv = budgetLevel(BUDGET);
+    return { budget: BUDGET, floor: softFloor(), level: lv };
+  };
 
   /* 渲染后端，同样由 Java 侧注入（见 Ruffle 配置段的说明） */
   var RENDERER = 'wgpu-webgl';
@@ -872,6 +932,9 @@
         catch (e) { parts.push(String(a)); }
       }
       var line = maskIp(level + '| ' + parts.join(' '));
+      /* 1.2.4-beta：喂给崩溃报告的环形缓冲（第 8 段）。
+         只在崩溃/上报时读，平时零成本 —— 一次 push + 一次 shift。 */
+      try { if (window.__moleRing) window.__moleRing(line); } catch (e) {}
       enqueue(line);
       hudLine(line);
     }
@@ -980,7 +1043,12 @@
         + ' | 字体渲染=canvas(跟随手机)'
         + ' | 后端=' + (window.__moleRenderer || '?')
         + '（降级档位=' + (window.__moleRendererTier || 0) + '）'
-        + ' | 预算=' + BUDGET + 'px（生效 ' + Math.max(BUDGET, BUDGET_MIN) + 'px）'
+        + ' | 预算=' + (function () {
+            try {
+              var b = window.__moleBudgetInfo();
+              return b.budget + 'px（生效 ' + b.floor + 'px，档位 ' + b.level + '）';
+            } catch (e) { return '?'; }
+          })()
         + ' | DPR raw=' + window.__moleDprRaw + ' 钳制后=' + window.__moleDprCap.toFixed(2)
         + ' | 缩放=' + (window.__moleFitScale || 1).toFixed(3)
         + ' | 视口=' + window.innerWidth + 'x' + window.innerHeight); } catch (e) {}
@@ -2219,6 +2287,483 @@ exports.BaseEntity=N;exports.Button=Ri;exports.ButtonBaseView=L;exports.ButtonCo
       audio: c ? c.state : 'none',
       playing: !!(p && p.instance && p.instance.is_playing())
     };
+  };
+})();
+
+/* ==================================================================
+ * 8) 崩溃收集与一键转发（1.2.4-beta）
+ * ==================================================================
+ * 要解决的问题：用户报「闪退 / 红屏 / 卡死」，但拿不到任何可用的东西 ——
+ *   logcat 要连电脑，录屏看不见原因，截图只有一块红屏。维护者只能靠猜。
+ *
+ * 做法：崩溃现场（Ruffle panic / JS 未捕获异常 / WebGL 上下文丢失 /
+ *   主动上报）发生时，把「设备 + 渲染状态 + 现场 + 最近日志」拼成一份
+ *   纯文本，落盘成 txt 并调系统分享面板 —— 可以直接选 QQ 发给开发者。
+ *
+ * 三条刻意守住的边界：
+ *   1) 只读状态、只写自己的文件，不碰画质 / 帧率 / 画幅 / 节流器 /
+ *      输入法守卫 / 纹理回收 / 服务器地址 / OmniPad 逻辑；
+ *   2) GPU 探测只在**要生成报告时**做一次，用完立刻 loseContext ——
+ *      常驻持有一个 WebGL 上下文本身就是显存压力源，不能为了诊断
+ *      反而加重崩溃；
+ *   3) 自动弹窗有节流（10s 一次、每会话 2 次），连环 panic 时不会
+ *      变成「点不完的分享框」把用户挡在游戏外面。
+ * ================================================================== */
+window.__moleCrash = (function () {
+  var TAG = '[MoleShell]';
+  var APPV = '1.2.4-beta';
+  var RING_MAX = 140;
+  var ring = [];
+  var errs = [];
+  var autoShared = 0;
+  var AUTO_SHARE_MAX = 2;
+  var lastAt = 0;
+
+  function ringPush(line) {
+    ring.push(line);
+    if (ring.length > RING_MAX) ring.shift();
+  }
+  window.__moleRing = ringPush;
+
+  function pad2(n) { return (n < 10 ? '0' : '') + n; }
+  function fmtTime(d) {
+    d = d || new Date();
+    return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate())
+      + ' ' + pad2(d.getHours()) + ':' + pad2(d.getMinutes()) + ':' + pad2(d.getSeconds());
+  }
+  function stamp() {
+    var d = new Date();
+    return '' + d.getFullYear() + pad2(d.getMonth() + 1) + pad2(d.getDate())
+      + '-' + pad2(d.getHours()) + pad2(d.getMinutes()) + pad2(d.getSeconds());
+  }
+
+  /* GPU 型号：崩溃现场才探一次，探完立刻销毁上下文 */
+  function gpuInfo() {
+    var out = '未知';
+    try {
+      var c = document.createElement('canvas');
+      c.width = c.height = 1;
+      var gl = c.getContext('webgl') || c.getContext('experimental-webgl');
+      if (!gl) return '无 WebGL 上下文（系统未启用或已被回收）';
+      var ext = gl.getExtension('WEBGL_debug_renderer_info');
+      var vendor = ext ? gl.getParameter(ext.UNMASKED_VENDOR_WEBGL) : gl.getParameter(gl.VENDOR);
+      var rend = ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER);
+      out = String(vendor) + ' | ' + String(rend);
+      try {
+        var lc = gl.getExtension('WEBGL_lose_context');
+        if (lc) lc.loseContext();
+      } catch (e) {}
+      gl = null;
+      c = null;
+    } catch (e) { out = '探测失败：' + e; }
+    return out;
+  }
+
+  function canvasInfo() {
+    try {
+      var p = document.querySelector('ruffle-player,ruffle-embed,ruffle-object');
+      var sh = p && p.shadowRoot;
+      var c = sh ? sh.querySelector('canvas') : null;
+      if (!c) return '无画布';
+      return c.width + 'x' + c.height + '（CSS ' + c.clientWidth + 'x' + c.clientHeight + '）';
+    } catch (e) { return '读取失败：' + e; }
+  }
+
+  function envLines() {
+    var L = [];
+    L.push('触发时间: ' + fmtTime());
+    L.push('客户端版本: ' + APPV + '（Android）');
+    L.push('');
+    L.push('----- 设备 -----');
+    L.push('UA: ' + navigator.userAgent);
+    L.push('屏幕: ' + screen.width + 'x' + screen.height
+      + ' | 视口: ' + window.innerWidth + 'x' + window.innerHeight
+      + ' | DPR: ' + (window.devicePixelRatio || 1));
+    L.push('GPU: ' + gpuInfo());
+    try {
+      if (performance.memory) {
+        L.push('JS 堆: ' + Math.round(performance.memory.usedJSHeapSize / 1048576) + ' MB / '
+          + Math.round(performance.memory.jsHeapSizeLimit / 1048576) + ' MB');
+      }
+    } catch (e) {}
+    L.push('');
+    L.push('----- 渲染状态 -----');
+    L.push('后端: ' + (window.__moleRenderer || '?')
+      + '（降级档位 ' + (window.__moleRendererTier || 0) + '）');
+    L.push('画布: ' + canvasInfo());
+    try {
+      var b = window.__moleBudgetInfo();
+      L.push('像素预算: ' + b.budget + ' px（生效 ' + b.floor + '，档位 ' + b.level + '）');
+    } catch (e) { L.push('像素预算: 读取失败'); }
+    try {
+      L.push('影片: ' + (window.__moleMovieW || '?') + 'x' + (window.__moleMovieH || '?')
+        + ' | 缩放: ' + (window.__moleFitScale ? window.__moleFitScale.toFixed(3) : '?'));
+    } catch (e) {}
+    L.push('已运行: ' + Math.round((Date.now() - (window.__moleBootAt || Date.now())) / 1000) + 's');
+    try {
+      L.push('本次会话 panic 次数: '
+        + (parseInt(sessionStorage.getItem('mole_panic_n') || '0', 10) || 0));
+    } catch (e) {}
+    try {
+      if (window.__molePad && window.__molePad.state) {
+        var s = window.__molePad.state();
+        L.push('OmniPad: mounted=' + s.mounted + ' 落点=' + (s.layout || '无')
+          + ' 靶区=' + (s.zone || '无'));
+      }
+    } catch (e) {}
+    try {
+      if (window.__moleBg) {
+        var g = window.__moleBg();
+        L.push('后台状态: frozen=' + g.frozen + ' hidden=' + g.hidden + ' playing=' + g.playing
+          + ' audio=' + g.audio);
+      }
+    } catch (e) {}
+    return L;
+  }
+
+  function build(kind, extra) {
+    var L = ['===== 摩尔庄园 Flash 客户端 · 崩溃报告 ====='];
+    L.push('报告类型: ' + (kind || '未指定'));
+    L = L.concat(envLines());
+    if (extra) {
+      L.push('');
+      L.push('----- 现场 -----');
+      for (var k in extra) {
+        if (Object.prototype.hasOwnProperty.call(extra, k)) {
+          L.push(k + ': ' + extra[k]);
+        }
+      }
+    }
+    if (errs.length) {
+      L.push('');
+      L.push('----- JS 运行时错误（最近 ' + errs.length + ' 条）-----');
+      for (var i = 0; i < errs.length; i++) L.push(errs[i]);
+    }
+    if (ring.length) {
+      L.push('');
+      L.push('----- 运行日志（最近 ' + ring.length + ' 行）-----');
+      for (var j = 0; j < ring.length; j++) L.push(ring[j]);
+    }
+    L.push('');
+    L.push('===== 报告结束 =====');
+    return L.join('\n');
+  }
+
+  /* 落盘 + 调系统分享。桥不在（浏览器里调试）就只打日志。 */
+  function share(kind, extra) {
+    var txt;
+    try { txt = build(kind, extra); } catch (e) { txt = '报告生成失败：' + e; }
+    var name = 'mole-crash-' + stamp() + '.txt';
+    try {
+      if (window.MoleBridge && MoleBridge.reportCrash) {
+        MoleBridge.reportCrash(name, txt);
+        try { console.warn(TAG + ' 已生成崩溃报告：' + name + '（已请求系统分享）'); } catch (e) {}
+        return txt;
+      }
+    } catch (e) {
+      try { console.warn(TAG + ' 分享桥调用失败：' + e); } catch (x) {}
+    }
+    try { console.warn(TAG + ' 崩溃报告（无桥，仅写日志）\n' + txt); } catch (e) {}
+    return txt;
+  }
+
+  /* 自动分享的节流：10s 一次、每会话 2 次 */
+  function auto(kind, extra) {
+    var now = Date.now();
+    if (now - lastAt < 10000) return null;
+    if (autoShared >= AUTO_SHARE_MAX) {
+      try { console.warn(TAG + ' 本次会话已自动分享 ' + autoShared + ' 次，后续只记录不弹窗'); } catch (e) {}
+      return null;
+    }
+    lastAt = now;
+    autoShared++;
+    return share(kind, extra);
+  }
+
+  /* 运行时错误留档：不单独弹窗（可能高频），随 panic / 闪退一起带走。
+     注意：监听注册必须自带兜底 —— 单测（tests/pad_test.js）用 vm 沙箱跑本段，
+     stub 出来的 window 没有 addEventListener，裸调会整段抛错。 */
+  function on(target, type, fn, opt) {
+    try {
+      if (target && typeof target.addEventListener === 'function') {
+        target.addEventListener(type, fn, opt);
+      }
+    } catch (e) {}
+  }
+  on(window, 'error', function (e) {
+    try {
+      errs.push(fmtTime() + ' ' + (e.message || 'error')
+        + ' @' + (e.filename || '?') + ':' + (e.lineno || 0) + ':' + (e.colno || 0));
+      if (errs.length > 40) errs.shift();
+    } catch (x) {}
+  }, true);
+  on(window, 'unhandledrejection', function (e) {
+    try {
+      var r = e && e.reason;
+      errs.push(fmtTime() + ' [unhandledrejection] ' + (r && r.stack ? r.stack : String(r)));
+      if (errs.length > 40) errs.shift();
+    } catch (x) {}
+  });
+
+  return {
+    share: share,
+    auto: auto,
+    build: build,
+    ring: ringPush,
+    info: function () { return { ring: ring.length, errs: errs.length, autoShared: autoShared }; }
+  };
+})();
+
+/* 控制台 / 调试口子：__moleShareCrash('原因') 立刻生成并分享一份报告 */
+window.__moleShareCrash = function (kind) {
+  try { return window.__moleCrash.share(kind || '手动上报', null); } catch (e) { return null; }
+};
+
+/* ==================================================================
+ * 9) 虚拟方向键浮钮（1.2.4-beta）
+ * ==================================================================
+ * 需求：手机/平板上要能像键盘一样按上下左右 —— 摩尔庄园里不少小游戏
+ *   （走格子、赛车、贪吃蛇一类）只吃 ArrowUp/Down/Left/Right，
+ *   触摸屏上根本按不出来。
+ *
+ * 用 OmniPad 自带的 VirtualDPad，不自己造轮子：
+ *   · DPadCore 的构造是 new T(targetStageId, mapping?.[方向])，
+ *     emitter 按下发 KEYDOWN、抬起发 KEYUP；
+ *   · mapping 支持直接写按键名（内部 Z 表里有 ArrowUp/ArrowDown/
+ *     ArrowLeft/ArrowRight，keyCode 37~40 一应俱全）；
+ *   · 皮肤也不用画 —— omnipad-0.7.3.css 里 .omnipad-dpad-cross-bg /
+ *     .dpad-arm.top|bottom|left|right / .dpad-arm.on 全套都在，
+ *     连按下高亮的 CSS 变量都备好了。
+ *
+ * 交互：默认只露一个 46x46 的半透明圆钮（左下角），点一下展开十字键，
+ *   再点收起。收起时用 opacity+pointer-events 隐藏而**不是** display:none
+ *   —— 后者会让 OmniPad 量到的 rect 变成 0，重新展开时方向键全乱。
+ *
+ * 兜底：OmniPad 没挂上（内核太旧 / #pad 没建起来）时，退化成四个自绘键
+ *   + 原生 KeyboardEvent 直接派发到播放器元素，功能不减、只是没有皮肤。
+ *
+ * 与游戏本体无关：画幅 / 帧率 / 画质 / 输入法守卫 / 回收机制一律不碰；
+ *   __moleDpad.off() 一句话拆掉。
+ * ================================================================== */
+window.__moleDpad = (function () {
+  var TAG = '[MoleShell]';
+  function log(m) { try { console.log(TAG + ' ' + m); } catch (e) {} }
+
+  var KEYMAP = {
+    up:    { key: 'ArrowUp',    code: 'ArrowUp',    keyCode: 38 },
+    down:  { key: 'ArrowDown',  code: 'ArrowDown',  keyCode: 40 },
+    left:  { key: 'ArrowLeft',  code: 'ArrowLeft',  keyCode: 37 },
+    right: { key: 'ArrowRight', code: 'ArrowRight', keyCode: 39 }
+  };
+  var DIRS = ['up', 'down', 'left', 'right'];
+
+  var host = null;      // 浮层容器（挂在 body）
+  var btn = null;       // 折叠钮
+  var panel = null;     // 十字键容器
+  var dpad = null;      // OmniPad VirtualDPad 实例
+  var open = false;
+  var usingOmni = false;
+  var fakeBtn = {};     // 兜底模式下的四个自绘键
+  var downSet = {};     // 兜底模式：当前按下的方向
+
+  function playerEl() {
+    return document.querySelector('ruffle-player,ruffle-embed,ruffle-object');
+  }
+
+  /* 绑事件统一走这里：真机 DOM 一定有 addEventListener，但离线单测用的是
+     vm 里的极简桩（tests/pad_test.js），裸调会把整段脚本炸掉。 */
+  function listen(el, type, fn, opt) {
+    try {
+      if (el && typeof el.addEventListener === 'function') el.addEventListener(type, fn, opt);
+    } catch (e) {}
+  }
+
+  function injectCss() {
+    if (document.getElementById('moleDpadCss')) return;
+    var hostCss = document.head || document.body;
+    if (!hostCss) return;
+    var st = document.createElement('style');
+    st.id = 'moleDpadCss';
+    st.textContent = [
+      '#moleDpadHost{position:fixed;left:10px;bottom:10px;z-index:12;',
+      '  width:46px;height:46px;pointer-events:none;touch-action:none;}',
+      '#moleDpadBtn{position:absolute;inset:0;border-radius:50%;',
+      '  background:rgba(0,0,0,.42);border:2px solid rgba(255,255,255,.45);',
+      '  color:rgba(255,255,255,.92);font-size:20px;line-height:42px;text-align:center;',
+      '  pointer-events:auto;user-select:none;-webkit-user-select:none;',
+      '  -webkit-tap-highlight-color:transparent;cursor:pointer;}',
+      '#moleDpadBtn.on{background:rgba(255,186,67,.55);border-color:#ffba43;}',
+      '#moleDpadPanel{position:absolute;left:0;bottom:56px;width:132px;height:132px;',
+      '  pointer-events:auto;touch-action:none;opacity:0;visibility:hidden;',
+      '  transition:opacity .12s ease-out;}',
+      '#moleDpadPanel.on{opacity:1;visibility:visible;}',
+      '#moleDpadPanel .mole-fake-key{position:absolute;width:40px;height:40px;',
+      '  box-sizing:border-box;background:rgba(255,255,255,.15);',
+      '  border:2px solid rgba(255,255,255,.4);border-radius:8px;',
+      '  color:#fff;font-size:16px;line-height:36px;text-align:center;',
+      '  pointer-events:auto;user-select:none;-webkit-user-select:none;}',
+      '#moleDpadPanel .mole-fake-key.down{background:rgba(255,186,67,.6);border-color:#ffba43;}',
+      '#moleDpadPanel .fk-up{left:46px;top:0;}',
+      '#moleDpadPanel .fk-down{left:46px;bottom:0;}',
+      '#moleDpadPanel .fk-left{left:0;top:46px;}',
+      '#moleDpadPanel .fk-right{right:0;top:46px;}'
+    ].join('');
+    hostCss.appendChild(st);
+  }
+
+  /* 兜底模式：把方向键直接派发到播放器元素，冒泡到 window 后 Ruffle 收得到 */
+  function fireKey(dir, isDown) {
+    var m = KEYMAP[dir];
+    if (!m) return;
+    var target = playerEl() || document.body;
+    var type = isDown ? 'keydown' : 'keyup';
+    var ev = null;
+    try {
+      ev = new KeyboardEvent(type, {
+        key: m.key, code: m.code, bubbles: true, cancelable: true, composed: true
+      });
+      /* keyCode / which 在 KeyboardEvent 里是只读的，现代 WebView 里必须补 */
+      try { Object.defineProperty(ev, 'keyCode', { get: function () { return m.keyCode; } }); } catch (e) {}
+      try { Object.defineProperty(ev, 'which', { get: function () { return m.keyCode; } }); } catch (e) {}
+    } catch (e) {
+      ev = document.createEvent('Event');
+      ev.initEvent(type, true, true);
+      ev.key = m.key; ev.code = m.code; ev.keyCode = m.keyCode; ev.which = m.keyCode;
+    }
+    try { target.dispatchEvent(ev); } catch (e) { log('派发失败：' + e); }
+  }
+
+  function buildFakeKeys() {
+    for (var i = 0; i < DIRS.length; i++) {
+      (function (dir) {
+        var el = document.createElement('div');
+        el.className = 'mole-fake-key fk-' + dir;
+        el.textContent = { up: '▲', down: '▼', left: '◀', right: '▶' }[dir];
+        listen(el, 'pointerdown', function (e) {
+          e.preventDefault(); e.stopPropagation();
+          if (downSet[dir]) return;
+          downSet[dir] = 1;
+          el.classList.add('down');
+          fireKey(dir, true);
+        }, { passive: false });
+        function up(e) {
+          if (e) { e.preventDefault(); e.stopPropagation(); }
+          if (!downSet[dir]) return;
+          downSet[dir] = 0;
+          el.classList.remove('down');
+          fireKey(dir, false);
+        }
+        listen(el, 'pointerup', up, { passive: false });
+        listen(el, 'pointercancel', up, { passive: false });
+        listen(el, 'pointerleave', up, { passive: false });
+        panel.appendChild(el);
+        fakeBtn[dir] = el;
+      })(DIRS[i]);
+    }
+  }
+
+  function tryOmniDpad() {
+    var OP = window.OmniPad;
+    if (!OP || typeof OP.VirtualDPad !== 'function') return false;
+    if (typeof OP.TargetZone !== 'function') return false;
+    var padRoot = document.getElementById('pad');
+    if (!padRoot) return false;          // 第 5 段还没挂上，靶区不存在
+    try {
+      dpad = new OP.VirtualDPad(panel, {
+        widgetId: '$dpad',
+        targetStageId: '$stage',         // 第 5 段 TargetZone 的 widgetId
+        layout: { left: '0px', top: '0px', width: '132px', height: '132px' },
+        mapping: {
+          up: 'ArrowUp', down: 'ArrowDown', left: 'ArrowLeft', right: 'ArrowRight'
+        },
+        threshold: 0.3,
+        showStick: false
+      });
+      usingOmni = true;
+      log('方向键已用 OmniPad VirtualDPad 挂载（映射 ArrowUp/Down/Left/Right）');
+      return true;
+    } catch (e) {
+      log('VirtualDPad 挂载失败，改用原生键盘事件：' + e);
+      dpad = null;
+      usingOmni = false;
+      return false;
+    }
+  }
+
+  function toggle(force) {
+    open = (force === undefined) ? !open : !!force;
+    if (panel) panel.className = open ? 'on' : '';
+    if (btn) btn.className = open ? 'on' : '';
+    log('方向键' + (open ? '已展开' : '已收起') + '（' + (usingOmni ? 'OmniPad' : '原生键盘事件') + '）');
+    return open;
+  }
+
+  function build() {
+    if (host) return true;
+    if (!document.body) return false;
+    if (!playerEl()) return false;
+    injectCss();
+
+    host = document.createElement('div');
+    host.id = 'moleDpadHost';
+
+    panel = document.createElement('div');
+    panel.id = 'moleDpadPanel';
+    host.appendChild(panel);
+
+    btn = document.createElement('div');
+    btn.id = 'moleDpadBtn';
+    btn.textContent = '✛';
+    listen(btn, 'pointerdown', function (e) {
+      e.preventDefault();
+      e.stopPropagation();
+    }, { passive: false });
+    listen(btn, 'click', function (e) {
+      e.preventDefault();
+      e.stopPropagation();
+      toggle();
+    }, false);
+    host.appendChild(btn);
+
+    document.body.appendChild(host);
+
+    /* 先试 OmniPad；不成再画四个键。没挂上就先画兜底键，
+       等 #pad 出现后再尝试升级成 VirtualDPad。 */
+    if (!tryOmniDpad()) buildFakeKeys();
+    return true;
+  }
+
+  var tries = 0;
+  var waiter = setInterval(function () {
+    tries++;
+    var ok = build();
+    if (ok) {
+      /* 兜底模式下如果后来 #pad 建起来了，升级一把 */
+      if (!usingOmni && tries % 10 === 0 && tryOmniDpad()) {
+        while (panel.firstChild) panel.removeChild(panel.firstChild);
+        fakeBtn = {};
+      }
+      if (usingOmni || tries > 60) clearInterval(waiter);
+    } else if (tries > 60) {
+      clearInterval(waiter);
+      log('方向键浮钮放弃：60 次（30s）内没等到播放器元素');
+    }
+  }, 500);
+
+  return {
+    on: function () { return build(); },
+    off: function () {
+      try { if (host && host.parentNode) host.parentNode.removeChild(host); } catch (e) {}
+      try { if (dpad && dpad.destroy) dpad.destroy(); } catch (e) {}
+      host = null; btn = null; panel = null; dpad = null; open = false; fakeBtn = {}; downSet = {};
+      try { clearInterval(waiter); } catch (e) {}
+      log('方向键浮钮已拆除');
+      return true;
+    },
+    toggle: toggle,
+    state: function () {
+      return { mounted: !!host, open: open, engine: usingOmni ? 'omnipad' : 'native' };
+    }
   };
 })();
 </script>

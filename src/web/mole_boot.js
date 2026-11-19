@@ -78,6 +78,17 @@
                 lostTimer = setTimeout(function () {
                     lostTimer = null;
                     log('!! WebGL 上下文 2.5s 未恢复 → 上报 Java');
+                    /* 1.2.4-beta：这是 native 闪退（Adreno SIGTRAP / mmap 失败）
+                       之前唯一能拿到手的信号，必须留一份现场。 */
+                    try {
+                        if (window.__moleCrash && window.__moleCrash.auto) {
+                            window.__moleCrash.auto('WebGL 上下文丢失未恢复', {
+                                '画布': c.width + 'x' + c.height,
+                                '渲染后端': (window.__moleRenderer || '?'),
+                                '说明': 'GPU 显存吃紧，Ruffle 未能自行恢复，可能随后 native 崩溃'
+                            });
+                        }
+                    } catch (x) {}
                     try { MoleBridge.onGpuExhausted('dead'); } catch (e) {}
                 }, 2500);
                 try { MoleBridge.onGpuExhausted('lost'); } catch (e) {}
@@ -222,15 +233,58 @@
         var looksGpu = /wgpu|webgl|webgpu|render|adapter|swap ?chain|context|surface|device\s*lost|pipeline|shader|texture|out of memory|gpu/i
             .test(flat + ' ' + x.title);
 
+        /* ------------------------------------------------------------------
+         * 1.2.4-beta：证据驱动的降档判定
+         * ---------------------------------------------------------------
+         * 现象（OPPO / 真机反馈）：红屏「更频繁」，重开还是红屏。
+         *
+         * 根因：降档完全依赖上面这条正则。而 Adreno 上 wgpu 的 panic
+         *   文本常常只有 `Something went wrong` + 一段 wasm 堆栈，
+         *   既没有 "wgpu" 也没有 "render" —— 于是被判成「内容类」，
+         *   后端档位不动。Java 重载 → 还是 wgpu-webgl → 再炸一遍。
+         *   用户端看到的就是「一直在红屏」，而且每次都要手动重开。
+         *
+         * 修法：加一条不依赖文本的证据 —— **同一个后端档位上连续崩 2 次**，
+         *   不管 panic 说了什么，都判定为这个后端在这台机器上不可用。
+         *   第一次仍然尊重文本判定（避免内容类 panic 被误降画质），
+         *   第二次才强制降档，代价可控、不会误伤。
+         * ------------------------------------------------------------------ */
+        var tierKey = 'mole_panic_tier_' + (window.__moleRendererTier || 0);
+        var tierN = 0;
+        try {
+            tierN = (parseInt(sessionStorage.getItem(tierKey) || '0', 10) || 0) + 1;
+            sessionStorage.setItem(tierKey, String(tierN));
+        } catch (e) { tierN = 1; }
+        var repeatTier = tierN >= 2;
+        if (repeatTier && !looksGpu) {
+            log('!! 同一后端档位第 ' + tierN + ' 次 panic（文本不像 GPU 问题）'
+                + ' → 按证据判定为后端不可用，强制降档');
+        }
+
         var n = panicCount(true);
         log('!! panic 累计 ' + n + ' 次（上限 ' + PANIC_MAX + '）');
+
+        /* 1.2.4-beta：把现场交给崩溃报告（第 8 段），由 Java 落盘并调系统分享。
+           放在重载之前 —— 一旦开始重载，这些变量就都拿不到了。 */
+        try {
+            if (window.__moleCrash && window.__moleCrash.auto) {
+                window.__moleCrash.auto('Ruffle panic', {
+                    '渲染后端': (window.__moleRenderer || '?') + '（档位 ' + (window.__moleRendererTier || 0) + '）',
+                    '后端档位连续崩溃': tierN,
+                    '判定': (looksGpu ? '渲染后端类' : (repeatTier ? '证据驱动·后端不可用' : '非渲染类')),
+                    '已运行': up + 's',
+                    'panic 标题': x.title || '(空)',
+                    'panic 正文': flat || '(空)'
+                });
+            }
+        } catch (e) {}
 
         if (n > PANIC_MAX) {
             log('!! 连续 panic 到上限，停止自动恢复（红屏保留，请把上面这些 !! 行发出来）');
             return;
         }
 
-        if (looksGpu) {
+        if (looksGpu || repeatTier) {
             var next = null;
             try { next = window.__moleRendererBump && window.__moleRendererBump(); } catch (e) {}
             log(next ? '!! 判定为渲染后端不兼容 → 下次改用 ' + next

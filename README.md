@@ -23,6 +23,7 @@
 
 - [这是什么](#这是什么)
 - [功能特性](#功能特性)
+- [1.2.4-beta 更新摘要](#124-beta-更新摘要)
 - [1.2.0 更新摘要](#120-更新摘要)
 - [实机截图](#实机截图)
 - [下载与安装](#下载与安装)
@@ -89,15 +90,22 @@
 - **断线重连**：`SocketBridge` 上下行对称关闭 + 有界线程池，避免线程泄漏导致的假死
 - **无损纹理回收**：长跑显存吃紧时，用跨帧抖动让 Ruffle 重建渲染目标，**只归还纹理、不降画质**
 - **崩溃自动降档**：连续异常启动时逐级下调像素预算（6 档，121 万 → 21 万），不再无限重载；
-  1.2.0 起给参与算 DPR 的预算加了地板，降档照常生效但不会再被拖进马赛克档
-- **红屏自愈**（1.2.0）：华为 / Adreno 上 wgpu 是在**绘制阶段** panic，Ruffle 自己的后端退路走不到。
-  侦测 `shadowRoot` 里的 `#panic` 面板（Ruffle 只派发 `loadedmetadata` / `loadeddata`，
-  监听 `'panic'` 事件是死代码），按 panic 文本判定渲染类 / 内容类，渲染类才降后端
-  `wgpu-webgl → webgl → canvas`，结果存 `localStorage`、只在本机真崩过之后才往下走，会话内上限 4 次
+  1.2.4-beta 修掉「地板把后 5 档全废」——1.2.0 起的硬地板让档位 1~5 与档位 0 完全等价，
+  连崩 5 次的机器拿到的分辨率与干净安装一模一样，于是崩了降、降了白降。
+  现在地板只保护 0~2 档，3 档及以下尊重 Java 押下来的预算，稳定后由 `boot_good_runs_v4` 逐档回升
+- **红屏自愈**（1.2.0 / 1.2.4-beta 加强）：华为 / Adreno 上 wgpu 是在**绘制阶段** panic，
+  Ruffle 自己的后端退路走不到。侦测 `shadowRoot` 里的 `#panic` 面板（Ruffle 只派发 `loadedmetadata` /
+  `loadeddata`，监听 `'panic'` 事件是死代码），按 panic 文本判定渲染类 / 内容类，渲染类才降后端
+  `wgpu-webgl → webgl → canvas`，结果存 `localStorage`、只在本机真崩过之后才往下走，会话内上限 4 次。
+  1.2.4-beta 加「证据驱动」：ColorOS 上 Adreno 的 panic 文案常常只有一句 `Something went wrong`，
+  关键词判定失效 → 后端永远不降。现在**同一后端档位第二次崩**就不再猜原因、直接降
 
 **好操作**
 
 - **虚拟触控板**（[OmniPad](https://github.com/omnipad-js/omnipad)）：黑边里的摇杆式光标控制，专治「悬停才展开」的 PC 交互
+- **虚拟方向键**（1.2.4-beta）：左下角 46×46 圆钮，点开是 132×132 十字键，按 `ArrowUp/Down/Left/Right`。
+  用 OmniPad 自带的 `VirtualDPad`（键表里 37~40 齐全）+ 现成皮肤；内核太旧或 OmniPad 没挂上时，
+  退化成四个自绘键 + 原生 `KeyboardEvent` 直派到播放器，功能不减。`__moleDpad.off()` 可关
 - **靶区（TargetZone）**：单指直接点舞台，命中位置精确到像素，穿透 Ruffle 的 Shadow DOM
 - **触控板不压画面**：只挂在黑边里，四边都没有余量时自动不显示
 - **16:10 平板也有板子**（1.2.0）：黑边判定放宽到 `MIN_BAR 30` / `EDGE_GUARD 12`；
@@ -124,10 +132,41 @@
 - **渲染实况**（1.2.0）：启动 3 秒后打一行
   `[MoleShell] 渲染实况 budget=… DPR=… canvas=宽x高 元素=宽x高 显示=宽x高`。
   `canvas/元素` 大于 1.6 说明画面发虚、大于 2.5 就是马赛克，画质问题不用再猜
-- 调试口：`__moleClock()`、`__molePad.state()`、`__molePurgeTex()`，
+- 调试口：`__moleClock()`、`__molePad.state()`、`__molePurgeTex()`、`__moleBudgetInfo()`、
+  `__moleDpad.state()`、`__moleCrash.info()`、`__moleShareCrash('原因')`，
   以及默认关闭的长帧探针 `__molePerf.on()`（用原生 rAF，不叠循环）
+- **崩溃报告自动上报**（1.2.4-beta）：panic 面板出现、WebGL 上下文 2.5s 未恢复时，
+  自动生成一份中文 `.txt`（设备 / GPU / 渲染后端 / 画布 / 像素预算 / 影片尺寸 / 最近 140 行日志 / 脱敏 IP），
+  落到 `/Android/data/com.taomee.mole/files/crash/`，并弹出系统分享面板——选 QQ 就能直接发给开发者。
+  不需要任何存储权限，节流 10s 一次、每会话 2 次
 
 ---
+
+## 1.2.4-beta 更新摘要
+
+针对群友反馈的三件事：平板卡顿闪退、OPPO 红屏更频繁、缺少方向键与崩溃上报。
+完整证据链与逐条对照见 [patches/1.2.4-beta/README.md](patches/1.2.4-beta/README.md)。
+
+### 修复
+
+| 症状 | 根因 | 位置 |
+| --- | --- | --- |
+| 平板越用越卡、闪退，重装才好 | `budgetNow()` 的 `Math.max(BUDGET, BUDGET_MIN)` 让 `PIXEL_BUDGETS` 后 5 档全部等价于档位 0：连崩 → 档位升 → 预算不动 → 同分辨率再崩。Adreno 的 `mmap failed errno 12` 本来就是「少给像素就能活」 | `shell.html` |
+| OPPO 红屏比别的机型勤且永远好不了 | 降档条件依赖 panic 文案命中 GPU 关键词，ColorOS 上文案常常只有一句 `Something went wrong` → `looksGpu` 恒 false → 后端恒不降 | `mole_boot.js` |
+| 启动诊断里「预算=」一栏永远是空 | 该行引用了 IIFE 闭包内的 `BUDGET` / `softFloor`，外层取不到，`ReferenceError` 被 `try/catch` 吞掉 | `shell.html` |
+
+### 新增
+
+| 能力 | 说明 |
+| --- | --- |
+| 崩溃报告与分享 | 三处触发（panic / 上下文丢失 / JS 未捕获异常）→ 生成中文 txt → `ACTION_SEND` 系统分享面板，可直发 QQ。新增 `CrashReport.smali` + `CrashReport$1.smali` + `JsBridge.reportCrash` |
+| 虚拟方向键 | `__moleDpad`：OmniPad `VirtualDPad` 优先，原生键盘事件兜底，左下角悬浮钮展开/收起 |
+| 预算软地板 | `softFloor()`：地板只保护 0~2 档（≥46 万），3 档及以下用 Java 真实预算，`×1.6` 仍是硬顶 |
+
+### 没有动的
+
+画幅（`960×560` + letterbox）、帧率 24、节流器、`quality`、`PIXEL_BUDGETS` 数组、
+无损纹理回收、五层输入法守卫、OmniPad 本体逻辑、引擎三件套。
 
 ## 1.2.0 更新摘要
 
@@ -206,23 +245,31 @@
 
 ## 下载与安装
 
-全部产物见 [Releases](https://github.com/Earthink030918/mole-flash-android/releases/latest)。当前版本 **v1.2.0**。
+全部产物见 [Releases](https://github.com/Earthink030918/mole-flash-android/releases/latest)。
+最新预发布 **v1.2.4-beta**（仅 Android），最新正式版 **v1.2.0**（双端）。
 
 | 平台 | 文件 | 大小 | 系统要求 |
 | --- | --- | --- | --- |
-| Android | `mole-1.2.0.apk` | 9.88 MiB | Android 5.0（API 21）以上，建议 8+ |
-| HarmonyOS | `mole-harmony-1.2.0-signed.hap` | 10.93 MiB | HarmonyOS 5.0.0（API 12）以上 |
+| Android（预发布） | `mole-flash-1.2.4-beta.apk` | 9.89 MiB | Android 5.0（API 21）以上，建议 8+ |
+| Android（正式） | `mole-1.2.0.apk` | 9.88 MiB | 同上 |
+| HarmonyOS（正式） | `mole-harmony-1.2.0-signed.hap` | 10.93 MiB | HarmonyOS 5.0.0（API 12）以上 |
+
+> **1.2.4-beta 换了签名密钥**（与原 `974EA1B9…` 不同），安装前必须先卸载旧版，
+> `INSTALL_FAILED_UPDATE_INCOMPATIBLE` 是预期行为。代价是 `mole_shell` 里缓存的
+> 服务器地址要重学一遍（重进游戏自动完成）。1.2.0 及以前不受影响，仍可覆盖安装。
 
 ### Android
 
 ```bash
-adb install -r mole-1.2.0.apk
+adb install -r mole-1.2.0.apk          # 正式版
+adb install -r mole-flash-1.2.4-beta.apk  # 预发布（先卸载旧版）
 ```
 
 或在手机上下载 APK 后直接点开安装（需允许「安装未知来源应用」）。
 
-- 签名证书 SHA-256：`974EA1B9 54845D05 FAECF5D4 568EBDEF 783BBCB5 F929281D EC3D6A71 C0780093`
-- 与历史版本 **同签名**，可直接覆盖安装、保留登录态；若提示签名冲突，说明装的是官方原包，需先卸载
+- 1.2.0 签名证书 SHA-256：`974EA1B9 54845D05 FAECF5D4 568EBDEF 783BBCB5 F929281D EC3D6A71 C0780093`
+- 1.2.4-beta 签名证书 SHA-256：`B9197126 C1CE0BCA 61AC7DAE 50722443 33F427D2 D87C87BC 16A9B69D AE845BEE`
+- 1.2.0 与历史版本 **同签名**，可直接覆盖安装、保留登录态；若提示签名冲突，说明装的是官方原包，需先卸载
 - 首次启动会申请网络权限，无其他任何权限
 
 ### HarmonyOS
@@ -254,6 +301,12 @@ v1.2.0 校验值：
 ```
 b776302bbc5ce46c71e773d4425edc2f2bee5fa99d0a13101571e59c57331714  mole-1.2.0.apk
 c8b99da639c9f9598898ac2c1822127c7e89024c107d7ff0465442c61e113af5  mole-harmony-1.2.0-signed.hap
+```
+
+v1.2.4-beta 校验值：
+
+```
+0b00716b9f94ad06a1e04d4a215b243be7dd82061a585837309624a2ec31ad02  mole-flash-1.2.4-beta.apk
 ```
 
 ---
@@ -602,13 +655,15 @@ __moleKb.focus()   // 手动聚焦那个 1px 输入框
 
 ## 版本与更新日志
 
-当前 **v1.2.0**（2026-11-12，正式版；Android `versionCode 24` / HarmonyOS `versionCode 7`）。
-自 v1.1.0 起共 15 个 versionCode 的迭代收束于此，逐版对照、两端差异与 HAP 重建过程见
-[docs/release-1.2.0.md](docs/release-1.2.0.md)。完整记录见 [CHANGELOG.md](CHANGELOG.md)，
+当前预发布 **v1.2.4-beta**（2026-11-19，仅 Android `versionCode 25`）；
+最新正式版 **v1.2.0**（2026-11-12；Android `versionCode 24` / HarmonyOS `versionCode 7`）。
+1.2.0 的逐版对照、两端差异与 HAP 重建过程见 [docs/release-1.2.0.md](docs/release-1.2.0.md)。
+完整记录见 [CHANGELOG.md](CHANGELOG.md)，
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
 | 版本 | 要点 |
 | --- | --- |
+| **1.2.4-beta** | 针对反馈的三件事：平板卡顿闪退、OPPO 红屏更频繁、缺方向键与崩溃上报。修 `budgetNow()` 的硬地板把 `PIXEL_BUDGETS` 后 5 档全废（连崩 → 档位升 → 预算不动 → 再崩），改成只保护 0~2 档的软地板；修 OPPO 上 panic 文案认不出 GPU 关键词导致后端永不降档，改为「同一档位二次崩即降」的证据驱动。新增崩溃报告自动生成 + 系统分享（可直发 QQ）与 `__moleDpad` 虚拟方向键。**换签名密钥**，需先卸载旧版。仅 Android（10,368,388 B，SHA-256 `0b00716b…ad02`）。画幅/帧率/节流器/`quality`/预算档位/回收/输入法守卫一律未动 |
 | **1.2.0** | 正式版。新增 / 修复清单见上方 [1.2.0 更新摘要](#120-更新摘要)。Android 内容 = 1.1.9-beta，只去掉 `-beta`（10,356,100 B，SHA-256 `b776302b…1714`）；HarmonyOS 首次同步新引擎（`EFKRKUVC` / `I56A2W5M`）并合入画质地板（11,465,574 B，SHA-256 `c8b99da6…3af5`）。相对 v1.1.0 的累积变化：画质、输入法、卡顿、红屏、后台存活、平板触控、引擎换代七组，画幅/帧率/节流器/`quality`/预算档位/回收策略/服务器地址一律未动 |
 | **1.1.9-beta** | 修「一进游戏整屏马赛克」。根因不是新引擎，是 `evaluateLoadLevel()` 把**连崩次数**当降载档位（`PIXEL_BUDGETS` 最低档 210,000 → DPR 0.79 → canvas 759×443 铺 2304×1344，放大 3.37×）。给参与算 DPR 的预算加地板 `BUDGET_MIN = 1210000`（= 档位 0），并把 `DENSITY 1.44→1.7`、`MAXPIX 160万→220万`、`FLOOR 0.5→0.7`：平板 759×443 → **1669×974**（放大 1.53×，优于 1.1.7 基线的 1.67×）。档位数组/显存看护/降载接口/无损纹理回收/画幅/帧率/节流器/输入法全未动；加一行 `[MoleShell] 渲染实况` 诊断（3s 打一次，`canvas/元素 > 1.6` 即发虚、`> 2.5` 即马赛克）。顺带核实 `quality: 'low'` 与分辨率无关（`stage.rs::set_quality()` 只存值 + 请求重绘） |
 | **1.1.8-beta** | 第二次换引擎（`MK7STBFJ` / `JTCYPQ5T`），`ruffle.js` 692,938 → 691,942 B；鸿蒙 `rawfile` 侧顺带删掉 10-21 遗留的两个死 wasm（20 MB → 10 MB） |
