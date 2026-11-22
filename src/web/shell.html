@@ -2318,7 +2318,7 @@ exports.BaseEntity=N;exports.Button=Ri;exports.ButtonBaseView=L;exports.ButtonCo
  * ================================================================== */
 window.__moleCrash = (function () {
   var TAG = '[MoleShell]';
-  var APPV = '1.2.6-beta';
+  var APPV = '1.2.7-beta';
   var RING_MAX = 140;
   var ring = [];
   var errs = [];
@@ -2344,8 +2344,14 @@ window.__moleCrash = (function () {
       + '-' + pad2(d.getHours()) + pad2(d.getMinutes()) + pad2(d.getSeconds());
   }
 
-  /* GPU 型号：崩溃现场才探一次，探完立刻销毁上下文 */
-  function gpuInfo() {
+  /* GPU 型号：崩溃现场才探一次，探完立刻销毁上下文。
+     1.2.7-beta：实时日志页每 1 秒要重出一份报告，如果每次都探 GPU，
+     那就是每秒 new 一个 canvas + WebGL 上下文 —— 正是本段开头第 2 条
+     禁区。所以探测结果缓存起来，实时刷新时只读缓存（cached=true），
+     崩溃上报仍然现探（panic 之后上下文状态可能已经变了）。 */
+  var gpuCache = '';
+  function gpuInfo(cached) {
+    if (cached && gpuCache) return gpuCache;
     var out = '未知';
     try {
       var c = document.createElement('canvas');
@@ -2363,6 +2369,7 @@ window.__moleCrash = (function () {
       gl = null;
       c = null;
     } catch (e) { out = '探测失败：' + e; }
+    if (!gpuCache) gpuCache = out;
     return out;
   }
 
@@ -2385,7 +2392,7 @@ window.__moleCrash = (function () {
     } catch (e) { return '读取失败：' + e; }
   }
 
-  function envLines() {
+  function envLines(cachedGpu) {
     var L = [];
     L.push('触发时间: ' + fmtTime());
     L.push('客户端版本: ' + APPV + '（Android）');
@@ -2395,7 +2402,7 @@ window.__moleCrash = (function () {
     L.push('屏幕: ' + screen.width + 'x' + screen.height
       + ' | 视口: ' + window.innerWidth + 'x' + window.innerHeight
       + ' | DPR: ' + (window.devicePixelRatio || 1));
-    L.push('GPU: ' + gpuInfo());
+    L.push('GPU: ' + gpuInfo(cachedGpu));
     try {
       if (performance.memory) {
         L.push('JS 堆: ' + Math.round(performance.memory.usedJSHeapSize / 1048576) + ' MB / '
@@ -2437,10 +2444,12 @@ window.__moleCrash = (function () {
     return L;
   }
 
-  function build(kind, extra) {
-    var L = ['===== 摩尔庄园 Flash 客户端 · 崩溃报告 ====='];
+  /* opt.title   —— 报告抬头（崩溃报告 / 运行日志）
+     opt.cachedGpu —— 复用缓存的 GPU 串，实时刷新时用 */
+  function build(kind, extra, opt) {
+    var L = ['===== 摩尔庄园 Flash 客户端 · ' + ((opt && opt.title) || '崩溃报告') + ' ====='];
     L.push('报告类型: ' + (kind || '未指定'));
-    L = L.concat(envLines());
+    L = L.concat(envLines(opt && opt.cachedGpu));
     if (extra) {
       L.push('');
       L.push('----- 现场 -----');
@@ -2565,7 +2574,14 @@ window.__moleCrash = (function () {
     auto: auto,
     build: build,
     ring: ringPush,
-    info: function () { return { ring: ring.length, errs: errs.length, autoShared: autoShared }; }
+    /* 实时日志页只读这两样：末尾 N 行、以及计数 —— 都是 O(1)/O(N小) */
+    tail: function (n) {
+      n = (n > 0) ? n : 40;
+      return ring.length > n ? ring.slice(ring.length - n) : ring.slice(0);
+    },
+    info: function () {
+      return { ring: ring.length, ringMax: RING_MAX, errs: errs.length, autoShared: autoShared };
+    }
   };
 })();
 
@@ -2880,7 +2896,7 @@ window.__moleDpad = (function () {
 })();
 
 /* ==================================================================
- * 10) 崩溃页 —— 崩了就停在这一页（1.2.6-beta）
+ * 10) 崩溃页 / 运行日志页 —— 崩了就停在这一页，没崩也能主动打开（1.2.7-beta）
  * ==================================================================
  * 要解决的问题（两份群友日志 + 之前所有「闪退」反馈的共同症状）：
  *   一崩 → Ruffle 那屏红橙渐变 → 6 秒后页面自己 location.reload()
@@ -2893,12 +2909,16 @@ window.__moleDpad = (function () {
  *   mole_boot.js 里那个 6 秒兜底。这一点以前没人拆开看，所以「红屏停留
  *   六秒」一直被当成正常现象。这一版把这段等待换成一张说人话的页面。
  *
- * 这一版做的事：
- *   · panic 之后不再自动重载，直接把 Ruffle 的红屏整块盖住；
- *   · 页面上写明发生了什么、跑了多久、什么后端、崩了几次；
- *   · 右上角一个分享按钮，走 1.2.4 已经打通的 ACTION_SEND 通道
- *     （txt 落盘 + 系统分享面板），点开选 QQ 就能发到群里；
- *   · 想继续玩点「重新进入」，重载时用的是**已经降好的后端档位**。
+ * 1.2.6：panic 之后不再自动重载，改为盖一张说明页；右上角分享按钮走
+ *   1.2.4 已经打通的 ACTION_SEND 通道（txt 落盘 + 系统分享面板）；点
+ *   「重新进入」重载时用的是**已经降好的后端档位**。
+ *
+ * 1.2.7：同一张页面多了一个入口 —— 游戏里右上角的「日志」浮钮随时能把它
+ *   叫出来，此时它叫「运行日志页」：
+ *     · 不重载、不降档、不碰 player，只是盖一层 DOM；游戏在下面继续跑；
+ *     · 日志每 1 秒重抓一次（复用缓存的 GPU 串，不再新建 WebGL 上下文）；
+ *     · 点「↗ 分享日志」→ 立刻冻结（停止刷新、定稿正文）→ 拉起系统分享；
+ *     · 「← 返回游戏」或系统返回键 → 收起浮层，回到原样的游戏主页面。
  *
  * 刻意守住的边界：
  *   只操作自己的浮层 DOM，绝不往 player 里写任何东西 —— panic 之后
@@ -2907,9 +2927,19 @@ window.__moleDpad = (function () {
  * ================================================================== */
 window.__moleCrashPage = (function () {
   var TAG = '[MoleShell]';
-  var APPV = '1.2.6-beta';
+  var APPV = '1.2.7-beta';
   var host = null, refs = {}, cssDone = false;
   var lastText = '', lastKind = '', lastExtra = null, shownAt = 0;
+
+  /* 一张页面两个来路（1.2.7）：mode 只决定文案、主按钮、是否刷新，
+     DOM 骨架共用 —— 两套 UI 各写一遍迟早长歪。 */
+  var mode = 'crash';        // 'crash' | 'live'
+  var timer = null;          // live 模式的刷新定时器
+  var frozen = false;        // 点过分享就冻结，不再改 lastText
+  var pushed = false;        // 是否往 history 里塞过一条，用来吃返回键
+  var pushedAt = 0;          // 塞进去的时刻，用来挡「上一次 back 的余波」
+  var TICK_MS = 1000;
+  var TAIL_MAX = 40;
 
   function listen(t, type, fn, opt) {
     try {
@@ -2933,6 +2963,142 @@ window.__moleCrashPage = (function () {
     var s = Math.round((Date.now() - (window.__moleBootAt || Date.now())) / 1000);
     if (s < 60) return s + ' 秒';
     return Math.floor(s / 60) + ' 分 ' + (s % 60) + ' 秒';
+  }
+
+  /* ---- 1.2.7：实时刷新 / 冻结 / 返回 ---- */
+  function ringCount() {
+    try {
+      var i = window.__moleCrash && window.__moleCrash.info ? window.__moleCrash.info() : null;
+      return i ? i.ring : 0;
+    } catch (e) { return 0; }
+  }
+  function ringMax() {
+    try {
+      var i = window.__moleCrash && window.__moleCrash.info ? window.__moleCrash.info() : null;
+      return i && i.ringMax ? i.ringMax : 140;
+    } catch (e) { return 140; }
+  }
+
+  function stopTimer() {
+    if (timer !== null) {
+      try { clearInterval(timer); } catch (e) {}
+      timer = null;
+    }
+    return timer;
+  }
+
+  function startTimer() {
+    stopTimer();
+    try {
+      timer = setInterval(function () {
+        try { tick(false); } catch (e) {}
+      }, TICK_MS);
+    } catch (e) { timer = null; }
+    return timer;
+  }
+
+  /* 冻结 = 用户点了分享。此刻起 lastText 定稿，定时器停掉，
+     后面即使再有新日志也不会改变要发出去的那一份。 */
+  function freeze(reason) {
+    if (frozen) return false;
+    frozen = true;
+    stopTimer();
+    try {
+      if (refs.logMeta) {
+        refs.logMeta.textContent = '已冻结在分享前这一刻 · 共 ' + ringCount() + ' 行';
+        refs.logMeta.className = 'mcp-logmeta frozen';
+      }
+    } catch (e) {}
+    try {
+      if (refs.bShare) refs.bShare.textContent = '↗ 分享日志';
+    } catch (e) {}
+    warn('运行日志：已停止刷新（' + (reason || 'freeze') + '）');
+    return true;
+  }
+
+  /* 重抓一帧：正文 + 五行摘要 + 日志尾巴。
+     注意 build 带 cachedGpu —— 这里每秒跑一次，绝不能新建 WebGL 上下文。 */
+  function tick(force) {
+    if (mode !== 'live' || frozen) return false;
+    try {
+      if (!force && document.visibilityState === 'hidden') return false;
+    } catch (e) {}
+    var kind = '运行日志（实时抓取）';
+    var extra = {
+      '入口': '游戏内「日志」浮钮（可返回）',
+      '刷新': '每 ' + (TICK_MS / 1000) + ' 秒'
+    };
+    try {
+      lastText = window.__moleCrash
+        ? window.__moleCrash.build(kind, extra, { cachedGpu: true, title: '运行日志' })
+        : ('运行日志：' + kind);
+    } catch (e) { lastText = '日志生成失败：' + e; }
+    lastKind = kind;
+    lastExtra = extra;
+    fill(kind);
+    fillLog();
+    return true;
+  }
+
+  function fillLog() {
+    if (!refs.log) return;
+    var lines = [];
+    try {
+      lines = (window.__moleCrash && window.__moleCrash.tail)
+        ? window.__moleCrash.tail(TAIL_MAX) : [];
+    } catch (e) { lines = []; }
+    var n = lines.length;
+    try {
+      refs.log.textContent = n ? lines.join('\n') : '（本次运行还没有产生日志）';
+    } catch (e) {}
+    try {
+      if (refs.logMeta && !frozen) {
+        var total = ringCount();
+        refs.logMeta.textContent = (total > n ? '最近 ' + n + ' 行 / 共 ' + total + ' 行' : '共 ' + total + ' 行')
+          + (mode === 'live'
+            ? ' · 每 ' + (TICK_MS / 1000) + ' 秒刷新'
+            : ' · 上限 ' + ringMax() + ' 行（定稿）');
+        refs.logMeta.className = 'mcp-logmeta';
+      }
+    } catch (e) {}
+    /* 只有本来就贴在底部时才跟着滚 —— 用户手动往回翻的时候别抢滚动条 */
+    try {
+      if (refs.log.scrollHeight - refs.log.scrollTop - refs.log.clientHeight < 48) {
+        refs.log.scrollTop = refs.log.scrollHeight;
+      }
+    } catch (e) {}
+  }
+
+  function hideBtn() { try { if (window.__moleLogBtn) window.__moleLogBtn.hide(); } catch (e) {} }
+  function showBtn() { try { if (window.__moleLogBtn) window.__moleLogBtn.show(); } catch (e) {} }
+
+  function pushHistory() {
+    if (pushed) return false;
+    try {
+      /* 不传 URL：同文档状态，http://mole.61.com/__mole_shell__ 上必定成功，
+         也绝不会触发一次真实导航 → 不会重载页面 → 不会动到正在跑的游戏。 */
+      if (window.history && typeof window.history.pushState === 'function') {
+        window.history.pushState({ moleLog: 1 }, '');
+        pushed = true;
+        pushedAt = Date.now();
+      }
+    } catch (e) { pushed = false; }
+    return pushed;
+  }
+
+  /* viaPop=true 表示是系统返回键 / history.back() 触发的，别再回退一次 */
+  function close(viaPop) {
+    stopTimer();
+    frozen = false;
+    try { if (host) host.className = ''; } catch (e) {}
+    showBtn();
+    if (!viaPop && pushed) {
+      pushed = false;
+      try { window.history.back(); } catch (e) {}
+      return true;
+    }
+    pushed = false;
+    return true;
   }
 
   /* 样式一次性注入。用 opacity/visibility 之外的东西都无所谓 ——
@@ -2980,6 +3146,49 @@ window.__moleCrashPage = (function () {
       'border-color:#ffc46b;}',
       '#moleCrashPage .mcp-btn:active{transform:scale(.97);}',
       '#moleCrashPage .mcp-foot{margin:12px 0 0;font-size:11px;line-height:1.6;color:#7d6a5c;text-align:center;}',
+      /* 1.2.7：日志正文区。崩溃时是定稿快照，手动打开时每 1 秒刷一帧。 */
+      '#moleCrashPage .mcp-logbox{margin:12px 0 0;border:1px solid rgba(255,196,107,.18);',
+      'border-radius:12px;background:rgba(0,0,0,.34);overflow:hidden;}',
+      '#moleCrashPage .mcp-logmeta{padding:7px 12px;font-size:11px;line-height:1.4;color:#9d8676;',
+      'border-bottom:1px solid rgba(255,255,255,.06);}',
+      '#moleCrashPage .mcp-logmeta.frozen{color:#ffc46b;}',
+      '#moleCrashPage .mcp-log{margin:0;padding:8px 12px;min-height:64px;max-height:30vh;',
+      'overflow:auto;-webkit-overflow-scrolling:touch;touch-action:pan-y;',
+      'font:11px/1.55 ui-monospace,Menlo,Consolas,"Noto Sans Mono CJK SC",monospace;',
+      'color:#cfc0b2;white-space:pre-wrap;word-break:break-all;background:transparent;}',
+      /* 1.2.7：横屏时日志页改成两栏 —— 左边摘要 + 按钮，右边日志正文。
+         只挂在 .live 上，崩溃页一个字不动（同一份 DOM，两种排法）。
+         手机横屏的 CSS 视口只有 400 出头，单栏竖着码下来按钮会被挤到
+         屏幕外，必须让日志去吃掉右边的空当。 */
+      '@media (orientation:landscape) and (min-width:600px){',
+      '  #moleCrashPage.live .mcp-card{display:grid;max-width:900px;',
+      '    grid-template-columns:minmax(0,.95fr) minmax(0,1.05fr);',
+      '    grid-template-areas:"head log" "rows log" "tip log" "btns log" "foot log";',
+      '    column-gap:16px;align-items:start;}',
+      '  #moleCrashPage.live .mcp-head{grid-area:head;}',
+      '  #moleCrashPage.live .mcp-rows{grid-area:rows;}',
+      '  #moleCrashPage.live .mcp-tip{grid-area:tip;}',
+      '  #moleCrashPage.live .mcp-btns{grid-area:btns;}',
+      '  #moleCrashPage.live .mcp-foot{grid-area:foot;}',
+      '  #moleCrashPage.live .mcp-logbox{grid-area:log;margin-top:14px;align-self:stretch;',
+      '    display:flex;flex-direction:column;max-height:calc(100vh - 150px);}',
+      '  #moleCrashPage.live .mcp-log{flex:1 1 auto;min-height:0;max-height:none;}',
+      /* 视口只有 360~420 高的时候，左栏必须瘦身：不然「返回游戏」会被
+         挤到屏幕外面，用户以为这一页出不去。表情、字号、行距一起收。 */
+      '  #moleCrashPage.live .mcp-face{display:none;}',
+      '  #moleCrashPage.live h1{font-size:17px;margin:2px 0 2px;}',
+      '  #moleCrashPage.live .mcp-sub{font-size:12px;line-height:1.6;margin:4px 0 8px;}',
+      '  #moleCrashPage.live .mcp-rows{display:grid;grid-template-columns:1fr 1fr;',
+      '    column-gap:12px;padding:0 10px;}',
+      '  #moleCrashPage.live .mcp-row{padding:5px 0;}',
+      '  #moleCrashPage.live .mcp-k{flex:0 0 42px;}',
+      '  #moleCrashPage.live .mcp-row.mcp-wide{grid-column:1 / -1;}',
+      '  #moleCrashPage.live .mcp-tip{font-size:11.5px;line-height:1.55;margin:10px 0 0;padding:7px 10px;}',
+      '  #moleCrashPage.live .mcp-btns{margin:10px 0 2px;}',
+      '  #moleCrashPage.live .mcp-btn{flex:1 1 0;min-width:0;padding:9px 4px;',
+      '    font-size:12px;white-space:nowrap;}',
+      '  #moleCrashPage.live .mcp-foot{margin:6px 0 0;}',
+      '}',
       '#moleCrashPage .mcp-toast{position:fixed;left:50%;bottom:calc(26px + env(safe-area-inset-bottom));',
       'transform:translateX(-50%);max-width:82%;padding:9px 16px;border-radius:999px;font-size:12px;',
       'background:rgba(0,0,0,.82);color:#ffd9a8;border:1px solid rgba(255,179,71,.3);',
@@ -3011,19 +3220,29 @@ window.__moleCrashPage = (function () {
   }
 
   /* ---- 分享：走 1.2.4 打通的 Java 通道（落盘 txt + 系统分享面板） ----
-     分享面板里选 QQ 就能直接发到群，不需要 FileProvider，也不额外要权限。 */
+     分享面板里选 QQ 就能直接发到群，不需要 FileProvider，也不额外要权限。
+     1.2.7：手动打开时先冻结再分享 —— 用户点下去的那一刻，发出去的就是
+     他眼前看到的那一份，不会因为晚了一秒而多出几行对不上号的日志。 */
   function share() {
+    var live = (mode === 'live');
+    /* 冻结在取正文之前：先停表、定稿，再取 lastText —— 顺序反了就可能
+       发出「比页面多一行」的报告。 */
+    if (live) freeze('分享');
     var txt = lastText;
     if (!txt && window.__moleCrash) {
-      try { txt = window.__moleCrash.build(lastKind || 'Ruffle panic', lastExtra); } catch (e) {}
+      try {
+        txt = live
+          ? window.__moleCrash.build(lastKind || '运行日志', lastExtra, { cachedGpu: true, title: '运行日志' })
+          : window.__moleCrash.build(lastKind || 'Ruffle panic', lastExtra);
+      } catch (e) {}
     }
     if (!txt) txt = '（报告生成失败，请把这一页截图发给开发者）';
-    var name = 'mole-crash-' + stamp() + '.txt';
+    var name = (live ? 'mole-log-' : 'mole-crash-') + stamp() + '.txt';
     try {
       if (window.MoleBridge && typeof MoleBridge.reportCrash === 'function') {
         MoleBridge.reportCrash(name, txt);
-        toast('已拉起分享，选 QQ 就能发到群里');
-        warn('崩溃页：已请求系统分享 ' + name);
+        toast(live ? '日志已冻结，选 QQ 就能发到群里' : '已拉起分享，选 QQ 就能发到群里');
+        warn((live ? '运行日志页：' : '崩溃页：') + '已请求系统分享 ' + name);
         return true;
       }
     } catch (e) {
@@ -3058,27 +3277,97 @@ window.__moleCrashPage = (function () {
     try { location.reload(); } catch (e) {}
   }
 
+  /* 主按钮：崩溃页是「重新进入」，日志页是「返回游戏」。
+     返回走 close()，绝不 reload —— 日志页是一次纯粹的浮层进出，
+     下面的游戏一秒都没停，用户回去应该还是原来那一帧。 */
+  function main() {
+    if (mode === 'live') return close(false);
+    return restart();
+  }
+
+  /* 同一张页面按 mode 换文案。所有会变的字都在这里改，DOM 不重建，
+     所以崩溃页 ↔ 日志页之间切换不会闪、也不会丢掉已经输入的滚动位置。 */
+  function applyMode(m) {
+    mode = (m === 'live') ? 'live' : 'crash';
+    var live = (mode === 'live');
+    try { if (refs.brand) refs.brand.textContent = live ? '摩尔庄园 · 微端 · 运行日志' : '摩尔庄园 · 微端 · 崩溃现场'; } catch (e) {}
+    try { if (refs.face) refs.face.textContent = live ? '(´･ω･`)' : '(｡•́︿•̀｡)'; } catch (e) {}
+    try { if (refs.title) refs.title.textContent = live ? '运行日志 · 实时' : '呜……好像卡住了'; } catch (e) {}
+    try {
+      if (refs.sub) {
+        refs.sub.textContent = live
+          ? '游戏还在下面跑着，这里只是把运行记录摊开。点右上角「分享日志」'
+            + '会立刻停住刷新，再拉起分享面板。'
+          : '别担心，这不是你做错了什么。Flash 引擎刚才撞上了一个它自己解决不了的问题，'
+            + '现场我已经替你收拾好了 —— 点右上角「分享日志」，选 QQ 发到群里就行。';
+      }
+    } catch (e) {}
+    try {
+      if (refs.tip) {
+        refs.tip.textContent = live
+          ? '只有设备型号、渲染后端和最近的运行记录，没有账号密码，发到群里不会泄露什么。'
+          : '这份日志里只有设备型号、渲染后端和最近的运行记录，没有账号密码，'
+            + '发到群里不会泄露什么。想继续玩就点下面的「重新进入」。';
+      }
+    } catch (e) {}
+    try {
+      if (refs.bMain) {
+        refs.bMain.textContent = live ? '← 返回游戏' : '重新进入';
+        refs.bMain.className = 'mcp-btn primary';
+      }
+    } catch (e) {}
+    try {
+      if (refs.rows && refs.labels) {
+        refs.labels.kReason.textContent = live ? '状态' : '原因';
+        refs.labels.kCount.textContent = live ? '日志' : '崩溃次数';
+      }
+      /* 横屏两栏时左栏很窄：行数已经在日志区标题里写了，这条摘要
+         让位给「返回游戏」—— 一行都不能多。 */
+      if (refs.rowEls && refs.rowEls.kCount) {
+        refs.rowEls.kCount.style.display = live ? 'none' : '';
+      }
+    } catch (e) {}
+    /* 已经露着就顺手换装：.live 决定横屏要不要两栏 */
+    try {
+      if (host && isOn()) host.className = live ? 'on live' : 'on';
+    } catch (e) {}
+    return mode;
+  }
+
+  function isOn() {
+    return !!(host && /(^|\s)on(\s|$)/.test(host.className));
+  }
+
   function build() {
     host = make('div', '');
     host.id = 'moleCrashPage';
 
     var bar = make('div', 'mcp-bar');
-    bar.appendChild(make('div', 'mcp-brand', '摩尔庄园 · 微端 · 崩溃现场'));
+    refs.brand = make('div', 'mcp-brand', '摩尔庄园 · 微端 · 崩溃现场');
+    bar.appendChild(refs.brand);
     var btnShare = make('div', 'mcp-share');
     btnShare.textContent = '↗ 分享日志';
     listen(btnShare, 'click', function (e) {
       try { e.preventDefault(); e.stopPropagation(); } catch (x) {}
       share();
     }, false);
+    refs.bShare = btnShare;
     bar.appendChild(btnShare);
     host.appendChild(bar);
 
     var card = make('div', 'mcp-card');
-    card.appendChild(make('div', 'mcp-face', '(｡•́︿•̀｡)'));
-    card.appendChild(make('h1', '', '呜……好像卡住了'));
-    card.appendChild(make('div', 'mcp-sub',
+    /* 横屏两栏时这一整块占左栏第一行（见 .mcp-head 的 grid-area），
+       竖屏 / 崩溃页里它是个没有样式的普通 div，等于不存在。 */
+    var head = make('div', 'mcp-head');
+    refs.face = make('div', 'mcp-face', '(｡•́︿•̀｡)');
+    head.appendChild(refs.face);
+    refs.title = make('h1', '', '呜……好像卡住了');
+    head.appendChild(refs.title);
+    refs.sub = make('div', 'mcp-sub',
       '别担心，这不是你做错了什么。Flash 引擎刚才撞上了一个它自己解决不了的问题，'
-      + '现场我已经替你收拾好了 —— 点右上角「分享日志」，选 QQ 发到群里就行。'));
+      + '现场我已经替你收拾好了 —— 点右上角「分享日志」，选 QQ 发到群里就行。');
+    head.appendChild(refs.sub);
+    card.appendChild(head);
 
     var rows = make('div', 'mcp-rows');
     var rowDefs = [
@@ -3086,27 +3375,43 @@ window.__moleCrashPage = (function () {
       ['已运行', 'kUp'], ['崩溃次数', 'kCount']
     ];
     refs.rows = {};
+    refs.labels = {};
+    refs.rowEls = {};
     for (var i = 0; i < rowDefs.length; i++) {
       var r = make('div', 'mcp-row');
-      r.appendChild(make('span', 'mcp-k', rowDefs[i][0]));
+      var kl = make('span', 'mcp-k', rowDefs[i][0]);
+      r.appendChild(kl);
       var v = make('span', 'mcp-v', '—');
       r.appendChild(v);
       rows.appendChild(r);
       refs.rows[rowDefs[i][1]] = v;
+      refs.labels[rowDefs[i][1]] = kl;
+      refs.rowEls[rowDefs[i][1]] = r;
+      if (rowDefs[i][1] === 'kEngine') r.className = 'mcp-row mcp-wide';
     }
     card.appendChild(rows);
 
-    card.appendChild(make('div', 'mcp-tip',
+    /* 日志正文：崩溃时是定稿快照，手动打开时每 1 秒刷一帧。
+       单独成块是因为它自己要滚 —— 五行摘要永远在视野里，日志滚它的。 */
+    var logBox = make('div', 'mcp-logbox');
+    refs.logMeta = make('div', 'mcp-logmeta', '');
+    logBox.appendChild(refs.logMeta);
+    refs.log = make('pre', 'mcp-log', '');
+    logBox.appendChild(refs.log);
+    card.appendChild(logBox);
+
+    refs.tip = make('div', 'mcp-tip',
       '这份日志里只有设备型号、渲染后端和最近的运行记录，没有账号密码，'
-      + '发到群里不会泄露什么。想继续玩就点下面的「重新进入」。'));
+      + '发到群里不会泄露什么。想继续玩就点下面的「重新进入」。');
+    card.appendChild(refs.tip);
 
     var btns = make('div', 'mcp-btns');
-    var bRestart = make('div', 'mcp-btn primary', '重新进入');
-    listen(bRestart, 'click', function (e) {
+    refs.bMain = make('div', 'mcp-btn primary', '重新进入');
+    listen(refs.bMain, 'click', function (e) {
       try { e.preventDefault(); e.stopPropagation(); } catch (x) {}
-      restart();
+      main();
     }, false);
-    btns.appendChild(bRestart);
+    btns.appendChild(refs.bMain);
 
     var bCopy = make('div', 'mcp-btn', '复制报告');
     listen(bCopy, 'click', function (e) {
@@ -3139,7 +3444,8 @@ window.__moleCrashPage = (function () {
   function fill(kind) {
     var R = refs.rows;
     if (!R) return;
-    try { R.kReason.textContent = kind || '未知'; } catch (e) {}
+    var live = (mode === 'live');
+    try { R.kReason.textContent = live ? '运行中' : (kind || '未知'); } catch (e) {}
     try { R.kVer.textContent = APPV; } catch (e) {}
     try {
       R.kEngine.textContent = (window.__moleRenderer || '?')
@@ -3147,25 +3453,38 @@ window.__moleCrashPage = (function () {
     } catch (e) {}
     try { R.kUp.textContent = uptime(); } catch (e) {}
     try {
-      var n = parseInt(sessionStorage.getItem('mole_panic_n') || '0', 10) || 0;
-      R.kCount.textContent = n + ' 次（本次启动）';
+      if (live) {
+        var c = ringCount(), m = ringMax();
+        R.kCount.textContent = c + ' / ' + m + ' 行';
+      } else {
+        var n = parseInt(sessionStorage.getItem('mole_panic_n') || '0', 10) || 0;
+        R.kCount.textContent = n + ' 次（本次启动）';
+      }
     } catch (e) {}
   }
 
+  /* ================= 崩溃：终局 ================= */
   function show(kind, extra) {
     try {
       injectCss();
       if (!document.body) return false;
+      /* 从「日志页」被 panic 打断时，先把刷表停掉 —— 崩溃现场要的是
+         定稿，不是还在跳秒的数。 */
+      stopTimer();
+      frozen = false;
+      pushed = false;
       lastKind = kind || 'Ruffle panic';
       lastExtra = extra || null;
       try {
         lastText = window.__moleCrash
-          ? window.__moleCrash.build(lastKind, lastExtra)
+          ? window.__moleCrash.build(lastKind, lastExtra, { title: '崩溃报告' })
           : ('崩溃：' + lastKind);
       } catch (e) { lastText = '报告生成失败：' + e; }
       if (!host) build();
       if (!host) return false;
+      applyMode('crash');
       fill(lastKind);
+      fillLog();
       host.className = 'on';
       shownAt = Date.now();
       /* 把 OmniPad 那一层压住：panic 之后它已经没有意义，
@@ -3174,6 +3493,7 @@ window.__moleCrashPage = (function () {
         var pad = document.getElementById('pad');
         if (pad) pad.style.display = 'none';
       } catch (e) {}
+      hideBtn();
       warn('崩溃页已显示（' + lastKind + '），等用户分享或重进');
       return true;
     } catch (e) {
@@ -3182,19 +3502,205 @@ window.__moleCrashPage = (function () {
     }
   }
 
+  /* ================= 运行日志：可返回 =================
+     与 show() 的三点不同，每一点都是为了「不碰游戏本体」：
+       1) 不 reload、不降档 —— 游戏在下面继续跑；
+       2) 不碰 #pad —— OmniPad 正在服务游戏，收掉它等于改输入；
+       3) 往 history 里塞一条空状态，系统返回键就能把这一页收掉。 */
+  function showLive() {
+    try {
+      injectCss();
+      if (!document.body) return false;
+      if (!host) build();
+      if (!host) return false;
+      if (isOn() && mode === 'live') { tick(true); return true; }
+      stopTimer();
+      frozen = false;
+      applyMode('live');
+      host.className = 'on live';
+      shownAt = Date.now();
+      tick(true);
+      startTimer();
+      pushHistory();
+      hideBtn();
+      warn('运行日志页已打开（实时刷新，可返回）');
+      return true;
+    } catch (e) {
+      warn('运行日志页打开失败：' + e);
+      return false;
+    }
+  }
+
   function hide() {
+    stopTimer();
+    frozen = false;
     try { if (host) host.className = ''; } catch (e) {}
+    showBtn();
     return true;
   }
 
+  /* 系统返回键：MainActivity.onBackPressed 先 canGoBack 再 goBack，
+     所以我们塞进去的那条 history 正好兜住 —— 回到这一页时收到 popstate，
+     把浮层收掉，游戏原样露出来。 */
+  listen(window, 'popstate', function () {
+    if (!pushed) return;
+    /* 刚打开就收到 popstate，只可能是「上一次退回游戏」那一下的余波 ——
+       不能拿它把刚打开的页面收掉。300ms 足够盖住这个时序。 */
+    if (Date.now() - pushedAt < 300) return;
+    pushed = false;
+    try {
+      if (mode === 'live' && isOn()) close(true);
+    } catch (e) {}
+  });
+
   return {
     show: show,
+    showLive: showLive,
+    close: close,
     hide: hide,
     share: share,
     copy: copy,
     state: function () {
-      return { shown: !!(host && host.className === 'on'), at: shownAt, kind: lastKind, size: lastText.length };
+      return {
+        shown: isOn(),
+        at: shownAt,
+        kind: lastKind,
+        size: lastText.length,
+        mode: mode,
+        live: mode === 'live',
+        frozen: frozen,
+        ticking: timer !== null,
+        pushed: pushed
+      };
     }
+  };
+})();
+
+/* ==================================================================
+ * 10-B) 游戏内「日志」浮钮 —— 日志页的常驻入口（1.2.7-beta）
+ * ==================================================================
+ * 需求：横屏之后右上角要有一个按钮，点开就是那张「崩溃后会弹出来的」
+ *   分享页；但这一页可以被返回，上一级就是游戏主页面，日志还是活的。
+ *
+ * 为什么不做成「直接分享」的一个键：用户根本不知道该发什么。先给他看
+ *   一眼现场（五行摘要 + 日志尾巴），确认了再发，比按一下弹个面板靠谱。
+ *
+ * 三条边界：
+ *   1) 只是一个 44x30 的 div，z-index 13 —— 压在 OmniPad（9）之上、
+ *      崩溃页（2147483647）之下，既不抢手柄的触摸，也不会盖住终局页面；
+ *   2) 只读 DOM、只调 __moleCrashPage，不碰 player / 画幅 / 帧率；
+ *   3) 万一日志页建不起来（DOM 被拆、内存告急），退化成老行为：
+ *      直接生成一份报告并拉起分享 —— 按钮永远不会「点了没反应」。
+ *
+ * 位置：position:fixed + 右上角 + safe-area，横屏竖屏都贴当前视口的
+ *   右上角（本作 manifest 锁 landscape，实际只会是横屏右上角）。
+ * ================================================================== */
+window.__moleLogBtn = (function () {
+  var TAG = '[MoleShell]';
+  var host = null, hidden = false, opens = 0;
+
+  function listen(el, type, fn, opt) {
+    try {
+      if (el && typeof el.addEventListener === 'function') el.addEventListener(type, fn, opt);
+    } catch (e) {}
+  }
+  function warn(s) { try { console.warn(TAG + ' ' + s); } catch (e) {} }
+
+  function css() {
+    if (document.getElementById('moleLogBtnCss')) return;
+    var head = document.head || document.body;
+    if (!head) return;
+    var st = document.createElement('style');
+    st.id = 'moleLogBtnCss';
+    st.textContent = [
+      '#moleLogBtn{position:fixed;box-sizing:border-box;z-index:13;',
+      'right:calc(10px + env(safe-area-inset-right));top:calc(10px + env(safe-area-inset-top));',
+      'display:flex;align-items:center;justify-content:center;width:52px;height:34px;',
+      'border-radius:999px;background:rgba(0,0,0,.40);border:1px solid rgba(255,255,255,.34);',
+      'color:rgba(255,255,255,.92);',
+      'font:600 12px/1 system-ui,-apple-system,"PingFang SC","Noto Sans CJK SC",sans-serif;',
+      'letter-spacing:.02em;pointer-events:auto;cursor:pointer;',
+      'user-select:none;-webkit-user-select:none;-webkit-tap-highlight-color:transparent;',
+      'touch-action:none;}',
+      '#moleLogBtn:active{background:rgba(255,186,67,.62);border-color:#ffba43;color:#2a1a10;}'
+    ].join('');
+    head.appendChild(st);
+  }
+
+  function open(e) {
+    try { if (e) { e.preventDefault(); e.stopPropagation(); } } catch (x) {}
+    var p = window.__moleCrashPage;
+    if (p && typeof p.showLive === 'function') {
+      var ok = false;
+      try { ok = p.showLive(); } catch (x) { warn('日志页调用异常：' + x); }
+      if (ok) {
+        opens++;
+        return true;
+      }
+    }
+    /* 兜底：页面建不起来也绝不能「点了没反应」 */
+    warn('日志页不可用，降级为直接分享');
+    try { window.__moleCrash.share('手动上报', null); } catch (x) {}
+    return false;
+  }
+
+  function mount() {
+    if (host) return host;
+    if (!document.body) return null;
+    css();
+    host = document.createElement('div');
+    host.id = 'moleLogBtn';
+    host.textContent = '日志';
+    host.setAttribute('role', 'button');
+    host.setAttribute('aria-label', '查看并分享运行日志');
+    /* 触摸先掐住，别让底下的 OmniPad / 播放器把这一下也吃了 */
+    listen(host, 'touchstart', function (e) { try { e.stopPropagation(); } catch (x) {} }, { passive: true });
+    listen(host, 'click', open, false);
+    if (hidden) host.style.display = 'none';
+    document.body.appendChild(host);
+    warn('日志浮钮已就位（右上角）');
+    return host;
+  }
+
+  function hide() {
+    hidden = true;
+    try { if (host) host.style.display = 'none'; } catch (e) {}
+    return true;
+  }
+  function show() {
+    hidden = false;
+    try { if (host) host.style.display = ''; } catch (e) {}
+    return true;
+  }
+
+  /* 挂载放到宏任务里：本文件解析完紧接着就是 Ruffle 起播，两个元素
+     （一个 style + 一个 div）没必要挤在首帧的主线程上。body 还没建好
+     就退让重试，最多 20 次（约 5 秒），之后放弃 —— 一个按钮不值得为它
+     死循环。没有 setTimeout 的极简环境（离线单测）直接不挂。 */
+  function schedule(n) {
+    n = n || 0;
+    if (host) return false;
+    if (!document || !document.body) {
+      if (n < 20) {
+        try { setTimeout(function () { schedule(n + 1); }, 250); } catch (e) {}
+      }
+      return false;
+    }
+    try {
+      setTimeout(function () {
+        try { mount(); } catch (e) { warn('日志浮钮挂载失败：' + e); }
+      }, 0);
+    } catch (e) { return false; }
+    return true;
+  }
+  schedule(0);
+
+  return {
+    show: show,
+    hide: hide,
+    open: open,
+    mount: mount,
+    state: function () { return { mounted: !!host, hidden: hidden, opens: opens }; }
   };
 })();
 
