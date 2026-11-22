@@ -23,6 +23,7 @@
 
 - [这是什么](#这是什么)
 - [功能特性](#功能特性)
+- [1.2.6-beta 更新摘要](#126-beta-更新摘要)
 - [1.2.5-beta 更新摘要](#125-beta-更新摘要)
 - [1.2.4-beta 更新摘要](#124-beta-更新摘要)
 - [1.2.0 更新摘要](#120-更新摘要)
@@ -97,7 +98,8 @@
 - **核心重入自愈**（1.2.5-beta）：正文 `arena already borrowed` 是 Ruffle 的 arena 借用重入
   （`enter_arena_mut()` 借不到就 panic），既不是驱动也不是内容。这类 panic 只在 **wgpu** 后端上
   降一档 —— wgpu 的 web 后端是回调式胶水，是唯一能在 wasm 内部回调 JS 的后端；`webgl` / `canvas`
-  上仍然只重载，不白降画质
+  上仍然只重载，不白降画质。1.2.6-beta 起承认它治不了（栈溢出在 wasm 内部，
+  壳层碰不到 AS3 递归），改为「停在崩溃页 + 一键分享现场」，不再无限重载
 - **红屏自愈**（1.2.0 / 1.2.4-beta 加强）：华为 / Adreno 上 wgpu 是在**绘制阶段** panic，
   Ruffle 自己的后端退路走不到。侦测 `shadowRoot` 里的 `#panic` 面板（Ruffle 只派发 `loadedmetadata` /
   `loadeddata`，监听 `'panic'` 事件是死代码），按 panic 文本判定渲染类 / 内容类，渲染类才降后端
@@ -139,13 +141,64 @@
 - **渲染实况**（1.2.0）：启动 3 秒后打一行
   `[MoleShell] 渲染实况 budget=… DPR=… canvas=宽x高 元素=宽x高 显示=宽x高`。
   `canvas/元素` 大于 1.6 说明画面发虚、大于 2.5 就是马赛克，画质问题不用再猜
+- **崩溃页**（1.2.6-beta）：panic 之后**不再自动重载**，改为全屏一张说明页 ——
+  原因 / 版本 / 引擎与档位 / 已运行 / 崩溃次数，右上角 `↗ 分享日志` 拉起系统分享面板，
+  选 QQ 就能直接发到群里；另有「重新进入」「复制报告」「关于本作」。
+  同时静默落一份 txt 到 `Android/data/com.taomee.mole/files/crash/`，
+  用户看一眼就重进、甚至直接杀进程，现场也还在
+- **「关于本作」原生弹窗**（1.2.6-beta）：不用网页自绘 —— Android 走
+  `AlertDialog + Html.fromHtml`，「本作并非官方项目」那段是**真红字**（`ForegroundColorSpan`，
+  跟随系统深浅色与字体缩放）；鸿蒙侧按 UA 分派到 `NativeBridge.showAbout(json)`，
+  纯血鸿蒙用 `CustomDialog`（`AlertDialog.show` 的 message 只收 string，没法只让一段变红）。
+  「只弹一次」两端都记在系统偏好里，清 WebView 缓存也不重复骚扰
 - 调试口：`__moleClock()`、`__molePad.state()`、`__molePurgeTex()`、`__moleBudgetInfo()`、
-  `__moleDpad.state()`、`__moleCrash.info()`、`__moleShareCrash('原因')`，
+  `__moleDpad.state()`、`__moleCrash.info()`、`__moleShareCrash('原因')`、
+  `__moleCrashPage.show('原因')`、`__moleAbout.show(true)`，
   以及默认关闭的长帧探针 `__molePerf.on()`（用原生 rAF，不叠循环）
 - **崩溃报告自动上报**（1.2.4-beta）：panic 面板出现、WebGL 上下文 2.5s 未恢复时，
   自动生成一份中文 `.txt`（设备 / GPU / 渲染后端 / 画布 / 像素预算 / 影片尺寸 / 最近 140 行日志 / 脱敏 IP），
   落到 `/Android/data/com.taomee.mole/files/crash/`，并弹出系统分享面板——选 QQ 就能直接发给开发者。
   不需要任何存储权限，节流 10s 一次、每会话 2 次
+
+---
+
+## 1.2.6-beta 更新摘要
+
+依据两份群友日志（PHZ110 / Mali-G720 / Chromium 138，24117RK2CC / Adreno 750 / Chromium 156）。
+两台机器、两个 GPU 厂商、两个 Chromium 大版本，错误顺序**一模一样**：
+
+```
+RangeError: Maximum call stack size exceeded  @wasm://…
+RuntimeError: unreachable
+panicked at core\src\player.rs:485:16: arena already borrowed
+```
+
+完整证据链见 [patches/1.2.6-beta/README.md](patches/1.2.6-beta/README.md)。
+
+`arena already borrowed` 是**尸检报告**，不是死因：真正倒下的是上面那行 wasm 内的栈溢出。
+JS 侧的 RangeError 穿过 Rust 帧时析构函数一个都不跑，`gc_arena` 的借用守卫永久留在「已借出」，
+下一次进 `enter_arena_mut()` 就 `expect` 失败。所以 1.2.5 的「降一档」认得对但**治不了** ——
+换后端换的是 GL 抽象层，AS3 的递归深度一分不减。这一版不再假装能修它，只做两件确定有用的事。
+
+### 新增
+
+| 能力 | 说明 |
+| --- | --- |
+| **崩溃页** | panic 后不再自动重载，改为全屏一张说明页：原因 / 版本 / 引擎与档位 / 已运行 / 崩溃次数；**右上角「↗ 分享日志」**拉起系统分享面板，选 QQ 即可发到群里；另有「重新进入」「复制报告」「关于本作」。同时静默落一份 txt 到 `Android/data/com.taomee.mole/files/crash/`，直接杀进程也不丢现场 |
+| **「关于本作」原生弹窗** | Android：`AlertDialog` + `Html.fromHtml`，「非官方声明」那段是**真红字**（`ForegroundColorSpan`），只弹一次记在 `SharedPreferences`。鸿蒙：按 UA 分派到 `NativeBridge.showAbout(json)`，ArkTS 参考实现见 `patches/1.2.6-beta/harmony/AboutDialog.ets`。两边都没有时退化成页内弹窗 |
+
+### 修复
+
+| 症状 | 根因 | 位置 |
+| --- | --- | --- |
+| 每次启动都印 `budget=460000（生效 1210000）`，而同一份报告写「生效 460000，档位 3」 | 这行还留着 1.1.9 的**硬**地板表达式 `Math.max(BUDGET, BUDGET_MIN)`，1.2.4 换软地板时没跟着改 —— 同一次启动两个数互相打脸，最容易被误读成「降档又失效」 | `shell.html` 第 0.4 段启动日志 |
+| 「红屏要挂 6 秒才消失」 | `MoleBridge.onPanic()` 只调 `releaseTextures(true)`（释放纹理 + 15s 冷却），**整个库里没有任何跟随的 reload**；真正让页面回来的是 6 秒兜底 `location.reload()`。这 6 秒从来不是设计，是没人接手的空档 | `mole_boot.js` / `MainActivity$JsBridge.smali` |
+
+### 未出 HAP
+
+DevEco / SDK 已删、仓库里没有 ArkTS 工程、1.2.0 用的 `entry-unsigned-111.hap` 容器与签名材料
+本机都已不在；且这次新增了原生弹窗通道，只替换 `rawfile` 带不进去。恢复条件与 ArkTS 接入步骤
+见补丁文档第五节。HarmonyOS 4.x 及以前可直接装 APK。
 
 ---
 
@@ -285,30 +338,30 @@ OmniPad 本体、`AndroidManifest.xml`、全部 smali。
 ## 下载与安装
 
 全部产物见 [Releases](https://github.com/Earthink030918/mole-flash-android/releases/latest)。
-最新预发布 **v1.2.5-beta**（仅 Android），最新正式版 **v1.2.0**（双端）。
+最新预发布 **v1.2.6-beta**（仅 Android），最新正式版 **v1.2.0**（双端）。
 
 | 平台 | 文件 | 大小 | 系统要求 |
 | --- | --- | --- | --- |
-| Android（预发布） | `mole-flash-1.2.5-beta.apk` | 9.89 MiB | Android 5.0（API 21）以上，建议 8+ |
+| Android（预发布） | `mole-flash-1.2.6-beta.apk` | 9.90 MiB | Android 5.0（API 21）以上，建议 8+ |
 | Android（正式） | `mole-1.2.0.apk` | 9.88 MiB | 同上 |
 | HarmonyOS（正式） | `mole-harmony-1.2.0-signed.hap` | 10.93 MiB | HarmonyOS 5.0.0（API 12）以上 |
 
 > **1.2.4-beta 起换了签名密钥**（与原 `974EA1B9…` 不同），从 1.2.0 及更早版本升级
 > 必须先卸载旧版，`INSTALL_FAILED_UPDATE_INCOMPATIBLE` 是预期行为，代价是 `mole_shell`
 > 里缓存的服务器地址要重学一遍（重进游戏自动完成）。
-> 1.2.4-beta → 1.2.5-beta 是**同一把新密钥**，可以直接覆盖升级，什么都不丢。
+> 1.2.4-beta 起（含 1.2.5-beta / 1.2.6-beta）都是**同一把新密钥**，可以直接覆盖升级，什么都不丢。
 
 ### Android
 
 ```bash
 adb install -r mole-1.2.0.apk             # 正式版
-adb install -r mole-flash-1.2.5-beta.apk  # 预发布（1.2.0 及以前要先卸载）
+adb install -r mole-flash-1.2.6-beta.apk  # 预发布（1.2.0 及以前要先卸载）
 ```
 
 或在手机上下载 APK 后直接点开安装（需允许「安装未知来源应用」）。
 
 - 1.2.0 签名证书 SHA-256：`974EA1B9 54845D05 FAECF5D4 568EBDEF 783BBCB5 F929281D EC3D6A71 C0780093`
-- 1.2.4-beta / 1.2.5-beta 签名证书 SHA-256：`B9197126 C1CE0BCA 61AC7DAE 50722443 33F427D2 D87C87BC 16A9B69D AE845BEE`
+- 1.2.4-beta 起签名证书 SHA-256：`B9197126 C1CE0BCA 61AC7DAE 50722443 33F427D2 D87C87BC 16A9B69D AE845BEE`
 - 1.2.0 与历史版本 **同签名**，可直接覆盖安装、保留登录态；若提示签名冲突，说明装的是官方原包，需先卸载
 - 首次启动会申请网络权限，无其他任何权限
 
@@ -341,6 +394,12 @@ v1.2.0 校验值：
 ```
 b776302bbc5ce46c71e773d4425edc2f2bee5fa99d0a13101571e59c57331714  mole-1.2.0.apk
 c8b99da639c9f9598898ac2c1822127c7e89024c107d7ff0465442c61e113af5  mole-harmony-1.2.0-signed.hap
+```
+
+v1.2.6-beta 校验值：
+
+```
+f9cb58141d955ddf7b1b8247a3c68fcb08fedd6cd7842bffe4d640bf51005340  mole-flash-1.2.6-beta.apk
 ```
 
 v1.2.5-beta 校验值：
@@ -701,7 +760,7 @@ __moleKb.focus()   // 手动聚焦那个 1px 输入框
 
 ## 版本与更新日志
 
-当前预发布 **v1.2.5-beta**（2026-11-19，仅 Android `versionCode 26`）；
+当前预发布 **v1.2.6-beta**（2026-11-22，仅 Android `versionCode 27`）；
 最新正式版 **v1.2.0**（2026-11-12；Android `versionCode 24` / HarmonyOS `versionCode 7`）。
 1.2.0 的逐版对照、两端差异与 HAP 重建过程见 [docs/release-1.2.0.md](docs/release-1.2.0.md)。
 完整记录见 [CHANGELOG.md](CHANGELOG.md)，
@@ -709,6 +768,7 @@ __moleKb.focus()   // 手动聚焦那个 1px 输入框
 
 | 版本 | 要点 |
 | --- | --- |
+| **1.2.6-beta** | 崩了就停在一张说明页上（不再红屏 6 秒 + 无限重载）：页上写明原因/版本/引擎档位/已运行/崩溃次数，右上角「分享日志」拉起系统分享面板，选 QQ 直接发群；同时静默落 txt 到 `Android/data/com.taomee.mole/files/crash/`。新增「关于本作」原生弹窗：Android 用 `AlertDialog` + `Html.fromHtml`（非官方声明是真红字），鸿蒙侧预置 `NativeBridge.showAbout(json)` 与 ArkTS 参考实现。另修两处真 bug：启动日志「生效」一直读的是 1.1.9 的硬地板（`budget=460000（生效 1210000）` 与报告自相矛盾）、`MoleBridge.onPanic()` 根本没有重载动作（红屏那 6 秒是 JS 兜底在等）。新增 `tests/crashui_test.js`，panic 断言 41→50。仅 Android（10,380,676 B，SHA-256 `f9cb5814…5340`），沿用 1.2.4-beta 签名可覆盖升级 |
 | **1.2.5-beta** | 修「方向键按死」（面板收起后收不到 pointerup，KEYUP 发不出去，OmniPad 的 `isPressed` 卡住 → 该方向永久按下、该键失灵）与「核心重入 panic 不降档」（`arena already borrowed` 是 arena 借用的重入，原判定「非渲染类」不动后端，重载后照撞；新判据只在 wgpu 后端降一档）。报告补上 panic 后丢失的「画布」实测值。新增 `tests/dpad_test.js`，panic 断言 34→41。仅 Android（10,372,484 B，SHA-256 `af041077…2d89`），沿用 1.2.4-beta 签名可覆盖升级 |
 | **1.2.4-beta** | 针对反馈的三件事：平板卡顿闪退、OPPO 红屏更频繁、缺方向键与崩溃上报。修 `budgetNow()` 的硬地板把 `PIXEL_BUDGETS` 后 5 档全废（连崩 → 档位升 → 预算不动 → 再崩），改成只保护 0~2 档的软地板；修 OPPO 上 panic 文案认不出 GPU 关键词导致后端永不降档，改为「同一档位二次崩即降」的证据驱动。新增崩溃报告自动生成 + 系统分享（可直发 QQ）与 `__moleDpad` 虚拟方向键。**换签名密钥**，需先卸载旧版。仅 Android（10,368,388 B，SHA-256 `0b00716b…ad02`）。画幅/帧率/节流器/`quality`/预算档位/回收/输入法守卫一律未动 |
 | **1.2.0** | 正式版。新增 / 修复清单见上方 [1.2.0 更新摘要](#120-更新摘要)。Android 内容 = 1.1.9-beta，只去掉 `-beta`（10,356,100 B，SHA-256 `b776302b…1714`）；HarmonyOS 首次同步新引擎（`EFKRKUVC` / `I56A2W5M`）并合入画质地板（11,465,574 B，SHA-256 `c8b99da6…3af5`）。相对 v1.1.0 的累积变化：画质、输入法、卡顿、红屏、后台存活、平板触控、引擎换代七组，画幅/帧率/节流器/`quality`/预算档位/回收策略/服务器地址一律未动 |

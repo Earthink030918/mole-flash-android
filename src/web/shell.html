@@ -597,8 +597,15 @@
       var p = document.querySelector('ruffle-player,ruffle-embed,ruffle-object');
       var sh = p && p.shadowRoot;
       var c = sh ? sh.querySelector('canvas') : null;
+      /* 1.2.6-beta：这里原本写的是 `Math.max(BUDGET, BUDGET_MIN)` —— 那是 1.1.9
+         的硬地板，1.2.4 换成软地板之后这行**没有跟着改**。于是每次启动日志都印
+         「budget=460000（生效 1210000）」，而同一份崩溃报告里写的是「生效 460000，
+         档位 3」。同一次启动两个数互相打脸，看日志的人自然会以为降档又失效了。
+         改成读 __moleBudgetInfo()，日志与报告从此同一个源。 */
+      var bi = null;
+      try { bi = window.__moleBudgetInfo(); } catch (e) {}
       console.log('[MoleShell] 渲染实况 budget=' + BUDGET
-          + '（生效 ' + Math.max(BUDGET, BUDGET_MIN) + '）'
+          + '（生效 ' + (bi ? bi.floor : BUDGET) + '，档位 ' + (bi ? bi.level : '?') + '）'
           + ' DPR=' + compute().toFixed(2)
           + ' canvas=' + (c ? (c.width + 'x' + c.height) : '?')
           + ' 元素=' + (c ? (c.clientWidth + 'x' + c.clientHeight) : '?')
@@ -2311,7 +2318,7 @@ exports.BaseEntity=N;exports.Button=Ri;exports.ButtonBaseView=L;exports.ButtonCo
  * ================================================================== */
 window.__moleCrash = (function () {
   var TAG = '[MoleShell]';
-  var APPV = '1.2.5-beta';
+  var APPV = '1.2.6-beta';
   var RING_MAX = 140;
   var ring = [];
   var errs = [];
@@ -2458,6 +2465,26 @@ window.__moleCrash = (function () {
     return L.join('\n');
   }
 
+  /* 1.2.6-beta：只落盘、不弹窗。
+     崩溃页出现时用它先存一份底 —— 用户可能看一眼就点「重新进入」，
+     甚至直接杀掉进程，不发分享。文件留在
+     /sdcard/Android/data/com.taomee.mole/files/crash/ 里，随时能取。 */
+  function save(kind, extra) {
+    var txt;
+    try { txt = build(kind, extra); } catch (e) { return null; }
+    var name = 'mole-crash-' + stamp() + '.txt';
+    try {
+      if (window.MoleBridge && MoleBridge.saveCrash) {
+        MoleBridge.saveCrash(name, txt);
+        try { console.warn(TAG + ' 崩溃报告已静默落盘：' + name); } catch (e) {}
+        return name;
+      }
+    } catch (e) {
+      try { console.warn(TAG + ' 静默落盘失败：' + e); } catch (x) {}
+    }
+    return null;
+  }
+
   /* 落盘 + 调系统分享。桥不在（浏览器里调试）就只打日志。 */
   function share(kind, extra) {
     var txt;
@@ -2534,6 +2561,7 @@ window.__moleCrash = (function () {
 
   return {
     share: share,
+    save: save,
     auto: auto,
     build: build,
     ring: ringPush,
@@ -2847,6 +2875,494 @@ window.__moleDpad = (function () {
     toggle: toggle,
     state: function () {
       return { mounted: !!host, open: open, engine: usingOmni ? 'omnipad' : 'native' };
+    }
+  };
+})();
+
+/* ==================================================================
+ * 10) 崩溃页 —— 崩了就停在这一页（1.2.6-beta）
+ * ==================================================================
+ * 要解决的问题（两份群友日志 + 之前所有「闪退」反馈的共同症状）：
+ *   一崩 → Ruffle 那屏红橙渐变 → 6 秒后页面自己 location.reload()
+ *   → 30 秒后在同一处再崩 → 再等 6 秒 → …… 上限 4 次。
+ *   用户全程看不到一句解释，只看到「一直在闪退、一直在红屏」。
+ *
+ * 为什么是 6 秒、为什么是页面自己重载：
+ *   Java 侧 `MoleBridge.onPanic()` 只调 releaseTextures(true)（释放纹理，
+ *   而且带 15s 冷却），**根本没有重载动作** —— 真正重载的是
+ *   mole_boot.js 里那个 6 秒兜底。这一点以前没人拆开看，所以「红屏停留
+ *   六秒」一直被当成正常现象。这一版把这段等待换成一张说人话的页面。
+ *
+ * 这一版做的事：
+ *   · panic 之后不再自动重载，直接把 Ruffle 的红屏整块盖住；
+ *   · 页面上写明发生了什么、跑了多久、什么后端、崩了几次；
+ *   · 右上角一个分享按钮，走 1.2.4 已经打通的 ACTION_SEND 通道
+ *     （txt 落盘 + 系统分享面板），点开选 QQ 就能发到群里；
+ *   · 想继续玩点「重新进入」，重载时用的是**已经降好的后端档位**。
+ *
+ * 刻意守住的边界：
+ *   只操作自己的浮层 DOM，绝不往 player 里写任何东西 —— panic 之后
+ *   player 已经 destroy()，再碰它就是第二次 panic。画质 / 帧率 / 画幅 /
+ *   节流器 / 键盘守卫 / 纹理回收 / 像素预算：一个字节都没动。
+ * ================================================================== */
+window.__moleCrashPage = (function () {
+  var TAG = '[MoleShell]';
+  var APPV = '1.2.6-beta';
+  var host = null, refs = {}, cssDone = false;
+  var lastText = '', lastKind = '', lastExtra = null, shownAt = 0;
+
+  function listen(t, type, fn, opt) {
+    try {
+      if (t && typeof t.addEventListener === 'function') t.addEventListener(type, fn, opt);
+    } catch (e) {}
+  }
+  function warn(s) { try { console.warn(TAG + ' ' + s); } catch (e) {} }
+
+  function esc(s) {
+    return String(s === null || s === undefined ? '' : s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+  function pad2(n) { return (n < 10 ? '0' : '') + n; }
+  function stamp() {
+    var d = new Date();
+    return '' + d.getFullYear() + pad2(d.getMonth() + 1) + pad2(d.getDate())
+      + '-' + pad2(d.getHours()) + pad2(d.getMinutes()) + pad2(d.getSeconds());
+  }
+  function uptime() {
+    var s = Math.round((Date.now() - (window.__moleBootAt || Date.now())) / 1000);
+    if (s < 60) return s + ' 秒';
+    return Math.floor(s / 60) + ' 分 ' + (s % 60) + ' 秒';
+  }
+
+  /* 样式一次性注入。用 opacity/visibility 之外的东西都无所谓 ——
+     这一层是「终局」，不需要再被 OmniPad 量几何。 */
+  function injectCss() {
+    if (cssDone || document.getElementById('moleCrashCss')) { cssDone = true; return; }
+    var head = document.head || document.body;
+    if (!head) return;
+    var st = document.createElement('style');
+    st.id = 'moleCrashCss';
+    st.textContent = [
+      '#moleCrashPage{position:fixed;inset:0;z-index:2147483647;display:none;',
+      'box-sizing:border-box;padding:calc(10px + env(safe-area-inset-top)) 14px ',
+      'calc(14px + env(safe-area-inset-bottom));',
+      'background:radial-gradient(120% 80% at 50% 0%,#3a2418 0%,#1a1210 55%,#090706 100%);',
+      'color:#f7ece1;font-family:system-ui,-apple-system,"PingFang SC","Noto Sans CJK SC",sans-serif;',
+      'overflow:auto;touch-action:pan-y;pointer-events:auto;}',
+      '#moleCrashPage.on{display:block;}',
+      '#moleCrashPage .mcp-bar{display:flex;align-items:center;justify-content:space-between;gap:10px;}',
+      '#moleCrashPage .mcp-brand{font-size:12px;letter-spacing:.06em;color:#c0a189;}',
+      '#moleCrashPage .mcp-share{flex:0 0 auto;display:inline-flex;align-items:center;gap:6px;',
+      'padding:9px 15px;border-radius:999px;font-size:13px;font-weight:600;color:#2a1a10;',
+      'background:linear-gradient(180deg,#ffd08a,#ffb347);border:1px solid #ffc46b;',
+      'box-shadow:0 4px 14px rgba(255,160,60,.28);cursor:pointer;}',
+      '#moleCrashPage .mcp-share:active{transform:scale(.96);}',
+      '#moleCrashPage .mcp-card{margin:14px auto 0;max-width:520px;}',
+      '#moleCrashPage .mcp-face{font-size:26px;line-height:1;color:#ffc46b;}',
+      '#moleCrashPage h1{margin:8px 0 4px;font-size:19px;line-height:1.4;font-weight:700;color:#ffe9d2;}',
+      '#moleCrashPage .mcp-sub{margin:8px 0 14px;font-size:13px;line-height:1.75;color:#cbb5a4;}',
+      '#moleCrashPage .mcp-rows{border:1px solid rgba(255,196,107,.22);border-radius:12px;',
+      'background:rgba(255,255,255,.035);padding:2px 12px;}',
+      '#moleCrashPage .mcp-row{display:flex;gap:10px;padding:7px 0;font-size:12px;line-height:1.55;',
+      'border-bottom:1px dashed rgba(255,255,255,.07);}',
+      '#moleCrashPage .mcp-row:last-child{border-bottom:0;}',
+      '#moleCrashPage .mcp-k{flex:0 0 66px;color:#9d8676;}',
+      '#moleCrashPage .mcp-v{flex:1 1 auto;color:#f0e2d4;word-break:break-all;}',
+      '#moleCrashPage .mcp-tip{margin:14px 0 0;padding:10px 12px;border-radius:10px;font-size:12px;',
+      'line-height:1.7;color:#ffd9a8;background:rgba(255,179,71,.10);',
+      'border:1px solid rgba(255,179,71,.22);}',
+      '#moleCrashPage .mcp-btns{display:flex;flex-wrap:wrap;gap:10px;margin:16px 0 4px;}',
+      '#moleCrashPage .mcp-btn{flex:1 1 120px;text-align:center;padding:11px 12px;border-radius:12px;',
+      'font-size:13px;font-weight:600;color:#f6ece2;background:rgba(255,255,255,.07);',
+      'border:1px solid rgba(255,255,255,.16);cursor:pointer;}',
+      '#moleCrashPage .mcp-btn.primary{color:#2a1a10;background:linear-gradient(180deg,#ffd08a,#ffb347);',
+      'border-color:#ffc46b;}',
+      '#moleCrashPage .mcp-btn:active{transform:scale(.97);}',
+      '#moleCrashPage .mcp-foot{margin:12px 0 0;font-size:11px;line-height:1.6;color:#7d6a5c;text-align:center;}',
+      '#moleCrashPage .mcp-toast{position:fixed;left:50%;bottom:calc(26px + env(safe-area-inset-bottom));',
+      'transform:translateX(-50%);max-width:82%;padding:9px 16px;border-radius:999px;font-size:12px;',
+      'background:rgba(0,0,0,.82);color:#ffd9a8;border:1px solid rgba(255,179,71,.3);',
+      'opacity:0;transition:opacity .18s;pointer-events:none;white-space:nowrap;overflow:hidden;',
+      'text-overflow:ellipsis;}',
+      '#moleCrashPage .mcp-toast.on{opacity:1;}'
+    ].join('');
+    head.appendChild(st);
+    cssDone = true;
+  }
+
+  function make(tag, cls, text) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text !== undefined && text !== null) e.textContent = text;
+    return e;
+  }
+
+  function toast(msg) {
+    if (!refs.toast) return;
+    try {
+      refs.toast.textContent = msg;
+      refs.toast.className = 'mcp-toast on';
+      clearTimeout(refs.toastT);
+      refs.toastT = setTimeout(function () {
+        try { refs.toast.className = 'mcp-toast'; } catch (e) {}
+      }, 2600);
+    } catch (e) {}
+  }
+
+  /* ---- 分享：走 1.2.4 打通的 Java 通道（落盘 txt + 系统分享面板） ----
+     分享面板里选 QQ 就能直接发到群，不需要 FileProvider，也不额外要权限。 */
+  function share() {
+    var txt = lastText;
+    if (!txt && window.__moleCrash) {
+      try { txt = window.__moleCrash.build(lastKind || 'Ruffle panic', lastExtra); } catch (e) {}
+    }
+    if (!txt) txt = '（报告生成失败，请把这一页截图发给开发者）';
+    var name = 'mole-crash-' + stamp() + '.txt';
+    try {
+      if (window.MoleBridge && typeof MoleBridge.reportCrash === 'function') {
+        MoleBridge.reportCrash(name, txt);
+        toast('已拉起分享，选 QQ 就能发到群里');
+        warn('崩溃页：已请求系统分享 ' + name);
+        return true;
+      }
+    } catch (e) {
+      warn('崩溃页：分享桥调用失败 ' + e);
+    }
+    /* 没有桥（浏览器里调试 / 鸿蒙壳层还没有这个通道）→ 退化成复制 */
+    copy();
+    return false;
+  }
+
+  function copy() {
+    var ok = false;
+    try {
+      var ta = document.createElement('textarea');
+      ta.value = lastText || '';
+      ta.setAttribute('readonly', '');
+      ta.style.cssText = 'position:fixed;left:-9999px;top:0;opacity:0;';
+      document.body.appendChild(ta);
+      ta.select();
+      try { ta.setSelectionRange(0, ta.value.length); } catch (e) {}
+      ok = document.execCommand('copy');
+      document.body.removeChild(ta);
+    } catch (e) { ok = false; }
+    toast(ok ? '报告已复制，去 QQ 里粘贴就好' : '复制失败，请截图这一页');
+    return ok;
+  }
+
+  function restart() {
+    warn('崩溃页：用户选择重新进入（下次用后端档位 ' + (window.__moleRendererTier || 0) + '）');
+    /* 不走 MoleBridge.onPanic()：那个方法只释放纹理（带 15s 冷却），
+       并不重载；真正让页面回来的就是下面这一句。 */
+    try { location.reload(); } catch (e) {}
+  }
+
+  function build() {
+    host = make('div', '');
+    host.id = 'moleCrashPage';
+
+    var bar = make('div', 'mcp-bar');
+    bar.appendChild(make('div', 'mcp-brand', '摩尔庄园 · 微端 · 崩溃现场'));
+    var btnShare = make('div', 'mcp-share');
+    btnShare.textContent = '↗ 分享日志';
+    listen(btnShare, 'click', function (e) {
+      try { e.preventDefault(); e.stopPropagation(); } catch (x) {}
+      share();
+    }, false);
+    bar.appendChild(btnShare);
+    host.appendChild(bar);
+
+    var card = make('div', 'mcp-card');
+    card.appendChild(make('div', 'mcp-face', '(｡•́︿•̀｡)'));
+    card.appendChild(make('h1', '', '呜……好像卡住了'));
+    card.appendChild(make('div', 'mcp-sub',
+      '别担心，这不是你做错了什么。Flash 引擎刚才撞上了一个它自己解决不了的问题，'
+      + '现场我已经替你收拾好了 —— 点右上角「分享日志」，选 QQ 发到群里就行。'));
+
+    var rows = make('div', 'mcp-rows');
+    var rowDefs = [
+      ['原因', 'kReason'], ['版本', 'kVer'], ['引擎', 'kEngine'],
+      ['已运行', 'kUp'], ['崩溃次数', 'kCount']
+    ];
+    refs.rows = {};
+    for (var i = 0; i < rowDefs.length; i++) {
+      var r = make('div', 'mcp-row');
+      r.appendChild(make('span', 'mcp-k', rowDefs[i][0]));
+      var v = make('span', 'mcp-v', '—');
+      r.appendChild(v);
+      rows.appendChild(r);
+      refs.rows[rowDefs[i][1]] = v;
+    }
+    card.appendChild(rows);
+
+    card.appendChild(make('div', 'mcp-tip',
+      '这份日志里只有设备型号、渲染后端和最近的运行记录，没有账号密码，'
+      + '发到群里不会泄露什么。想继续玩就点下面的「重新进入」。'));
+
+    var btns = make('div', 'mcp-btns');
+    var bRestart = make('div', 'mcp-btn primary', '重新进入');
+    listen(bRestart, 'click', function (e) {
+      try { e.preventDefault(); e.stopPropagation(); } catch (x) {}
+      restart();
+    }, false);
+    btns.appendChild(bRestart);
+
+    var bCopy = make('div', 'mcp-btn', '复制报告');
+    listen(bCopy, 'click', function (e) {
+      try { e.preventDefault(); e.stopPropagation(); } catch (x) {}
+      copy();
+    }, false);
+    btns.appendChild(bCopy);
+
+    var bAbout = make('div', 'mcp-btn', '关于本作');
+    listen(bAbout, 'click', function (e) {
+      try { e.preventDefault(); e.stopPropagation(); } catch (x) {}
+      try { if (window.__moleAbout) window.__moleAbout.show(true); } catch (x) {}
+    }, false);
+    btns.appendChild(bAbout);
+    card.appendChild(btns);
+
+    card.appendChild(make('div', 'mcp-foot',
+      '本作是第三方爱好者的移植版本，与官方无关。'));
+    host.appendChild(card);
+
+    var t = make('div', 'mcp-toast');
+    refs.toast = t;
+    host.appendChild(t);
+
+    document.body.appendChild(host);
+    refs.host = host;
+    return true;
+  }
+
+  function fill(kind) {
+    var R = refs.rows;
+    if (!R) return;
+    try { R.kReason.textContent = kind || '未知'; } catch (e) {}
+    try { R.kVer.textContent = APPV; } catch (e) {}
+    try {
+      R.kEngine.textContent = (window.__moleRenderer || '?')
+        + '（档位 ' + (window.__moleRendererTier || 0) + '）';
+    } catch (e) {}
+    try { R.kUp.textContent = uptime(); } catch (e) {}
+    try {
+      var n = parseInt(sessionStorage.getItem('mole_panic_n') || '0', 10) || 0;
+      R.kCount.textContent = n + ' 次（本次启动）';
+    } catch (e) {}
+  }
+
+  function show(kind, extra) {
+    try {
+      injectCss();
+      if (!document.body) return false;
+      lastKind = kind || 'Ruffle panic';
+      lastExtra = extra || null;
+      try {
+        lastText = window.__moleCrash
+          ? window.__moleCrash.build(lastKind, lastExtra)
+          : ('崩溃：' + lastKind);
+      } catch (e) { lastText = '报告生成失败：' + e; }
+      if (!host) build();
+      if (!host) return false;
+      fill(lastKind);
+      host.className = 'on';
+      shownAt = Date.now();
+      /* 把 OmniPad 那一层压住：panic 之后它已经没有意义，
+         留着只会接走用户的点击。 */
+      try {
+        var pad = document.getElementById('pad');
+        if (pad) pad.style.display = 'none';
+      } catch (e) {}
+      warn('崩溃页已显示（' + lastKind + '），等用户分享或重进');
+      return true;
+    } catch (e) {
+      warn('崩溃页显示失败：' + e);
+      return false;
+    }
+  }
+
+  function hide() {
+    try { if (host) host.className = ''; } catch (e) {}
+    return true;
+  }
+
+  return {
+    show: show,
+    hide: hide,
+    share: share,
+    copy: copy,
+    state: function () {
+      return { shown: !!(host && host.className === 'on'), at: shownAt, kind: lastKind, size: lastText.length };
+    }
+  };
+})();
+
+/* ==================================================================
+ * 11) 关于本作 —— 交回系统原生弹窗（1.2.6-beta）
+ * ==================================================================
+ * 「不要用网页自己画一个框，要用系统弹窗」—— 那就走原生：
+ *
+ *   Android：MoleBridge.showAbout(force) → Java 侧 AboutDialog
+ *            → AlertDialog + Html.fromHtml（第二段是红字）
+ *            → 是否「只弹一次」由 SharedPreferences 记，清缓存也记得
+ *   HarmonyOS：NativeBridge.showAbout(json) → ArkTS 侧弹窗
+ *            → 纯血鸿蒙用 AlertDialog.show / promptAction，
+ *              具体实现见 patches/1.2.6-beta/harmony/AboutDialog.ets
+ *            两边都没有（浏览器调试 / 旧壳层）→ 页内兜底弹窗
+ *
+ * 文案统一放在这里，红字段落带 red:true。
+ * 三段话的**内容与原意一字不改**，只是把语气改软、改可爱一点。
+ * ================================================================== */
+window.__moleAbout = (function () {
+  var TAG = '[MoleShell]';
+  var KEY = 'mole_about_v1';
+  var TITLE = '关于本作 · 先说三句心里话';
+  var OK = '我知道啦 ♡';
+  var LINES = [
+    { t: '谢谢你选择了我这么一个小小的开源项目～能在这里遇见你，真的很开心！♡', red: false },
+    {
+      t: '小提醒一下：本作并非摩尔庄园官方项目，仅为第三方爱好者移植，请不要和官方版本的《摩尔庄园》手游混淆哦！！！',
+      red: true
+    },
+    {
+      t: '本作目前还在开发阶段，遇到问题欢迎随时指出～另外郑重说一句：严禁倒卖，也严禁在二次修改时加入收费弹窗；如果发现任何以此盈利的行为，欢迎大家向我反馈！',
+      red: false
+    }
+  ];
+
+  var forced = false, shownAt = 0, platform = '';
+
+  function warn(s) { try { console.warn(TAG + ' ' + s); } catch (e) {} }
+  function listen(t, type, fn) {
+    try { if (t && typeof t.addEventListener === 'function') t.addEventListener(type, fn, false); } catch (e) {}
+  }
+
+  function detect() {
+    var ua = '';
+    try { ua = navigator.userAgent || ''; } catch (e) {}
+    /* 纯血鸿蒙（HarmonyOS NEXT / ArkWeb）的 UA 里带 ArkWeb / OpenHarmony。
+       安卓 WebView 不会出现这两个词，所以先判鸿蒙再判安卓。 */
+    if (/ArkWeb|OpenHarmony|HarmonyOS/i.test(ua)) {
+      if (typeof NativeBridge !== 'undefined' && NativeBridge
+          && typeof NativeBridge.showAbout === 'function') return 'harmony';
+      return 'harmony-web';
+    }
+    if (window.MoleBridge && typeof MoleBridge.showAbout === 'function') return 'android';
+    return 'web';
+  }
+
+  function payload() {
+    var out = [];
+    for (var i = 0; i < LINES.length; i++) out.push({ t: LINES[i].t, red: LINES[i].red });
+    return JSON.stringify({ title: TITLE, lines: out, ok: OK });
+  }
+
+  /* ---- 页内兜底弹窗：只在两个原生通道都缺席时出现 ---- */
+  var box = null;
+  function css() {
+    if (document.getElementById('moleAboutCss')) return;
+    var head = document.head || document.body;
+    if (!head) return;
+    var st = document.createElement('style');
+    st.id = 'moleAboutCss';
+    st.textContent = [
+      '#moleAboutMask{position:fixed;inset:0;z-index:2147483647;display:flex;align-items:center;',
+      'justify-content:center;padding:18px;box-sizing:border-box;background:rgba(0,0,0,.62);',
+      'font-family:system-ui,-apple-system,"PingFang SC",sans-serif;}',
+      '#moleAboutMask .mab{width:100%;max-width:430px;max-height:80vh;overflow:auto;',
+      'box-sizing:border-box;padding:18px 18px 14px;border-radius:16px;',
+      'background:linear-gradient(180deg,#2a1d15,#17100c);color:#f7ece1;',
+      'border:1px solid rgba(255,196,107,.26);box-shadow:0 18px 48px rgba(0,0,0,.5);}',
+      '#moleAboutMask .mab-t{margin:0 0 12px;font-size:16px;font-weight:700;color:#ffe9d2;}',
+      '#moleAboutMask .mab-p{margin:0 0 12px;font-size:13px;line-height:1.85;color:#ded0c2;}',
+      '#moleAboutMask .mab-p.red{color:#ff6b5e;font-weight:600;}',
+      '#moleAboutMask .mab-ok{margin-top:6px;padding:11px 12px;border-radius:12px;text-align:center;',
+      'font-size:13px;font-weight:600;color:#2a1a10;cursor:pointer;',
+      'background:linear-gradient(180deg,#ffd08a,#ffb347);}'
+    ].join('');
+    head.appendChild(st);
+  }
+
+  function showWeb() {
+    try {
+      if (box) { box.style.display = 'flex'; return true; }
+      css();
+      if (!document.body) return false;
+      box = document.createElement('div');
+      box.id = 'moleAboutMask';
+      var card = document.createElement('div');
+      card.className = 'mab';
+      var h = document.createElement('div');
+      h.className = 'mab-t';
+      h.textContent = TITLE;
+      card.appendChild(h);
+      for (var i = 0; i < LINES.length; i++) {
+        var p = document.createElement('div');
+        p.className = LINES[i].red ? 'mab-p red' : 'mab-p';
+        p.textContent = LINES[i].t;
+        card.appendChild(p);
+      }
+      var ok = document.createElement('div');
+      ok.className = 'mab-ok';
+      ok.textContent = OK;
+      listen(ok, 'click', function () { try { box.style.display = 'none'; } catch (e) {} });
+      card.appendChild(ok);
+      box.appendChild(card);
+      document.body.appendChild(box);
+      return true;
+    } catch (e) { warn('关于弹窗（页内）失败：' + e); return false; }
+  }
+
+  /* force=true 时绕过节流（崩溃页里的「关于本作」按钮用） */
+  function show(force) {
+    platform = detect();
+    shownAt = Date.now();
+    forced = !!force;
+    if (platform === 'android') {
+      try {
+        MoleBridge.showAbout(!!force);
+        warn('关于弹窗交由 Android 原生 AlertDialog 显示（force=' + !!force + '）');
+        return 'native';
+      } catch (e) { warn('Android 关于弹窗调用失败：' + e); }
+    } else if (platform === 'harmony') {
+      try {
+        NativeBridge.showAbout(payload());
+        warn('关于弹窗交由鸿蒙原生弹窗显示（force=' + !!force + '）');
+        return 'native';
+      } catch (e) { warn('鸿蒙关于弹窗调用失败：' + e); }
+    }
+    /* 兜底：页内弹窗。force 时不看 localStorage。 */
+    if (!force) {
+      try { if (localStorage.getItem(KEY) === '1') return 'skip'; } catch (e) {}
+    }
+    var ok = showWeb();
+    if (ok) {
+      try { localStorage.setItem(KEY, '1'); } catch (e) {}
+    }
+    return ok ? 'web' : 'none';
+  }
+
+  /* 启动后自动问一次。安卓/鸿蒙由原生侧自己记「只弹一次」，
+     所以每次启动都问，不在这里做节流；页内兜底才查 localStorage。 */
+  function auto() {
+    var p = detect();
+    if (p === 'android' || p === 'harmony') return show(false);
+    try { if (localStorage.getItem(KEY) === '1') return 'skip'; } catch (e) {}
+    return show(false);
+  }
+
+  try {
+    setTimeout(function () { try { auto(); } catch (e) {} }, 2600);
+  } catch (e) {}
+
+  return {
+    show: show,
+    auto: auto,
+    lines: LINES,
+    title: TITLE,
+    state: function () {
+      return { platform: platform || detect(), forced: forced, at: shownAt };
     }
   };
 })();

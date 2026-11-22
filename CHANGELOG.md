@@ -2,6 +2,54 @@
 
 格式参照 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## [1.2.6-beta] - 2026-11-22
+
+预发布，仅 Android（`versionCode 27`）。依据两份群友日志（PHZ110 / 24117RK2CC，
+两台机器、两个 GPU 厂商、两个 Chromium 大版本，错误顺序一模一样）。
+逐条证据与代码位置见 [patches/1.2.6-beta/README.md](patches/1.2.6-beta/README.md)。
+
+产物 `mole-flash-1.2.6-beta.apk`，10,380,676 B，
+SHA-256 `f9cb58141d955ddf7b1b8247a3c68fcb08fedd6cd7842bffe4d640bf51005340`。
+**沿用 1.2.4-beta 的签名**（`b9197126…ae845bee`），1.2.4-beta / 1.2.5-beta 可直接覆盖升级。
+
+### 新增
+
+- **崩溃页**：panic 之后不再自动重载，改为全屏一张说明页（原因 / 版本 / 引擎与档位 /
+  已运行 / 崩溃次数），**右上角「↗ 分享日志」**拉起系统分享面板，选 QQ 即可发到群里；
+  另有「重新进入」「复制报告」「关于本作」。同时**静默落一份 txt** 到
+  `getExternalFilesDir("crash")`，用户直接杀进程也不会丢现场。
+- **「关于本作」原生弹窗**：Android 走 `AlertDialog` + `Html.fromHtml`（第二段
+  「非官方声明」是**真红字** `ForegroundColorSpan`），只弹一次记在
+  `SharedPreferences("mole_shell")`。鸿蒙侧按 UA 分派到
+  `NativeBridge.showAbout(json)`，ArkTS 参考实现见
+  `patches/1.2.6-beta/harmony/AboutDialog.ets`；两边都没有时退化成页内弹窗。
+- `tests/crashui_test.js`（40 条断言）：建页 / 分享桥文件名与正文 / 无桥退化成复制 /
+  安卓原生分派 / 鸿蒙 JSON 载荷（三段、第二段 `red=true`）/ 页内兜底 / `force` 绕过节流。
+
+### 修复
+
+- **启动日志里的「生效」一直是错的**：`Math.max(BUDGET, BUDGET_MIN)` 是 1.1.9 的**硬**地板，
+  1.2.4 换成软地板时这行没跟着改，于是每次启动都印
+  `budget=460000（生效 1210000）`，而同一份崩溃报告里写的是「生效 460000，档位 3」——
+  同一次启动两个数互相打脸，是最容易被误读成「降档又失效了」的地方。改为读
+  `window.__moleBudgetInfo()`，日志与报告同源。诊断修复，`budgetNow()` 未动。
+- **`MoleBridge.onPanic()` 根本不重载**：它只调 `releaseTextures(true)`
+  （释放纹理 + 15s 冷却），整个库里没有任何跟随的 `reload`。真正让页面回来的是
+  `mole_boot.js` 里那个 6 秒兜底 `location.reload()`——也就是说「红屏挂 6 秒」
+  从来不是设计，是没人接手的空档。现在这段空档由崩溃页接手。
+
+### 未动
+
+画幅、帧率 24、节流器、`quality: 'low'`、`DENSITY` / `MAXPIX` / `FLOOR`、
+`budgetNow()` 计算式、`PIXEL_BUDGETS` 数组本体、五层输入法守卫、纹理回收策略、
+OmniPad 本体、服务器地址与端口池、`AndroidManifest.xml`。
+
+### 未出 HAP
+
+DevEco / SDK 已删、仓库里没有 ArkTS 工程、1.2.0 用的 `entry-unsigned-111.hap` 容器与
+签名材料本机都已不在；且这次新增了原生弹窗通道，只替换 `rawfile` 带不进去。
+恢复条件与 ArkTS 侧接入步骤见补丁文档第五节。（HarmonyOS 4.x 及以前可直接装 APK。）
+
 ## [1.2.5-beta] - 2026-11-19
 
 预发布，仅 Android（`versionCode 26`）。针对群友 PHZ110 那份崩溃报告。

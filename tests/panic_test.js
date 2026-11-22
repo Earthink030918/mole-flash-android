@@ -225,6 +225,48 @@ console.log('=== 4c) 同样的重入 panic 出现在 webgl 后端 → 不动档�
     logs.some(l => l.indexOf('非 wgpu') >= 0), logs.join(' / '));
 }
 
+/* ------------------------------------------------------------------
+ * 4d/4e) 1.2.6-beta：收场方式
+ *   「红屏 6 秒 → 自己 reload → 30 秒后又崩」是用户看到的全部。
+ *   现在能建崩溃页就把人停在那页；建不起来才退回老路。
+ * ------------------------------------------------------------------ */
+console.log('=== 4d) 崩溃页可用 → 停住，不重载 ===');
+{
+  const { sandbox, bridge, logs } = makeEnv({ renderer: 'wgpu-webgl' });
+  let shown = 0, saved = 0, autoShared = 0;
+  sandbox.window.__moleRendererBump = () => 'webgl';
+  sandbox.window.__moleCrashPage = { show: () => { shown++; return true; } };
+  sandbox.window.__moleCrash = {
+    save: () => { saved++; return 'mole-crash-1.txt'; },
+    auto: () => { autoShared++; return null; },
+  };
+  sandbox.onPanicDom(makePlayer({ title: 'x', body: 'panicked at player.rs:485: arena already borrowed' }));
+  ok('切到崩溃页一次', shown === 1, shown);
+  ok('静默落盘一次', saved === 1, saved);
+  ok('没有通知 Java 重载', bridge.panic === 0, bridge.panic);
+  ok('没有走自动分享（改成用户点按钮）', autoShared === 0, autoShared);
+  ok('日志写明停在崩溃页',
+    logs.some(l => l.indexOf('崩溃页') >= 0), logs.join(' / '));
+}
+
+console.log('=== 4e) 崩溃页建不起来（无 body / DOM 坏了）→ 退回老路 ===');
+{
+  const { sandbox, bridge, logs } = makeEnv({ renderer: 'wgpu-webgl' });
+  let saved = 0, autoShared = 0;
+  sandbox.window.__moleRendererBump = () => 'webgl';
+  sandbox.window.__moleCrashPage = { show: () => false };
+  sandbox.window.__moleCrash = {
+    save: () => { saved++; return 'x'; },
+    auto: () => { autoShared++; return null; },
+  };
+  sandbox.onPanicDom(makePlayer({ title: 'x', body: 'wgpu lost' }));
+  ok('没有落盘（页面都没建起来）', saved === 0, saved);
+  ok('退回自动分享一次', autoShared === 1, autoShared);
+  ok('仍然通知 Java 重载', bridge.panic === 1, bridge.panic);
+  ok('日志说明了退回原因',
+    logs.some(l => l.indexOf('建不起来') >= 0), logs.join(' / '));
+}
+
 console.log('=== 5) 同一个播放器只处理一次 ===');
 {
   const { sandbox, bridge } = makeEnv();

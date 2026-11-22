@@ -319,34 +319,69 @@
         var n = panicCount(true);
         log('!! panic 累计 ' + n + ' 次（上限 ' + PANIC_MAX + '）');
 
-        /* 1.2.4-beta：把现场交给崩溃报告（第 8 段），由 Java 落盘并调系统分享。
-           放在重载之前 —— 一旦开始重载，这些变量就都拿不到了。 */
-        try {
-            if (window.__moleCrash && window.__moleCrash.auto) {
-                window.__moleCrash.auto('Ruffle panic', {
-                    '渲染后端': (window.__moleRenderer || '?') + '（档位 ' + (window.__moleRendererTier || 0) + '）',
-                    '后端档位连续崩溃': tierN,
-                    '判定': verdict,
-                    '已运行': up + 's',
-                    'panic 标题': x.title || '(空)',
-                    'panic 正文': flat || '(空)'
-                });
-            }
-        } catch (e) {}
-
-        if (n > PANIC_MAX) {
-            log('!! 连续 panic 到上限，停止自动恢复（红屏保留，请把上面这些 !! 行发出来）');
-            return;
-        }
-
-        if (looksGpu || repeatTier || reentryOnWgpu) {
+        /* 先降档（下一次启动生效），再决定怎么收场。 */
+        var over = n > PANIC_MAX;
+        if (over) {
+            log('!! 连续 panic 到上限，不再自动恢复（保持崩溃页，等用户手动重进）');
+        } else if (looksGpu || repeatTier || reentryOnWgpu) {
             var next = null;
             try { next = window.__moleRendererBump && window.__moleRendererBump(); } catch (e) {}
             log(next ? '!! 判定为 ' + verdict + ' → 下次改用 ' + next
                      : '!! 判定为 ' + verdict + '，但已没有更低档位可用');
         } else {
-            log('!! 判定为 ' + verdict + '，后端档位不变，只重载');
+            log('!! 判定为 ' + verdict + '，后端档位不变');
         }
+
+        var extra = {
+            '渲染后端': (window.__moleRenderer || '?') + '（档位 ' + (window.__moleRendererTier || 0) + '）',
+            '后端档位连续崩溃': tierN,
+            '判定': verdict,
+            '已运行': up + 's',
+            'panic 标题': x.title || '(空)',
+            'panic 正文': flat || '(空)'
+        };
+        if (over) extra['自动恢复'] = '本次启动已连崩 ' + n + ' 次，已停止自动重载';
+
+        /* ------------------------------------------------------------------
+         * 1.2.6-beta：把「红屏 + 6 秒后自己重载」换成一张说人话的崩溃页
+         * ---------------------------------------------------------------
+         * 以前的收场：MoleBridge.onPanic()（只释放纹理，带 15s 冷却，
+         *   **并不重载**）→ 6 秒兜底 location.reload() → 还是同一个后端、
+         *   同一个 30 秒 → 再崩 → 再等 6 秒 …… 用户全程只看到红屏在闪。
+         *
+         * 现在：先切崩溃页。用户想继续就点「重新进入」，想反馈就点
+         *   右上角「分享日志」—— 那时才拉起系统分享面板（1.2.4 是崩的
+         *   瞬间就自动弹，用户还没看清是什么就被弹窗糊一脸）。
+         *   同时静默落一份 txt 到 getExternalFilesDir("crash")，
+         *   万一用户直接杀进程，现场也还在。
+         * ------------------------------------------------------------------ */
+        var onPage = false;
+        try {
+            if (window.__moleCrashPage && window.__moleCrashPage.show) {
+                onPage = window.__moleCrashPage.show('Ruffle panic', extra) === true;
+            }
+        } catch (e) { onPage = false; }
+
+        if (onPage) {
+            log('!! 已切到崩溃页（不再自动重载，等用户点「重新进入」）');
+            try {
+                if (window.__moleCrash && window.__moleCrash.save) {
+                    window.__moleCrash.save('Ruffle panic', extra);
+                }
+            } catch (e) {}
+            return;
+        }
+
+        /* 兜底：连覆盖层都建不起来（body 还没有 / DOM 已被破坏）。
+           退回 1.2.4 的老路 —— 自动分享一次，然后交给 Java 与 6s 兜底。 */
+        log('!! 崩溃页建不起来，退回自动分享 + 重载');
+        try {
+            if (window.__moleCrash && window.__moleCrash.auto) {
+                window.__moleCrash.auto('Ruffle panic', extra);
+            }
+        } catch (e) {}
+
+        if (over) return;
 
         try {
             MoleBridge.onPanic();          // Java：空白页中转 2s → 重载

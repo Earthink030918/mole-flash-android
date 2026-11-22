@@ -71,6 +71,30 @@ Adreno 显存池耗尽。内核直接 SIGTRAP 杀 RenderThread，Java 层拦不�
 （`crash/mole-crash-*.txt`，含当时的画布尺寸与预算），再上报 `dead`。报告比对相邻两份的
 `像素预算` 字段，就能判断「是没降档」还是「降了还不够」。
 
+### 崩溃以后停在一张「呜……好像卡住了」的页面上
+
+这是 1.2.6-beta 起**故意**的。以前 panic 之后 `MoleBridge.onPanic()` 只释放纹理
+（`releaseTextures(true)`，带 15s 冷却，**没有任何 reload**），真正让页面回来的是
+`mole_boot.js` 里那个 6 秒兜底 `location.reload()` —— 所以「红屏挂 6 秒」不是设计，
+是没人接手的空档。现在这段空档由崩溃页接手：
+
+- 点右上角 `↗ 分享日志` → 系统分享面板 → 选 QQ 发群；
+- 点 `重新进入` → `location.reload()`，用的是**已经降好的**后端档位；
+- 不想管它也行，txt 已经静默落在 `Android/data/com.taomee.mole/files/crash/`。
+
+页面上 `崩溃次数` 读 `sessionStorage.mole_panic_n`（随本次启动重置），
+与后端档位用的 `localStorage.mole_renderer_tier` 刻意分开计。
+
+### 连「呜……好像卡住了」都不出现，只有红屏
+
+说明覆盖层没建起来，`mole_boot.js` 会写一行
+`!! 崩溃页建不起来，退回自动分享 + 重载` 然后走老路。三种可能：
+
+1. panic 发生在 `document.body` 生成之前（启动期就炸）—— 这时确实没 DOM 可用；
+2. `shell.html` 的第 10 段没进包（`dexdump` 查不到没用，得 `unzip` 出
+   `assets/ruffle/shell.html` 搜 `__moleCrashPage`）；
+3. 页面被上一次的 `location.reload()` 打断在半路。
+
 ### `页面报告 Ruffle panic → 强制清空重载`，反复出现
 
 wgpu 在特定驱动上过不了 `create_render_pipeline` 的 VERTEX shader 校验。这是 Ruffle + 驱动的组合问题，
@@ -111,6 +135,10 @@ OmniPad 的 `isPressed` 卡在 true —— 这个方向在游戏里永久按下�
 __moleDpad.off()        // 拆掉浮钮，彻底回到原生触控
 __moleDpad.state()      // { mounted, open, engine }
 ```
+
+1.2.6-beta 起这两个数是**同源**的（都读 `__moleBudgetInfo()`）。如果你在 1.2.5 及以前的日志里
+看到 `budget=460000（生效 1210000）`，那是启动日志里的旧表达式没跟着软地板一起改，
+**不是降档失效** —— 同一份报告的「像素预算」栏才是真值。
 
 ### 从来没弹出过崩溃报告 / 找不到 txt
 
