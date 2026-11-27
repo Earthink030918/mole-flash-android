@@ -12,19 +12,24 @@
 //      AlertDialog.show 的 message 只收 string | Resource，**没法只让一段变红**。
 //      CustomDialog 是系统原生弹窗容器（独立窗口、系统返回键、系统字体缩放、
 //      无障碍朗读都归系统管），内部用 Text 就能逐段上色。
-//   2. 「只弹一次」记在 preferences（对应安卓的 SharedPreferences），
+//   2. 「装一次弹一次」记在 preferences（对应安卓的 SharedPreferences）：
+//      存的是 BundleInfo.updateTime（安装戳），同一份安装里稳定、覆盖安装会变，
 //      用户清 WebView 缓存 / localStorage 之后照样不重复骚扰。
+//   4. 1.2.7-beta(r2) 同步：payload 多了 note / by / dismiss 三个字段，
+//      正文末尾一行小字、右下角落款、以及「不再弹出」按钮；判定改安装戳。
 //   3. 文案由网页侧通过 JSON 传进来，**不在 ArkTS 里再存一份** ——
 //      改文案只改 shell.html 一处，两端不会漂。
 //      收到畸形 JSON 时退回内置的一份最小文案，绝不因为解析失败就什么都不弹。
 // =====================================================================
 
-import { common } from '@kit.AbilityKit';
+import { common, bundleManager } from '@kit.AbilityKit';
 import { preferences } from '@kit.ArkData';
 import { BusinessError } from '@kit.BasicServicesKit';
 
 const STORE_NAME: string = 'mole_shell';
-const ABOUT_KEY: string = 'mole_about_v1';
+// 1.2.7-beta(r2)：这个键存的不再是布尔值，而是「安装戳」（BundleInfo.updateTime）。
+// 同一份安装里它不变，覆盖安装后系统会刷新它 —— 于是「装一次弹一次」。
+const ABOUT_KEY: string = 'mole_about_stamp';
 
 export interface AboutLine {
   t: string;
@@ -35,6 +40,9 @@ interface AboutPayload {
   title: string;
   lines: AboutLine[];
   ok: string;
+  note?: string;      // 正文末尾那行小字
+  by?: string;        // 右下角落款
+  dismiss?: string;   // 「不再弹出」按钮文案
 }
 
 /** 解析失败时的兜底文案（与 shell.html 保持同义） */
@@ -43,16 +51,27 @@ const FALLBACK: AboutPayload = {
   lines: [
     { t: '谢谢你选择了我这么一个小小的开源项目～能在这里遇见你，真的很开心！♡', red: false },
     { t: '小提醒一下：本作并非摩尔庄园官方项目，仅为第三方爱好者移植，请不要和官方版本的《摩尔庄园》手游混淆哦！！！', red: true },
-    { t: '本作目前还在开发阶段，遇到问题欢迎随时指出～另外郑重说一句：严禁倒卖，也严禁在二次修改时加入收费弹窗；如果发现任何以此盈利的行为，欢迎大家向我反馈！', red: false }
+    { t: '欢迎来到我的小窝一起玩，QQ小窝的群号是：1125775110。本作目前还在开发阶段，遇到问题欢迎随时指出～另外郑重说一句：严禁倒卖，也严禁在二次修改时加入收费弹窗；如果发现任何以此盈利的行为，欢迎大家向我反馈！', red: false }
   ],
-  ok: '我知道啦 ♡'
+  ok: '我知道啦 ♡',
+  note: '（每次安装只出现一次，点「不再弹出」就不再打扰你啦）',
+  by: 'by 尘墨',
+  dismiss: '不再弹出'
 };
 
 function parsePayload(json: string): AboutPayload {
   try {
     const o = JSON.parse(json) as AboutPayload;
     if (o && o.lines && o.lines.length > 0) {
-      return o;
+      // 老 payload 没有 note / by / dismiss，缺哪补哪，绝不写 undefined 进 Text
+      return {
+        title: o.title ? o.title : FALLBACK.title,
+        lines: o.lines,
+        ok: o.ok ? o.ok : FALLBACK.ok,
+        note: o.note ? o.note : FALLBACK.note,
+        by: o.by ? o.by : FALLBACK.by,
+        dismiss: o.dismiss ? o.dismiss : FALLBACK.dismiss
+      };
     }
   } catch (e) {
     console.warn('[MoleShell] 关于弹窗 JSON 解析失败：' + e);
@@ -93,17 +112,44 @@ export struct MoleAboutDialog {
       .constraintSize({ maxHeight: '56%' })
       .scrollBar(BarState.Auto)
 
-      Button(this.payload.ok)
+      Text(this.payload.note ? this.payload.note : '')
+        .fontSize(12)
+        .lineHeight(19)
+        .fontColor('#8A8A90')
         .width('100%')
-        .height(44)
-        .fontSize(16)
-        .backgroundColor('#FFB347')
-        .fontColor('#2A1A10')
-        .onClick(() => {
-          if (this.controller) {
-            this.controller.close();
-          }
-        })
+
+      Text(this.payload.by ? this.payload.by : '')
+        .fontSize(12)
+        .fontColor('#8A8A90')
+        .width('100%')
+        .textAlign(TextAlign.End)   // 右下角落款
+
+      Row({ space: 10 }) {
+        // 「不再弹出」在左、「我知道啦」在右 —— 与安卓 neutral/positive 的位置一致
+        Button(this.payload.dismiss ? this.payload.dismiss : '不再弹出')
+          .layoutWeight(1)
+          .height(42)
+          .fontSize(15)
+          .backgroundColor('#F2ECE4')
+          .fontColor('#5B4A3C')
+          .onClick(() => {
+            if (this.controller) {
+              this.controller.close();
+            }
+          })
+        Button(this.payload.ok)
+          .layoutWeight(1)
+          .height(42)
+          .fontSize(15)
+          .backgroundColor('#FFB347')
+          .fontColor('#2A1A10')
+          .onClick(() => {
+            if (this.controller) {
+              this.controller.close();
+            }
+          })
+      }
+      .width('100%')
     }
     .width('86%')
     .padding(20)
@@ -118,25 +164,46 @@ export struct MoleAboutDialog {
 export class MoleAboutHelper {
   private static dialog: CustomDialogController | null = null;
 
-  private static async seen(ctx: common.UIAbilityContext): Promise<boolean> {
+  /** 安装戳：每次安装 / 覆盖安装系统都会刷新；同一份安装里不变。 */
+  private static installStamp(): number {
     try {
-      const p = await preferences.getPreferences(ctx, STORE_NAME);
-      return p.getSync(ABOUT_KEY, false) as boolean;
+      const info = bundleManager.getBundleInfoForSelfSync(
+        bundleManager.BundleFlag.GET_BUNDLE_INFO_DEFAULT);
+      return info.updateTime;
     } catch (e) {
       const err = e as BusinessError;
-      console.warn('[MoleShell] 读取关于弹窗标记失败：' + err.code);
+      console.warn('[MoleShell] 读取安装戳失败：' + err.code);
+      return 0;       // 拿不到就当作没弹过，宁可多弹一次
+    }
+  }
+
+  private static async seen(ctx: common.UIAbilityContext): Promise<boolean> {
+    const stamp = MoleAboutHelper.installStamp();
+    if (stamp <= 0) {
+      return false;
+    }
+    try {
+      const p = await preferences.getPreferences(ctx, STORE_NAME);
+      return (p.getSync(ABOUT_KEY, 0) as number) === stamp;
+    } catch (e) {
+      const err = e as BusinessError;
+      console.warn('[MoleShell] 读取关于弹窗安装戳失败：' + err.code);
       return false;   // 读不到就按「没弹过」处理，宁可多弹一次
     }
   }
 
   private static async mark(ctx: common.UIAbilityContext): Promise<void> {
+    const stamp = MoleAboutHelper.installStamp();
+    if (stamp <= 0) {
+      return;         // 拿不到戳就不记，否则可能把「已弹过」记成一个永远不匹配的值
+    }
     try {
       const p = await preferences.getPreferences(ctx, STORE_NAME);
-      p.putSync(ABOUT_KEY, true);
+      p.putSync(ABOUT_KEY, stamp);
       await p.flush();
     } catch (e) {
       const err = e as BusinessError;
-      console.warn('[MoleShell] 写入关于弹窗标记失败：' + err.code);
+      console.warn('[MoleShell] 写入关于弹窗安装戳失败：' + err.code);
     }
   }
 

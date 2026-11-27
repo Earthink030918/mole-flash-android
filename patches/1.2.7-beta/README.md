@@ -4,10 +4,10 @@
 | --- | --- |
 | 产物 | `mole-flash-1.2.7-beta.apk`，10,388,868 B（9.91 MiB） |
 | versionCode / versionName | `28` / `1.2.7-beta` |
-| SHA-256 | `d12326313cb8b3bf91d470cb3079d78d80cd441e053f44f56d5ce3d06e258c37` |
+| SHA-256 | `8c2bcec6b6cd5c4f35a1cc8df8d9a5295f3ffdb569d5f6901f4e90ef600ab0ad`（r2）<br>`d12326313cb8b3bf91d470cb3079d78d80cd441e053f44f56d5ce3d06e258c37`（r1，已在 Release 上） |
 | 签名 | `keystore/mole-release.jks`（alias `mole`），v1 + v2 + v3 |
 | 证书 SHA-256 | `B9197126…AE845BEE`（与 1.2.4 / 1.2.5 / 1.2.6 同一把） |
-| 改动面 | **只有 `assets/ruffle/shell.html`**；`classes.dex` 未变（28 个类），`mole_boot.js` 未变 |
+| 改动面 | `assets/ruffle/shell.html`；r2 另动 `AboutDialog.smali` / `AboutDialog$1.smali`（`classes.dex` 仍是 **28 个类**），`mole_boot.js` 未变 |
 
 ---
 
@@ -205,3 +205,92 @@ apksigner sign --ks keystore/mole-release.jks --ks-key-alias mole \
   全在 `rawfile/shell.html`，鸿蒙壳层只要换资源即可（`NativeBridge` 侧不涉及）。
 - **触控板几何抖动**（51↔30px 宽度、top 133↔132）仍在观察，疑似 fit 引擎里
   两个交替的缩放系数，与本版无关。
+
+---
+
+## 七、r2：弹窗文案与「不再弹出」
+
+> 需求原话：**仅更新弹窗里面的文字**；末尾加一行小字，右下角加「by 尘墨」，
+> 第三行加入「欢迎来到我的小窝一起玩，QQ小窝的群号是：1125775110」；
+> 再加一枚「不再弹出」的按钮 —— 安装后第一次打开才看得到，点过之后下次不再弹，
+> 但**覆盖安装要再弹一次**。版本号保持 1.2.7-beta 不动。
+
+### 7.1 顺手修掉一个一直存在的事实错误
+
+旧 `AboutDialog$1.run()` 的分支是反的：
+
+```
+if-eqz v2, :after      # v2 = 已弹过 → 为 0 时跳走（＝没弹过反而跳去显示）
+... putBoolean(true)
+goto :after            # 弹过的那条路也落到显示
+:after  show()
+```
+
+两条路最后都落到 `show()`，所以 **`mole_about_v1` 写了等于没写，每次启动都弹**。
+这正是需求里「用户仅在第一次打开游戏的时候才能够看到」要修的东西。
+
+### 7.2 判定依据：安装戳，不是版本号
+
+```
+PackageInfo.lastUpdateTime  ←→  SharedPreferences("mole_shell").getLong("mole_about_stamp", 0)
+```
+
+| 场景 | `lastUpdateTime` | 结果 |
+| --- | --- | --- |
+| 首次安装后第一次启动 | 首次安装时刻 | 戳不同 → **弹**，并立即记下戳 |
+| 同一份安装里再次启动 | 不变 | 戳相同 → 跳过 |
+| **覆盖安装**（含同 versionCode） | 被系统刷成安装时刻 | 戳不同 → **再弹一次** |
+
+为什么不用 `versionCode`：这一版按要求**不动版本号**，同版本覆盖安装也必须重弹，
+只有安装戳靠得住。也没有用「写一个布尔值再在安装时清掉」—— 那需要 `MY_PACKAGE_REPLACED`
+广播接收器，多一个组件多一份风险，而安装戳是系统本来就替我们记着的。
+
+戳在**弹之前**就写：用户直接杀进程、按返回键、或者只是没点按钮，都不会造成下次再被拦一次。
+`force=true`（崩溃页的「关于本作」）既不读也不写戳 —— 用户主动点的，不能被「已弹过」吞掉。
+
+任何 `Throwable`（无包管理器、无偏好）都按「没弹过」处理：宁可多弹一次，
+也不能让「非官方声明」根本没人看见。
+
+### 7.3 文案
+
+```
+第一段   谢谢你选择了我这么一个小小的开源项目～能在这里遇见你，真的很开心！♡
+第二段   <font color='#E23A3A'>（真红字）小提醒一下：本作并非摩尔庄园官方项目……
+第三段   欢迎来到我的小窝一起玩，QQ小窝的群号是：1125775110。本作目前还在开发阶段……
+小字     （每次安装只出现一次，点「不再弹出」就不再打扰你啦）
+落款                                                    by 尘墨
+```
+
+- 小字与落款都用 `<font color='#8A8A90'><small>` —— `Html.fromHtml` 里 `<small>` 就是
+  `RelativeSizeSpan(0.8)`，跟系统字体缩放一起走，不是写死的 px。
+- **右下角**：`AlertDialog` 的 message 只吃一个 `CharSequence`，`Html.fromHtml` 不产出段落对齐，
+  所以包一层 `SpannableStringBuilder`，对最后 5 个字符补
+  `AlignmentSpan.Standard(Layout.Alignment.ALIGN_OPPOSITE)`。落款前面有 `<br>` 独立成段，
+  span 不会波及正文。
+- **「不再弹出」放 neutral 位**：Android 的按钮顺序是 neutral → negative → positive，
+  于是「不再弹出」在左、「我知道啦 ♡」在右，符合「次要动作靠左」的直觉。
+- 两枚按钮都**不挂 listener**：`AlertController` 在 listener 为空时照样 dismiss，
+  所以没为一个空实现多出一个 class —— dex 里仍然是 **28 个类**。
+
+### 7.4 网页侧与鸿蒙侧同步
+
+- `shell.html` 第 11 段：`LINES[2]` 加群号，新增 `NOTE` / `BY` / `DISMISS`，
+  `payload()` 一并带给鸿蒙（`{title, lines, ok, note, by, dismiss}`），
+  页内兜底弹窗也画了小字、右下角落款与两枚按钮。
+- 鸿蒙侧的 ArkTS 参考实现（`patches/1.2.6-beta/harmony/AboutDialog.ets`）已同步
+  同一套字段与安装戳判定（`bundleManager` 的 `updateTime`），仍**未编译进 HAP**。
+
+### 7.5 验收
+
+- `tests/crashui_test.js` 40 → **51 条**：群号、小字、落款、新按钮文案、
+  鸿蒙 payload 三个新字段、页内兜底的两枚按钮与落款样式。
+- 既有 7 套全绿（`pad_test` 的 17 条触控板几何失败是 1.1.x 的既有基线，与本次无关）。
+- 包内 `assets/ruffle/shell.html` 与源文件 md5 一致；`classes.dex` 里检到
+  `getPackageInfo` / `lastUpdateTime` / `getLong` / `putLong` / `ALIGN_OPPOSITE` /
+  `setSpan` / `setNeutralButton` 七条关键指令，`class_defs_size` 仍是 28。
+- v1 + v2 + v3 三项签名通过，证书仍是 `B9197126…AE845BEE`，可直接覆盖 1.2.4 起的任何一版。
+
+**没有动的**：帧率 24、画幅与 `quality: 'low'`、节流器、`DENSITY` / `MAXPIX` / `FLOOR`、
+`budgetNow()`、五层输入法守卫、纹理回收、OmniPad 本体、服务器地址与端口池、
+`AndroidManifest.xml`、`mole_boot.js`。
+

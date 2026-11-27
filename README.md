@@ -23,6 +23,7 @@
 
 - [这是什么](#这是什么)
 - [功能特性](#功能特性)
+- [1.2.8-beta 更新摘要](#128-beta-更新摘要)
 - [1.2.7-beta 更新摘要](#127-beta-更新摘要)
 - [1.2.6-beta 更新摘要](#126-beta-更新摘要)
 - [1.2.5-beta 更新摘要](#125-beta-更新摘要)
@@ -150,11 +151,19 @@
 - **游戏内日志页**（1.2.7-beta）：横屏右上角一枚「日志」浮钮，点开就是那张崩溃页 ——
   但**可以返回**：日志每 1 秒实时刷新，点「↗ 分享日志」立刻冻结并拉起系统分享面板，
   「← 返回游戏」或系统返回键退回去，游戏全程没被打断（不重载、不降档、不收 OmniPad）
+- **进不去服务器**（1.2.8-beta）：壳页是公网源 `mole.61.com`、桥在 `ws://127.0.0.1`，
+  较新的 Chromium（华为 / 荣耀 WebView）会先发 PNA / LNA 预检，而旧桥只认
+  `sec-websocket-key`，预检一律 400 → WebSocket 被内核拒掉。现在桥回 204 +
+  `Allow-Private-Network` / `-Local-Network`，并把 `Origin` 回显。日志页第一行还会写
+  `[桥] 端口 · 目标条数`，端口 0 就是桥没起来
 - **「关于本作」原生弹窗**（1.2.6-beta）：不用网页自绘 —— Android 走
   `AlertDialog + Html.fromHtml`，「本作并非官方项目」那段是**真红字**（`ForegroundColorSpan`，
   跟随系统深浅色与字体缩放）；鸿蒙侧按 UA 分派到 `NativeBridge.showAbout(json)`，
   纯血鸿蒙用 `CustomDialog`（`AlertDialog.show` 的 message 只收 string，没法只让一段变红）。
-  「只弹一次」两端都记在系统偏好里，清 WebView 缓存也不重复骚扰
+  正文末尾一行灰色小字、右下角落款「by 尘墨」，另有一枚「不再弹出」。
+  **每次安装只自动弹一次**：判定用「安装戳」（Android 是 `PackageInfo.lastUpdateTime`，
+  鸿蒙是 `BundleInfo.updateTime`），同一份安装里不变、覆盖安装会被系统刷新 ——
+  所以升级后会再弹一次，清 WebView 缓存也不会重复骚扰
 - 调试口：`__moleClock()`、`__molePad.state()`、`__molePurgeTex()`、`__moleBudgetInfo()`、
   `__moleDpad.state()`、`__moleCrash.info()`、`__moleShareCrash('原因')`、
   `__moleCrashPage.show('原因')`、`__moleCrashPage.showLive()`（游戏内日志页）、
@@ -166,6 +175,29 @@
   不需要任何存储权限，节流 10s 一次、每会话 2 次
 
 ---
+
+## 1.2.8-beta 更新摘要
+
+群友反馈：**荣耀 V30 Pro 系列进不去服务器**，同版本别的机器正常。定位到链路最外层 ——
+socket 桥根本没被放行，游戏和服务器都是好的。
+
+| 环节 | 旧行为 | 1.2.8 |
+| --- | --- | --- |
+| 内核的 PNA / LNA 预检 | `OPTIONS` 被当垃圾请求，回 `400` | 回 `204` + `Allow-Private-Network` / `-Local-Network` + 回显 `Origin` |
+| accept 线程 | 一次 `IOException` 就 `break`，桥永久死 | 退避 300ms 继续收 |
+| 主文档路由 | 必须严格以 `/__mole_shell__` 结尾 | `contains`，容忍尾斜杠与 query |
+| 诊断 | 只能看 logcat | 日志页第一行 `[桥] 127.0.0.1:45123 · 目标 228 条` |
+
+为什么只有荣耀：壳页故意从 `http://mole.61.com/__mole_shell__` 下发（SWF 要认这个域名），
+桥却在 loopback。这是「公网源 → 本地回环」，Chromium 94+ 要预检，Chrome 138+ 的
+Local Network Access 更是默认拦。华为 / 荣耀的 WebView 跟上游跟得紧，所以先在这一批机器上炸。
+**没有把壳页搬到 `127.0.0.1` 来彻底绕开** —— 那样 `loaderInfo.url` 变成回环地址，
+SWF 的域名判断可能直接拒绝，代价远大于收益。
+
+**没有动的**：帧率 24 / 画幅 / `quality:'low'` / 节流器 / 像素预算 / 键盘守卫 /
+纹理回收 / OmniPad / Manifest / 服务器地址与端口表 / `mole_boot.js`。
+`classes.dex` 仍是 28 个类。验收：`logpage_test` 62 条 + 其余 7 套全绿
+（`pad_test` 的 17 条几何失败是 1.1.x 起的既有基线）。
 
 ## 1.2.7-beta 更新摘要
 
@@ -181,11 +213,13 @@
 | **分享即冻结** | 先停表定稿、再取正文、再调 `MoleBridge.reportCrash`，发出去的就是眼前那一份；冻结后新日志不再改写。文件名为 `mole-log-*.txt` |
 | **横屏两栏** | 800×360 这种小横屏上，日志走右栏、摘要与按钮走左栏，并把字号行距收紧，「返回游戏」保证在首屏内 |
 | **降级不白点** | 页面建不起来时，浮钮退化为「直接生成一份报告并拉起分享」，永远不会点了没反应 |
+| **「关于本作」改版**（r2） | 第三段加群号 `1125775110`，末尾加一行小字与右下角落款 `by 尘墨`；新增「不再弹出」。顺手修掉旧实现的分支写反 —— 那时**每次启动都会弹**，`mole_about_v1` 写了等于没写 |
 
-**没有动的**：dex 一个类都没变（仍是 28 个），画质 / 帧率 / 画幅 / 节流器 /
-键盘守卫 / 纹理回收 / 像素预算 / OmniPad 本体 / Manifest，全部原样。
-验收：`tests/logpage_test.js` 59 条断言 + 既有 7 套单测全绿（`pad_test` 的 17 条
-触控板几何失败是 1.1.x 就存在的基线，与本版无关）。
+**没有动的**：画质 / 帧率 / 画幅 / 节流器 / 键盘守卫 / 纹理回收 / 像素预算 /
+OmniPad 本体 / Manifest，全部原样。r1 只碰网页层；r2 追加弹窗文案与按钮，
+`classes.dex` 仍是 28 个类（没有新增类，两枚按钮都不挂 listener）。
+验收：`tests/logpage_test.js` 59 条 + `tests/crashui_test.js` 51 条 +
+既有 6 套全绿（`pad_test` 的 17 条触控板几何失败是 1.1.x 就存在的基线，与本版无关）。
 
 ## 1.2.6-beta 更新摘要
 
@@ -363,18 +397,18 @@ OmniPad 本体、`AndroidManifest.xml`、全部 smali。
 ## 下载与安装
 
 全部产物见 [Releases](https://github.com/Earthink030918/mole-flash-android/releases/latest)。
-最新预发布 **v1.2.7-beta**（仅 Android），最新正式版 **v1.2.0**（双端）。
+最新预发布 **v1.2.8-beta**（仅 Android），最新正式版 **v1.2.0**（双端）。
 
 | 平台 | 文件 | 大小 | 系统要求 |
 | --- | --- | --- | --- |
-| Android（预发布） | `mole-flash-1.2.7-beta.apk` | 9.91 MiB | Android 5.0（API 21）以上，建议 8+ |
+| Android（预发布） | `mole-flash-1.2.8-beta.apk` | 9.91 MiB | Android 5.0（API 21）以上，建议 8+ |
 | Android（正式） | `mole-1.2.0.apk` | 9.88 MiB | 同上 |
 | HarmonyOS（正式） | `mole-harmony-1.2.0-signed.hap` | 10.93 MiB | HarmonyOS 5.0.0（API 12）以上 |
 
 > **1.2.4-beta 起换了签名密钥**（与原 `974EA1B9…` 不同），从 1.2.0 及更早版本升级
 > 必须先卸载旧版，`INSTALL_FAILED_UPDATE_INCOMPATIBLE` 是预期行为，代价是 `mole_shell`
 > 里缓存的服务器地址要重学一遍（重进游戏自动完成）。
-> 1.2.4-beta 起（含 1.2.5-beta / 1.2.6-beta / 1.2.7-beta）都是**同一把新密钥**，可以直接覆盖升级，什么都不丢。
+> 1.2.4-beta 起（含 1.2.5 / 1.2.6 / 1.2.7 / 1.2.8-beta）都是**同一把新密钥**，可以直接覆盖升级，什么都不丢。
 
 ### Android
 
@@ -419,6 +453,12 @@ v1.2.0 校验值：
 ```
 b776302bbc5ce46c71e773d4425edc2f2bee5fa99d0a13101571e59c57331714  mole-1.2.0.apk
 c8b99da639c9f9598898ac2c1822127c7e89024c107d7ff0465442c61e113af5  mole-harmony-1.2.0-signed.hap
+```
+
+v1.2.8-beta 校验值：
+
+```
+edb390bcff3f558bd9e8bc8e07537fe1ec394fab959a545090aa4e84942527bc  mole-flash-1.2.8-beta.apk
 ```
 
 v1.2.6-beta 校验值：

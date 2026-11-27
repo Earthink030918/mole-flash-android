@@ -2318,7 +2318,7 @@ exports.BaseEntity=N;exports.Button=Ri;exports.ButtonBaseView=L;exports.ButtonCo
  * ================================================================== */
 window.__moleCrash = (function () {
   var TAG = '[MoleShell]';
-  var APPV = '1.2.7-beta';
+  var APPV = '1.3.0';
   var RING_MAX = 140;
   var ring = [];
   var errs = [];
@@ -2927,7 +2927,7 @@ window.__moleDpad = (function () {
  * ================================================================== */
 window.__moleCrashPage = (function () {
   var TAG = '[MoleShell]';
-  var APPV = '1.2.7-beta';
+  var APPV = '1.3.0';
   var host = null, refs = {}, cssDone = false;
   var lastText = '', lastKind = '', lastExtra = null, shownAt = 0;
 
@@ -3026,7 +3026,8 @@ window.__moleCrashPage = (function () {
     var kind = '运行日志（实时抓取）';
     var extra = {
       '入口': '游戏内「日志」浮钮（可返回）',
-      '刷新': '每 ' + (TICK_MS / 1000) + ' 秒'
+      '刷新': '每 ' + (TICK_MS / 1000) + ' 秒',
+      '桥': bridgeLine()
     };
     try {
       lastText = window.__moleCrash
@@ -3040,6 +3041,23 @@ window.__moleCrashPage = (function () {
     return true;
   }
 
+  /* 1.2.8-beta：「进不去服务器」最直接的两个证据 —— 桥端口为 0、socketProxy 条目为 0。
+     以前这两项只在 logcat 里，群友截图截不到；现在直接写进日志页和分享报告。 */
+  function bridgeLine() {
+    var port = -1, n = -1, back = '?';
+    try {
+      port = (window.MoleBridge && MoleBridge.bridgePort) ? MoleBridge.bridgePort() : -1;
+    } catch (e) { port = -2; }
+    try {
+      var c = window.RufflePlayer && window.RufflePlayer.config;
+      n = (c && c.socketProxy) ? c.socketProxy.length : -1;
+    } catch (e) { n = -2; }
+    try {
+      back = (window.__moleRenderer || '?') + '（档 ' + (window.__moleRendererTier || 0) + '）';
+    } catch (e) {}
+    return '127.0.0.1:' + port + ' · 目标 ' + n + ' 条 · ' + back;
+  }
+
   function fillLog() {
     if (!refs.log) return;
     var lines = [];
@@ -3048,8 +3066,12 @@ window.__moleCrashPage = (function () {
         ? window.__moleCrash.tail(TAIL_MAX) : [];
     } catch (e) { lines = []; }
     var n = lines.length;
+    if (mode === 'live') {
+      try { lines = ['[桥] ' + bridgeLine()].concat(lines); } catch (e) {}
+    }
     try {
-      refs.log.textContent = n ? lines.join('\n') : '（本次运行还没有产生日志）';
+      refs.log.textContent = lines.length
+        ? lines.join('\n') : '（本次运行还没有产生日志）';
     } catch (e) {}
     try {
       if (refs.logMeta && !frozen) {
@@ -3725,6 +3747,10 @@ window.__moleAbout = (function () {
   var KEY = 'mole_about_v1';
   var TITLE = '关于本作 · 先说三句心里话';
   var OK = '我知道啦 ♡';
+  /* 1.2.7-beta（r2）：新增一枚「不再弹出」，以及正文末尾一行小字和右下角落款。 */
+  var DISMISS = '不再弹出';
+  var NOTE = '（每次安装只出现一次，点「不再弹出」就不再打扰你啦）';
+  var BY = 'by 尘墨';
   var LINES = [
     { t: '谢谢你选择了我这么一个小小的开源项目～能在这里遇见你，真的很开心！♡', red: false },
     {
@@ -3732,7 +3758,9 @@ window.__moleAbout = (function () {
       red: true
     },
     {
-      t: '本作目前还在开发阶段，遇到问题欢迎随时指出～另外郑重说一句：严禁倒卖，也严禁在二次修改时加入收费弹窗；如果发现任何以此盈利的行为，欢迎大家向我反馈！',
+      t: '欢迎来到我的小窝一起玩，QQ小窝的群号是：1125775110。本作目前还在开发阶段，'
+        + '遇到问题欢迎随时指出～另外郑重说一句：严禁倒卖，也严禁在二次修改时加入收费弹窗；'
+        + '如果发现任何以此盈利的行为，欢迎大家向我反馈！',
       red: false
     }
   ];
@@ -3761,7 +3789,9 @@ window.__moleAbout = (function () {
   function payload() {
     var out = [];
     for (var i = 0; i < LINES.length; i++) out.push({ t: LINES[i].t, red: LINES[i].red });
-    return JSON.stringify({ title: TITLE, lines: out, ok: OK });
+    return JSON.stringify({
+      title: TITLE, lines: out, ok: OK, note: NOTE, by: BY, dismiss: DISMISS
+    });
   }
 
   /* ---- 页内兜底弹窗：只在两个原生通道都缺席时出现 ---- */
@@ -3776,15 +3806,31 @@ window.__moleAbout = (function () {
       '#moleAboutMask{position:fixed;inset:0;z-index:2147483647;display:flex;align-items:center;',
       'justify-content:center;padding:18px;box-sizing:border-box;background:rgba(0,0,0,.62);',
       'font-family:system-ui,-apple-system,"PingFang SC",sans-serif;}',
-      '#moleAboutMask .mab{width:100%;max-width:430px;max-height:80vh;overflow:auto;',
+      '#moleAboutMask .mab{width:100%;max-width:430px;max-height:80vh;overflow:hidden;',
+      'display:flex;flex-direction:column;',
       'box-sizing:border-box;padding:18px 18px 14px;border-radius:16px;',
       'background:linear-gradient(180deg,#2a1d15,#17100c);color:#f7ece1;',
       'border:1px solid rgba(255,196,107,.26);box-shadow:0 18px 48px rgba(0,0,0,.5);}',
+      '#moleAboutMask .mab-body{flex:1 1 auto;min-height:0;overflow-y:auto;',
+      'overflow-x:hidden;-webkit-overflow-scrolling:touch;}',
       '#moleAboutMask .mab-t{margin:0 0 12px;font-size:16px;font-weight:700;color:#ffe9d2;}',
       '#moleAboutMask .mab-p{margin:0 0 12px;font-size:13px;line-height:1.85;color:#ded0c2;}',
       '#moleAboutMask .mab-p.red{color:#ff6b5e;font-weight:600;}',
-      '#moleAboutMask .mab-ok{margin-top:6px;padding:11px 12px;border-radius:12px;text-align:center;',
-      'font-size:13px;font-weight:600;color:#2a1a10;cursor:pointer;',
+      '#moleAboutMask .mab-note{margin:2px 0 4px;font-size:11.5px;line-height:1.7;color:#9d8e80;}',
+      '#moleAboutMask .mab-by{margin:0 0 10px;font-size:11px;color:#8a7d72;text-align:right;}',
+      '#moleAboutMask .mab-btns{display:flex;gap:10px;flex:0 0 auto;padding-top:10px;}',
+      '@media (max-height:430px){',
+      '  #moleAboutMask .mab{padding:13px 14px 10px;}',
+      '  #moleAboutMask .mab-t{font-size:15px;margin-bottom:8px;}',
+      '  #moleAboutMask .mab-p{font-size:12.5px;line-height:1.62;margin-bottom:9px;}',
+      '  #moleAboutMask .mab-note,#moleAboutMask .mab-by{font-size:11px;}',
+      '}',
+      '#moleAboutMask .mab-btns>div{flex:1 1 0;min-width:0;}',
+      '#moleAboutMask .mab-no{padding:11px 10px;border-radius:12px;text-align:center;',
+      'font-size:13px;font-weight:600;color:#e8d8c6;cursor:pointer;white-space:nowrap;',
+      'background:rgba(255,255,255,.07);border:1px solid rgba(255,196,107,.22);}',
+      '#moleAboutMask .mab-ok{padding:11px 10px;border-radius:12px;text-align:center;',
+      'font-size:13px;font-weight:600;color:#2a1a10;cursor:pointer;white-space:nowrap;',
       'background:linear-gradient(180deg,#ffd08a,#ffb347);}'
     ].join('');
     head.appendChild(st);
@@ -3799,21 +3845,47 @@ window.__moleAbout = (function () {
       box.id = 'moleAboutMask';
       var card = document.createElement('div');
       card.className = 'mab';
+      var bodyBox = document.createElement('div');
+      bodyBox.className = 'mab-body';
       var h = document.createElement('div');
       h.className = 'mab-t';
       h.textContent = TITLE;
-      card.appendChild(h);
+      bodyBox.appendChild(h);
       for (var i = 0; i < LINES.length; i++) {
         var p = document.createElement('div');
         p.className = LINES[i].red ? 'mab-p red' : 'mab-p';
         p.textContent = LINES[i].t;
-        card.appendChild(p);
+        bodyBox.appendChild(p);
       }
+      var note = document.createElement('div');
+      note.className = 'mab-note';
+      note.textContent = NOTE;
+      bodyBox.appendChild(note);
+
+      var by = document.createElement('div');
+      by.className = 'mab-by';
+      by.textContent = BY;
+      bodyBox.appendChild(by);
+
+      card.appendChild(bodyBox);
+
+      var btns = document.createElement('div');
+      btns.className = 'mab-btns';
+
+      /* 顺序照安卓：neutral（不再弹出）在左，positive（我知道啦）在右 */
+      var no = document.createElement('div');
+      no.className = 'mab-no';
+      no.textContent = DISMISS;
+      listen(no, 'click', function () { try { box.style.display = 'none'; } catch (e) {} });
+      btns.appendChild(no);
+
       var ok = document.createElement('div');
       ok.className = 'mab-ok';
       ok.textContent = OK;
       listen(ok, 'click', function () { try { box.style.display = 'none'; } catch (e) {} });
-      card.appendChild(ok);
+      btns.appendChild(ok);
+
+      card.appendChild(btns);
       box.appendChild(card);
       document.body.appendChild(box);
       return true;
@@ -3867,6 +3939,10 @@ window.__moleAbout = (function () {
     auto: auto,
     lines: LINES,
     title: TITLE,
+    note: NOTE,
+    by: BY,
+    ok: OK,
+    dismiss: DISMISS,
     state: function () {
       return { platform: platform || detect(), forced: forced, at: shownAt };
     }

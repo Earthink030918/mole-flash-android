@@ -2,13 +2,74 @@
 
 格式参照 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
+## [1.2.8-beta] - 2026-11-22
+
+预发布，仅 Android（`versionCode 29`）。针对群友反馈的**荣耀 V30 Pro 系列无法进入服务器**。
+`classes.dex` 仍是 **28 个类**（只补了一条响应分支，没有新增类）。
+设计说明与验收清单见 [patches/1.2.8-beta/README.md](patches/1.2.8-beta/README.md)。
+
+产物 `mole-flash-1.2.8-beta.apk`，10,388,868 B（9.91 MiB），
+SHA-256 `edb390bcff3f558bd9e8bc8e07537fe1ec394fab959a545090aa4e84942527bc`。
+**沿用 1.2.4-beta 起的同一把密钥**（`b9197126…ae845bee`），1.2.4 起可直接覆盖升级。
+
+### 根因：公网源访问本地回环触发了 PNA / LNA 预检
+
+壳页故意从 `http://mole.61.com/__mole_shell__` 下发（SWF 要看到这个域名），
+而 socket 桥监听在 `ws://127.0.0.1:<随机端口>`。这是标准的「公网源 → 本地回环」，
+Chromium 94+ 会先发一个 `OPTIONS` 预检，Chrome 138+ 的 LNA 更是**默认拦截**；
+只有回 `204` 且带 `Access-Control-Allow-Private-Network` / `-Local-Network` 才放行。
+
+旧 `SocketBridge.handle()` 只认 `sec-websocket-key`，预检请求一律回 `400 Bad Request`：
+
+```
+OPTIONS /?host=...&port=... HTTP/1.1     ← 内核的预检
+HTTP/1.1 400 Bad Request                  ← 桥的回答
+WebSocket 被内核拒绝 → Ruffle 上层只看到「连不上」
+```
+
+荣耀 / 鸿蒙机型上华为 WebView 跟着上游 Chromium 走得更快，于是**只有这几台进不去**。
+其余环节（Ruffle、SWF、服务器本身）都是好的 —— 这也解释了为什么同版本在别的机器上正常。
+
+### 修复
+
+- **`SocketBridge.handle()` 识别 OPTIONS**：回 `204 No Content`，并带
+  `Access-Control-Allow-Origin`（回显请求的 `Origin`，LNA 不接受 `*`）、
+  `-Allow-Methods`、`-Allow-Headers: *`、`-Allow-Private-Network: true`、
+  `-Allow-Local-Network: true`、`Max-Age: 600`。非 OPTIONS 的非 WS 连接仍回 400。
+  命中预检时 logcat 会有一行 `bridge: CORS preflight allowed (PNA)`。
+- **accept 循环不再「一异常就死」**：旧实现捕获一次 `IOException` 就 `break`，
+  accept 线程永久退出，之后所有 WebSocket 都无人接收（症状同样是「进不去服务器」）。
+  现在退避 300ms 后继续收；只有 `ServerSocket` 真的关了才退出。
+- **主文档路由不再要求严格结尾**：`endsWith("/__mole_shell__")` 改成 `contains`。
+  华为 / 荣耀等定制内核可能给导航 URL 补尾斜杠或带 query，一漏就真去请求
+  `mole.61.com`，表现为白屏或进不去。
+- **日志页多一行桥状态**（`[桥] 127.0.0.1:45123 · 目标 228 条 · wgpu-webgl（档 0）`），
+  同时写进分享报告。这是「进不去服务器」最直接的两个证据：端口为 0 说明桥没起来，
+  目标为 0 条说明 socketProxy 没注入。
+
+### 刻意没做
+
+- 没把壳页换到 `http://127.0.0.1:PORT` 来彻底绕开 PNA —— 那样 `loaderInfo.url`
+  会变成回环地址，SWF 的域名判断可能直接拒绝，风险远大于收益。
+- 没有为 LNA 的「权限提示」做任何 UI —— 那个权限由内核控制，应用侧拿不到。
+
+### 没有动的
+
+帧率 24、画幅与 `quality:'low'`、节流器、`DENSITY` / `MAXPIX` / `FLOOR`、`budgetNow()`、
+五层输入法守卫、纹理回收、OmniPad 本体、服务器地址与端口表、`AndroidManifest.xml`、
+`mole_boot.js`。验收：`tests/logpage_test.js` 59 → 62 条，其余 7 套全绿
+（`pad_test` 的 17 条几何失败是 1.1.x 起的既有基线）。
+
 ## [1.2.7-beta] - 2026-11-22
 
-预发布，仅 Android（`versionCode 28`），**纯网页层改动，dex 一个类都没变（仍是 28 个）**。
+预发布，仅 Android（`versionCode 28`）。r1 是纯网页层改动；r2 追加了「关于本作」的文案与
+「不再弹出」，dex 随之变动但**仍是 28 个类**（没有新增类）。
 设计说明与验收清单见 [patches/1.2.7-beta/README.md](patches/1.2.7-beta/README.md)。
 
 产物 `mole-flash-1.2.7-beta.apk`，10,388,868 B（9.91 MiB），
-SHA-256 `d12326313cb8b3bf91d470cb3079d78d80cd441e053f44f56d5ce3d06e258c37`。
+SHA-256 `8c2bcec6b6cd5c4f35a1cc8df8d9a5295f3ffdb569d5f6901f4e90ef600ab0ad`（r2）。
+初版（r1，`d1232631…e258c37`）只动了网页层；r2 按群里的要求补了「关于本作」的文案与
+「不再弹出」，因此 `classes.dex` 也跟着变了（仍是 28 个类），**版本号按约定没有动**。
 **沿用 1.2.4-beta 起的同一把密钥**（`b9197126…ae845bee`），1.2.4 / 1.2.5 / 1.2.6 可直接覆盖升级。
 
 ### 新增
@@ -29,6 +90,20 @@ SHA-256 `d12326313cb8b3bf91d470cb3079d78d80cd441e053f44f56d5ce3d06e258c37`。
   小横屏上「返回游戏」也完整落在首屏内。**只作用于 `.live`，崩溃页排版一字未动。**
 - `tests/logpage_test.js`（59 条断言）：实时刷新 / 复用缓存 GPU / 冻结后不再改写 /
   无桥退化成复制 / 日志页开着时 panic 能切回崩溃终局 / 浮钮挂载与降级 / 返回键余波保护。
+
+### 变更（r2）：弹窗文案与「不再弹出」
+
+- **「关于本作」正文**：第三段开头加入「欢迎来到我的小窝一起玩，QQ小窝的群号是：1125775110」；
+  末尾加一行灰色小字（说明这页只出现一次、点「不再弹出」即可），
+  再一行右下角落款 `by 尘墨`（`AlignmentSpan.ALIGN_OPPOSITE`，`Html.fromHtml` 不管段落对齐，
+  只能事后补 span）。
+- **多一枚「不再弹出」**（neutral 位，在左；「我知道啦 ♡」仍在右）。两枚都不挂 listener，
+  `AlertController` 在 listener 为空时照样 dismiss —— 没为一句空实现多出 class。
+- **修掉「每次启动都弹」**：`AboutDialog$1.run()` 的分支本来是反的，两条路都落到 `show()`，
+  `mole_about_v1` 写了等于没写。改用 `PackageInfo.lastUpdateTime` 作「安装戳」：
+  同一份安装只弹一次，**覆盖安装（哪怕 versionCode 相同）会重弹**。戳在弹之前就写，
+  用户杀进程 / 按返回键也不会被二次拦截；`force=true`（崩溃页按钮）不读不写戳。
+- `tests/crashui_test.js` 40 → 51 条；`shell.html` 第 11 段与鸿蒙 ArkTS 参考实现同步新字段。
 
 ### 刻意没做
 

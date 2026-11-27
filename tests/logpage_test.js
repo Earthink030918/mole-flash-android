@@ -121,6 +121,7 @@ function makeEnv(opts) {
       reportCrash: (n, t) => shares.push({ n, t }),
       saveCrash: (n, t) => shares.push({ n, t, save: true }),
       showAbout: () => {},
+      bridgePort: () => 45123,
     };
     win.MoleBridge = sandbox.MoleBridge;
   }
@@ -192,6 +193,10 @@ const page = e1.win.__moleCrashPage;
     JSON.stringify(e1.liveTimers().map(t => t.ms)));
   ok('取日志尾巴用的是 40 行', e1.tailCalls.indexOf(40) >= 0, JSON.stringify(e1.tailCalls));
   ok('首帧就出过正文', e1.builds.length >= 1);
+  /* 1.2.8-beta：桥状态要出现在日志正文第一行 —— 「进不去服务器」时，
+     群友截图这一行就能说明桥有没有起来（端口 0 / 目标 0 条）。 */
+  ok('正文第一行是桥状态', flat.indexOf('[桥]') >= 0, flat.slice(0, 60));
+  ok('桥状态带本机端口号', flat.indexOf('127.0.0.1:45123') >= 0);
 }
 
 console.log('=== 2) 每 1 秒重抓，且复用已探测的 GPU（不新建 WebGL 上下文）===');
@@ -208,6 +213,8 @@ console.log('=== 2) 每 1 秒重抓，且复用已探测的 GPU（不新建 WebG
   const after = JSON.stringify(host, (k, v) => (k === 'parentNode' ? undefined : v));
   ok('新日志立刻出现在页面上', after.indexOf('转屏后帧率掉了 2 帧') >= 0);
   ok('页面确实被重绘过（不是空跑）', after !== before);
+  ok('分享报告里也带桥状态', last.e && typeof last.e['桥'] === 'string'
+    && last.e['桥'].indexOf('45123') >= 0, JSON.stringify(last.e));
   ok('每次刷新都带 cachedGpu', e1.builds.every(b => b.opt && b.opt.cachedGpu === true),
     JSON.stringify(e1.builds.map(b => b.opt && b.opt.cachedGpu)));
 }

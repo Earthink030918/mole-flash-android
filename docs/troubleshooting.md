@@ -37,6 +37,34 @@ Ruffle 的 polyfill 没运行（通常是 `ruffle.js` 加载到一半报错）�
 壳页本身没返回。这条只在**主框架**失败时打，说明拦截器第 1 条路由没命中 —— 检查 URL
 是否严格以 `/__mole_shell__` 结尾（带 query 就会漏）。代码里是 `endsWith`。
 
+### 某个机型进不去服务器（荣耀 / 华为反馈最多）
+
+先打开游戏内日志页（右上角「日志」浮钮），**看正文第一行**：
+
+```
+[桥] 127.0.0.1:45123 · 目标 228 条 · wgpu-webgl（档 0）
+```
+
+| 看到什么 | 含义 | 处置 |
+| --- | --- | --- |
+| `127.0.0.1:0` | 桥没起来（`ServerSocket` 绑定失败） | 重启应用；仍为 0 就发日志 |
+| `目标 0 条` | `socketProxy` 没注入（种子解码失败 / 端口表为空） | 发日志 |
+| 端口和目标都正常，但仍连不上 | 内核把 loopback 的 WebSocket 拦了 | 1.2.8-beta 起已回 204 + PNA/LNA 头；确认装的是 1.2.8 以上 |
+
+原理：壳页是 `http://mole.61.com/__mole_shell__`（公网源），桥在 `ws://127.0.0.1`（本地回环）。
+Chromium 94+ 会先发 `OPTIONS` 预检，Chrome 138+ 的 Local Network Access 默认拦截。
+旧桥只认 `sec-websocket-key`，预检回 400 → WebSocket 被内核拒掉。
+
+adb 侧确认预检有没有走到：
+
+```bash
+adb logcat -s MoleSocketBridge:V | grep -E "CORS preflight|桥已启动|桥启动失败"
+```
+
+- 有 `bridge: CORS preflight allowed (PNA)` → 预检已放行，问题不在这一层
+- 完全没有这一行、也没有 `桥已启动` → 桥压根没监听，看 `桥启动失败` 后面的异常
+- 有预检但紧跟着断开 → 目标地址过期，按下一节处理
+
 ### 画面出来但角色不动 / 一进地图就断线
 
 Socket 桥没通。查 `MoleSocketBridge` 的日志：

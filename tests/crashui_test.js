@@ -207,6 +207,11 @@ console.log('=== 5) 安卓走原生 AlertDialog ===');
   ok('第二段是红字', about.lines[1].red === true);
   ok('第一段不是红字', about.lines[0].red === false);
   ok('第二段写明「并非官方」', about.lines[1].t.indexOf('并非摩尔庄园官方项目') >= 0);
+  ok('第三段带 QQ 小窝群号', about.lines[2].t.indexOf('1125775110') >= 0, about.lines[2].t.slice(0, 40));
+  ok('第三段带「欢迎来到我的小窝」', about.lines[2].t.indexOf('欢迎来到我的小窝') >= 0);
+  ok('末尾小字提示「不再弹出」', about.note.indexOf('不再弹出') >= 0, about.note);
+  ok('落款是 by 尘墨', about.by === 'by 尘墨', about.by);
+  ok('新按钮文案是「不再弹出」', about.dismiss === '不再弹出', about.dismiss);
 
   const r = about.show(false);
   ok('返回 native', r === 'native', r);
@@ -235,6 +240,9 @@ console.log('=== 6) 纯血鸿蒙走 NativeBridge（ArkTS 原生弹窗）===');
   ok('payload 带 title', payload && typeof payload.title === 'string' && payload.title.length > 0);
   ok('payload 三段文案', payload && payload.lines && payload.lines.length === 3);
   ok('payload 第二段 red=true', payload && payload.lines[1].red === true);
+  ok('payload 带 note', payload && payload.note && payload.note.indexOf('不再弹出') >= 0);
+  ok('payload 带落款', payload && payload.by === 'by 尘墨');
+  ok('payload 带新按钮文案', payload && payload.dismiss === '不再弹出');
   ok('没有走安卓桥', env.aboutCalls.length === 0);
   ok('没有画页内弹窗', env.body.children.length === 0);
 }
@@ -251,6 +259,10 @@ console.log('=== 7) 两桥都没有 → 页内兜底弹窗（红字段落仍在�
   const flat = JSON.stringify(mask, (k, v) => (k === 'parentNode' ? undefined : v));
   ok('带 red 样式', flat.indexOf('mab-p red') >= 0);
   ok('三句话都在', (flat.match(/mab-p/g) || []).length >= 3);
+  ok('页内也有末尾小字', flat.indexOf('mab-note') >= 0 && flat.indexOf('不再弹出') >= 0);
+  ok('页内落款靠右下角样式', flat.indexOf('mab-by') >= 0 && flat.indexOf('by 尘墨') >= 0);
+  ok('页内两枚按钮', flat.indexOf('mab-btns') >= 0 && flat.indexOf('mab-no') >= 0
+    && flat.indexOf('mab-ok') >= 0);
   ok('记住了已弹过（localStorage）', env.store.mole_about_v1 === '1');
 }
 {
